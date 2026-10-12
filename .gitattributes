@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.glb binary
+*.fbx binary
+
+*.sh text eol=lf
+.githooks/* text eol=lf
+
+package-lock.json linguist-generated=true

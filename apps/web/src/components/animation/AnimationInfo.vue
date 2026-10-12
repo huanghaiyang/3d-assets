@@ -1,0 +1,317 @@
+<script setup lang="ts">
+import { computed } from 'vue';
+import Icon from '../ui/Icon.vue';
+import { useAnimationStore } from '@/stores/animation';
+import { formatBytes } from '@/utils/image';
+
+const store = useAnimationStore();
+
+const file = computed(() => store.selectedFile);
+
+function clipDuration(seconds: number): string {
+  return `${seconds.toFixed(2)} 秒`;
+}
+</script>
+
+<template>
+  <aside class="anim-info">
+    <header class="head">
+      <div class="title">
+        <Icon name="info" :size="15" />
+        <span>动画信息</span>
+      </div>
+    </header>
+
+    <div class="body">
+      <template v-if="file">
+        <section class="block">
+          <span class="field-label">文件</span>
+          <p class="file-name" :title="file.name">{{ file.name }}</p>
+          <dl class="info">
+            <div><dt>大小</dt><dd>{{ formatBytes(file.size) }}</dd></div>
+            <div><dt>修改时间</dt><dd>{{ new Date(file.mtime).toLocaleString('zh-CN') }}</dd></div>
+            <div v-if="store.selectedStats">
+              <dt>网格</dt>
+              <dd>
+                {{ store.selectedStats.meshes }} 个<template v-if="store.selectedStats.skinned">（含蒙皮）</template>
+              </dd>
+            </div>
+            <div v-if="store.selectedStats">
+              <dt>骨骼</dt><dd>{{ store.selectedStats.bones }}</dd>
+            </div>
+            <div v-if="store.selectedStats">
+              <dt>三角面</dt><dd>{{ store.selectedStats.triangles.toLocaleString('en-US') }}</dd>
+            </div>
+            <div v-if="store.selectedStats">
+              <dt>材质</dt><dd>{{ store.selectedStats.materials }}</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section v-if="store.selectedClips.length > 0" class="block">
+          <span class="field-label">动画片段（{{ store.selectedClips.length }}）</span>
+          <div class="clips">
+            <button
+              v-for="(clip, index) in store.selectedClips"
+              :key="clip.name + index"
+              class="clip"
+              :class="{ active: store.activeClipIndex === index }"
+              type="button"
+              @click="store.playClipIndex(index)"
+            >
+              <Icon name="play" :size="11" />
+              <span class="clip-name" :title="clip.name">{{ clip.name }}</span>
+              <span class="mono faint">{{ clipDuration(clip.duration) }}</span>
+            </button>
+          </div>
+        </section>
+
+        <section class="block">
+          <span class="field-label">播放选项</span>
+          <label class="row">
+            <span>原地播放<small>去掉髋部水平位移，便于观察循环动作</small></span>
+            <input
+              type="checkbox"
+              class="checkbox"
+              :checked="store.inPlace"
+              @change="store.setInPlace(($event.target as HTMLInputElement).checked)"
+            />
+          </label>
+          <label class="row">
+            <span>左右镜像<small>翻转模型与动作方向</small></span>
+            <input
+              type="checkbox"
+              class="checkbox"
+              :checked="store.mirror"
+              @change="store.setMirror(($event.target as HTMLInputElement).checked)"
+            />
+          </label>
+          <label class="row">
+            <span>地面网格</span>
+            <input
+              type="checkbox"
+              class="checkbox"
+              :checked="store.showGrid"
+              @change="store.setGridView(($event.target as HTMLInputElement).checked)"
+            />
+          </label>
+          <div class="speed-row">
+            <span class="speed-label">播放速度</span>
+            <input
+              class="slider"
+              type="range"
+              min="0.1"
+              max="2"
+              step="0.05"
+              :value="store.speed"
+              @input="store.setSpeed(Number(($event.target as HTMLInputElement).value))"
+            />
+            <span class="mono speed-value">{{ store.speed.toFixed(2) }}×</span>
+          </div>
+        </section>
+      </template>
+
+      <p v-else class="empty">从左侧选择一个动画，这里会显示文件与片段信息</p>
+
+      <section class="block readonly-note">
+        <span class="field-label">只读说明</span>
+        <p>
+          本页只使用 <span class="mono">readdir / stat / readFile</span> 读取
+          <span class="mono">.fbx</span>，不会写入、修改或锁定源文件夹中的任何文件；
+          缩略图只在浏览器内存中生成，不落盘。
+        </p>
+      </section>
+    </div>
+  </aside>
+</template>
+
+<style scoped>
+.anim-info {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--border);
+}
+
+.head {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.file-name {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.info {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.info > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.info dt {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  flex: none;
+}
+
+.info dd {
+  margin: 0;
+  font-size: 11.5px;
+  text-align: right;
+}
+
+.clips {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.clip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel-2);
+  color: var(--text-dim);
+  text-align: left;
+}
+
+.clip:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.clip.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.clip-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.row small {
+  display: block;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  line-height: 1.4;
+}
+
+.checkbox {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.speed-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.speed-label {
+  font-size: 12px;
+  flex: none;
+}
+
+.slider {
+  flex: 1;
+  min-width: 0;
+  height: 4px;
+  appearance: none;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), #4b3fb0);
+  outline: none;
+}
+
+.slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid var(--accent);
+  cursor: pointer;
+}
+
+.speed-value {
+  flex: none;
+  width: 40px;
+  text-align: right;
+  color: var(--text-dim);
+}
+
+.empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.readonly-note {
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.readonly-note p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--text-faint);
+}
+</style>
