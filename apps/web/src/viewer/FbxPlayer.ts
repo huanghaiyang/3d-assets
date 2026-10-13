@@ -3,6 +3,8 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 
+import { SkeletonOverlay, filterShadowBones, type BoneNode, type FlatBone } from './SkeletonOverlay';
+
 export interface ClipInfo {
   name: string;
   duration: number;
@@ -11,7 +13,10 @@ export interface ClipInfo {
 
 export interface ModelStats {
   meshes: number;
+  /** 参与形变的骨骼数（FBX 里的同名包装节点不计入） */
   bones: number;
+  /** 场景里的骨骼对象总数，含包装节点 */
+  boneNodes: number;
   triangles: number;
   vertices: number;
   materials: number;
@@ -57,6 +62,9 @@ export class FbxPlayer {
   private mixer: THREE.AnimationMixer | null = null;
   private clips: THREE.AnimationClip[] = [];
   private currentAction: THREE.AnimationAction | null = null;
+  private skeleton: SkeletonOverlay | null = null;
+  private skeletonOn = false;
+  private readonly raycaster = new THREE.Raycaster();
   private disposed = false;
   private gridOn = true;
   private mirrorOn = false;
@@ -136,6 +144,8 @@ export class FbxPlayer {
       this.mixer.update(delta * this.speed * (this.playing ? 1 : 0));
     }
     this.controls.update();
+    // 骨骼随动画移动，逐帧刷新叠加层与拾取用的点云
+    this.skeleton?.refreshPositions();
     this.renderer.render(this.scene, this.camera);
     if (this.mixer && this.currentAction) {
       this.emit({
@@ -168,6 +178,51 @@ export class FbxPlayer {
 
   get clipList(): ClipInfo[] {
     return this.clips.map((clip) => ({ name: clip.name, duration: clip.duration, tracks: clip.tracks.length }));
+  }
+
+  // ===== 骨骼 =====
+
+  get boneTree(): BoneNode[] {
+    return this.skeleton?.boneTree ?? [];
+  }
+
+  get boneList(): FlatBone[] {
+    return this.skeleton?.flatBones ?? [];
+  }
+
+  get skeletonVisible(): boolean {
+    return this.skeletonOn;
+  }
+
+  /** 被忽略的同名 FBX 包装节点数 */
+  get ignoredBoneNodes(): number {
+    return this.skeleton?.ignoredBoneNodes ?? 0;
+  }
+
+  setSkeletonVisible(on: boolean): void {
+    this.skeletonOn = on;
+    this.skeleton?.setVisible(on);
+  }
+
+  setSelectedBones(ids: readonly string[]): void {
+    this.skeleton?.setSelection(ids);
+  }
+
+  setHoveredBone(id: string | null): void {
+    this.skeleton?.setHovered(id);
+  }
+
+  /** 在模型上用屏幕坐标点选骨骼；返回骨骼 id，未命中为 null */
+  pickBone(clientX: number, clientY: number): string | null {
+    if (!this.skeleton) return null;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const ndc = new THREE.Vector2(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    this.raycaster.setFromCamera(ndc, this.camera);
+    return this.skeleton.pick(this.raycaster);
   }
 
   /** 加载 FBX（只读读取，加载完成后源文件不再被占用） */
@@ -211,6 +266,13 @@ export class FbxPlayer {
 
     this.mixer = new THREE.AnimationMixer(object);
     this.applyMirror();
+
+    // 骨骼叠加层挂在场景根上（世界坐标），因此自动跟随模型的归一化缩放与镜像
+    this.skeleton = new SkeletonOverlay(object);
+    this.skeleton.calibrate(maxDimension * this.baseScale);
+    this.skeleton.setVisible(this.skeletonOn);
+    this.scene.add(this.skeleton.root);
+
     this.frameModel();
     this.currentAction = null;
     this.playing = false;
@@ -379,19 +441,29 @@ export class FbxPlayer {
   }
 
   captureFrame(size = 256): string | null {
+    // 缩略图不要画上骨骼叠加层
+    const skeletonWasVisible = this.skeleton?.isVisible ?? false;
+    if (skeletonWasVisible) this.skeleton?.setVisible(false);
     this.renderer.render(this.scene, this.camera);
     const source = this.renderer.domElement;
     const side = Math.min(source.width, source.height);
-    if (side <= 0) return null;
+    if (side <= 0) {
+      if (skeletonWasVisible) this.skeleton?.setVisible(true);
+      return null;
+    }
 
     const canvas = document.createElement('canvas');
     canvas.width = size;
     canvas.height = size;
     const ctx = canvas.getContext('2d');
-    if (!ctx) return null;
+    if (!ctx) {
+      if (skeletonWasVisible) this.skeleton?.setVisible(true);
+      return null;
+    }
     ctx.fillStyle = '#1b1e25';
     ctx.fillRect(0, 0, size, size);
     ctx.drawImage(source, (source.width - side) / 2, (source.height - side) / 2, side, side, 0, 0, size, size);
+    if (skeletonWasVisible) this.skeleton?.setVisible(true);
     return canvas.toDataURL('image/jpeg', 0.82);
   }
 
@@ -403,6 +475,11 @@ export class FbxPlayer {
     }
     this.currentAction = null;
     this.clips = [];
+    if (this.skeleton) {
+      this.scene.remove(this.skeleton.root);
+      this.skeleton.dispose();
+      this.skeleton = null;
+    }
     if (this.model) {
       this.scene.remove(this.model);
       disposeObject(this.model);
@@ -427,14 +504,14 @@ export class FbxPlayer {
 
 function collectStats(object: THREE.Object3D): ModelStats {
   let meshes = 0;
-  let bones = 0;
   let triangles = 0;
   let vertices = 0;
   let skinned = false;
   const materials = new Set<THREE.Material>();
+  const boneNodes: THREE.Bone[] = [];
 
   object.traverse((child) => {
-    if ((child as THREE.Bone).isBone) bones += 1;
+    if ((child as THREE.Bone).isBone) boneNodes.push(child as THREE.Bone);
     const mesh = child as THREE.Mesh;
     if (!mesh.isMesh || !mesh.geometry) return;
     meshes += 1;
@@ -448,7 +525,16 @@ function collectStats(object: THREE.Object3D): ModelStats {
     for (const material of list) if (material) materials.add(material);
   });
 
-  return { meshes, bones, triangles: Math.round(triangles), vertices, materials: materials.size, skinned };
+  const shadows = filterShadowBones(boneNodes);
+  return {
+    meshes,
+    bones: shadows.kept.length,
+    boneNodes: boneNodes.length,
+    triangles: Math.round(triangles),
+    vertices,
+    materials: materials.size,
+    skinned,
+  };
 }
 
 /** 去掉根骨骼的水平位移（Mixamo 的髋部节点） */

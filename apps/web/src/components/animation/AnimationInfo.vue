@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import Icon from '../ui/Icon.vue';
+import BoneTree from './BoneTree.vue';
 import { useAnimationStore } from '@/stores/animation';
 import { formatBytes } from '@/utils/image';
 
 const store = useAnimationStore();
+const tab = ref<'info' | 'bones'>('info');
 
 const file = computed(() => store.selectedFile);
 
@@ -16,13 +18,22 @@ function clipDuration(seconds: number): string {
 <template>
   <aside class="anim-info">
     <header class="head">
-      <div class="title">
-        <Icon name="info" :size="15" />
-        <span>动画信息</span>
+      <div class="tabs">
+        <button class="tab" :class="{ active: tab === 'info' }" type="button" @click="tab = 'info'">
+          <Icon name="info" :size="13" />
+          动画信息
+        </button>
+        <button class="tab" :class="{ active: tab === 'bones' }" type="button" @click="tab = 'bones'">
+          <Icon name="bone" :size="13" />
+          骨骼
+          <span v-if="store.boneList.length" class="chip">{{ store.boneList.length }}</span>
+        </button>
       </div>
     </header>
 
-    <div class="body">
+    <BoneTree v-if="tab === 'bones'" />
+
+    <div v-else class="body">
       <template v-if="file">
         <section class="block">
           <span class="field-label">文件</span>
@@ -37,7 +48,17 @@ function clipDuration(seconds: number): string {
               </dd>
             </div>
             <div v-if="store.selectedStats">
-              <dt>骨骼</dt><dd>{{ store.selectedStats.bones }}</dd>
+              <dt>骨骼</dt>
+              <dd>
+                {{ store.selectedStats.bones }}
+                <span
+                  v-if="store.selectedStats.boneNodes > store.selectedStats.bones"
+                  class="note"
+                  :title="`场景里共有 ${store.selectedStats.boneNodes} 个骨骼对象，其余为 FBX 同名包装节点`"
+                >
+                  （共 {{ store.selectedStats.boneNodes }} 节点）
+                </span>
+              </dd>
             </div>
             <div v-if="store.selectedStats">
               <dt>三角面</dt><dd>{{ store.selectedStats.triangles.toLocaleString('en-US') }}</dd>
@@ -136,16 +157,40 @@ function clipDuration(seconds: number): string {
 }
 
 .head {
-  padding: 12px 14px;
+  padding: 8px 10px;
   border-bottom: 1px solid var(--border);
 }
 
-.title {
+.tabs {
   display: flex;
+  gap: 4px;
+}
+
+.tab {
+  display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 5px;
+  flex: 1;
+  justify-content: center;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.tab:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.tab.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
   font-weight: 600;
-  font-size: 13px;
 }
 
 .body {
@@ -194,6 +239,12 @@ function clipDuration(seconds: number): string {
   margin: 0;
   font-size: 11.5px;
   text-align: right;
+}
+
+.note {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  cursor: help;
 }
 
 .clips {

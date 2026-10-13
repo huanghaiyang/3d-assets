@@ -48,6 +48,9 @@ const PATHS: Record<string, string> = {
   repeat: 'M17 1l4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 23l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3',
   flip: 'M12 3v18M7 8L3 12l4 4M17 8l4 4-4 4',
   lock: 'M19 11H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2zM7 11V7a5 5 0 0 1 10 0v4',
+  bone: 'M7 3.5a2.5 2.5 0 0 1 3.54 3.54l3.42 3.42A2.5 2.5 0 1 1 17 17a2.5 2.5 0 1 1-3.54-3.54L10.04 10A2.5 2.5 0 1 1 7 3.5z',
+  chevronDown: 'M6 9l6 6 6-6',
+  chevronRight: 'M9 6l6 6-6 6',
 };
 
 const path = computed(() => PATHS[props.name] ?? '');

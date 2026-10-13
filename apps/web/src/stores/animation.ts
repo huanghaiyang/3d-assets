@@ -2,6 +2,7 @@ import { computed, ref, watch } from 'vue';
 import { defineStore } from 'pinia';
 import { animationApi, type AnimationFile, type AnimationInfoResponse } from '@/api/animation';
 import { FbxPlayer, type ClipInfo, type ModelStats } from '@/viewer/FbxPlayer';
+import type { BoneNode, FlatBone } from '@/viewer/SkeletonOverlay';
 import { matchToken } from '@/utils/fuzzy';
 
 const THUMB_SIZE = 256;
@@ -67,6 +68,14 @@ export const useAnimationStore = defineStore('animation', () => {
   const viewLoading = ref(false);
   const viewError = ref<string | null>(null);
   const toasts = ref<AnimationToast[]>([]);
+
+  // 骨骼
+  const showSkeleton = ref(false);
+  const boneTree = ref<BoneNode[]>([]);
+  const boneList = ref<FlatBone[]>([]);
+  const selectedBones = ref<string[]>([]);
+  const boneKeyword = ref('');
+  const ignoredBoneNodes = ref(0);
 
   /** 内存封面缓存：key = 文件绝对路径（跨页保留，切回时无需重算） */
   const thumbnails = ref<Record<string, string>>({});
@@ -299,6 +308,11 @@ export const useAnimationStore = defineStore('animation', () => {
       player.setMirror(mirror.value);
       player.setInPlace(inPlace.value);
       player.setSpeed(speed.value);
+      // 换模型后重建骨骼树，并沿用当前的骨骼显示/选择状态
+      syncBones();
+      selectedBones.value = [];
+      player.setSelectedBones([]);
+      player.setSkeletonVisible(showSkeleton.value);
       activeClipIndex.value = 0;
       if (result.clips.length > 0) {
         player.playClip(0);
@@ -363,6 +377,49 @@ export const useAnimationStore = defineStore('animation', () => {
 
   function resetView(): void {
     player?.resetView();
+  }
+
+  // ===== 骨骼 =====
+
+  function syncBones(): void {
+    boneTree.value = player?.boneTree ?? [];
+    boneList.value = player?.boneList ?? [];
+    ignoredBoneNodes.value = player?.ignoredBoneNodes ?? 0;
+  }
+
+  function setSkeletonVisible(on: boolean): void {
+    showSkeleton.value = on;
+    player?.setSkeletonVisible(on);
+  }
+
+  function setBoneSelection(ids: string[]): void {
+    selectedBones.value = ids;
+    player?.setSelectedBones(ids);
+  }
+
+  function toggleBone(id: string): void {
+    const next = selectedBones.value.includes(id)
+      ? selectedBones.value.filter((item) => item !== id)
+      : [...selectedBones.value, id];
+    setBoneSelection(next);
+  }
+
+  function clearBoneSelection(): void {
+    setBoneSelection([]);
+  }
+
+  function setHoveredBone(id: string | null): void {
+    player?.setHoveredBone(id);
+  }
+
+  /** 在模型上点选骨骼；additive = 按住 Ctrl/Cmd/Shift 时并选 */
+  function pickBoneAt(clientX: number, clientY: number, additive: boolean): string | null {
+    const id = player?.pickBone(clientX, clientY) ?? null;
+    if (!id) return null;
+    if (!showSkeleton.value) setSkeletonVisible(true);
+    if (additive) toggleBone(id);
+    else setBoneSelection([id]);
+    return id;
   }
 
   function setPage(next: number): void {
@@ -482,6 +539,18 @@ export const useAnimationStore = defineStore('animation', () => {
     viewLoading,
     viewError,
     toasts,
+    showSkeleton,
+    boneTree,
+    boneList,
+    selectedBones,
+    boneKeyword,
+    ignoredBoneNodes,
+    setSkeletonVisible,
+    setBoneSelection,
+    toggleBone,
+    clearBoneSelection,
+    setHoveredBone,
+    pickBoneAt,
     thumbnails,
     thumbBusy,
     attachPlayer,

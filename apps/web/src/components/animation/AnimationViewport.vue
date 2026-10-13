@@ -41,11 +41,56 @@ function formatTime(seconds: number): string {
 }
 
 const SPEEDS = [0.25, 0.5, 1, 1.5, 2];
+
+/** 已选骨骼的名字，用于标题下方提示 */
+const selectedBoneLabels = computed(() => {
+  const byId = new Map(store.boneList.map((bone) => [bone.id, bone.label]));
+  return store.selectedBones.map((id) => byId.get(id) ?? id);
+});
+
+const selectedBoneText = computed(() => {
+  const labels = selectedBoneLabels.value;
+  if (labels.length === 0) return '';
+  if (labels.length <= 3) return labels.join('、');
+  return `${labels.slice(0, 3).join('、')} 等 ${labels.length} 根`;
+});
+
+/**
+ * 在模型上点选骨骼。
+ * 只有"没拖动过"的左键单击才算点选，避免旋转视角时误选。
+ */
+let downAt: { x: number; y: number } | null = null;
+
+function onPointerDown(event: PointerEvent): void {
+  if (event.button !== 0) return;
+  downAt = { x: event.clientX, y: event.clientY };
+}
+
+function onPointerUp(event: PointerEvent): void {
+  const start = downAt;
+  downAt = null;
+  if (!start || event.button !== 0) return;
+  if (Math.hypot(event.clientX - start.x, event.clientY - start.y) > 4) return;
+  if (!store.selectedPath) return;
+  const id = store.pickBoneAt(event.clientX, event.clientY, event.ctrlKey || event.metaKey || event.shiftKey);
+  if (!id && !(event.ctrlKey || event.metaKey || event.shiftKey)) store.clearBoneSelection();
+}
+
+function onCanvasLeave(): void {
+  store.setHoveredBone(null);
+}
 </script>
 
 <template>
   <section class="anim-viewport">
-    <div ref="hostRef" class="canvas-host" />
+    <div
+      ref="hostRef"
+      class="canvas-host"
+      :class="{ picking: store.showSkeleton }"
+      @pointerdown="onPointerDown"
+      @pointerup="onPointerUp"
+      @pointerleave="onCanvasLeave"
+    />
 
     <!-- 顶部标题 -->
     <div class="overlay overlay-title">
@@ -58,8 +103,27 @@ const SPEEDS = [0.25, 0.5, 1, 1.5, 2];
       <span v-if="store.selectedFile" class="chip">{{ formatBytes(store.selectedFile.size) }}</span>
     </div>
 
+    <!-- 已选骨骼 -->
+    <div v-if="selectedBoneText" class="overlay overlay-bones">
+      <Icon name="bone" :size="12" />
+      <span class="bone-text">{{ selectedBoneText }}</span>
+      <button class="bone-clear" type="button" title="清除骨骼选择" @click="store.clearBoneSelection()">
+        <Icon name="close" :size="11" />
+      </button>
+    </div>
+
     <!-- 右上工具 -->
     <div class="overlay overlay-tools">
+      <button
+        class="tool"
+        :class="{ active: store.showSkeleton }"
+        type="button"
+        :disabled="store.boneList.length === 0"
+        title="显示骨骼（可在模型上直接点选骨骼）"
+        @click="store.setSkeletonVisible(!store.showSkeleton)"
+      >
+        <Icon name="bone" :size="15" />
+      </button>
       <button
         class="tool"
         :class="{ active: store.mirror }"
@@ -161,6 +225,11 @@ const SPEEDS = [0.25, 0.5, 1, 1.5, 2];
   inset: 0;
 }
 
+/* 显示骨骼时给出"可点选"的光标提示 */
+.canvas-host.picking {
+  cursor: crosshair;
+}
+
 .overlay {
   position: absolute;
   z-index: 2;
@@ -173,6 +242,51 @@ const SPEEDS = [0.25, 0.5, 1, 1.5, 2];
   align-items: center;
   gap: 8px;
   max-width: calc(100% - 90px);
+}
+
+.overlay-bones {
+  top: 44px;
+  left: 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100% - 90px);
+  padding: 4px 6px 4px 9px;
+  border-radius: 999px;
+  background: rgba(251, 191, 36, 0.14);
+  border: 1px solid rgba(251, 191, 36, 0.4);
+  color: #fcd34d;
+  font-size: 11.5px;
+}
+
+.bone-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bone-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  opacity: 0.75;
+}
+
+.bone-clear:hover {
+  background: rgba(251, 191, 36, 0.25);
+  opacity: 1;
+}
+
+.tool:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
 .now-playing {
