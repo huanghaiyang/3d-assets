@@ -64,7 +64,6 @@ export class FbxPlayer {
   private currentAction: THREE.AnimationAction | null = null;
   private skeleton: SkeletonOverlay | null = null;
   private skeletonOn = false;
-  private readonly raycaster = new THREE.Raycaster();
   private disposed = false;
   private gridOn = true;
   private mirrorOn = false;
@@ -217,12 +216,7 @@ export class FbxPlayer {
     if (!this.skeleton) return null;
     const rect = this.renderer.domElement.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return null;
-    const ndc = new THREE.Vector2(
-      ((clientX - rect.left) / rect.width) * 2 - 1,
-      -((clientY - rect.top) / rect.height) * 2 + 1,
-    );
-    this.raycaster.setFromCamera(ndc, this.camera);
-    return this.skeleton.pick(this.raycaster);
+    return this.skeleton.pick(this.camera, rect.width, rect.height, clientX - rect.left, clientY - rect.top);
   }
 
   /** 加载 FBX（只读读取，加载完成后源文件不再被占用） */

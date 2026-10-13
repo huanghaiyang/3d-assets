@@ -76,6 +76,8 @@ export const useAnimationStore = defineStore('animation', () => {
   const selectedBones = ref<string[]>([]);
   const boneKeyword = ref('');
   const ignoredBoneNodes = ref(0);
+  /** 光标下悬停的骨骼（用于点选前的反馈） */
+  const hoveredBoneId = ref<string | null>(null);
 
   /** 内存封面缓存：key = 文件绝对路径（跨页保留，切回时无需重算） */
   const thumbnails = ref<Record<string, string>>({});
@@ -409,7 +411,16 @@ export const useAnimationStore = defineStore('animation', () => {
   }
 
   function setHoveredBone(id: string | null): void {
+    if (hoveredBoneId.value === id) return;
+    hoveredBoneId.value = id;
     player?.setHoveredBone(id);
+  }
+
+  /** 光标移动时的悬停检测：命中就提前高亮，让"要点哪根"一目了然 */
+  function hoverBoneAt(clientX: number, clientY: number): string | null {
+    const id = player?.pickBone(clientX, clientY) ?? null;
+    setHoveredBone(id);
+    return id;
   }
 
   /** 在模型上点选骨骼；additive = 按住 Ctrl/Cmd/Shift 时并选 */
@@ -545,11 +556,13 @@ export const useAnimationStore = defineStore('animation', () => {
     selectedBones,
     boneKeyword,
     ignoredBoneNodes,
+    hoveredBoneId,
     setSkeletonVisible,
     setBoneSelection,
     toggleBone,
     clearBoneSelection,
     setHoveredBone,
+    hoverBoneAt,
     pickBoneAt,
     thumbnails,
     thumbBusy,

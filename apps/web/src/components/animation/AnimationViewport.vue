@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import Icon from '../ui/Icon.vue';
 import { FbxPlayer } from '@/viewer/FbxPlayer';
 import { useAnimationStore } from '@/stores/animation';
@@ -60,6 +60,29 @@ const selectedBoneText = computed(() => {
  * 只有"没拖动过"的左键单击才算点选，避免旋转视角时误选。
  */
 let downAt: { x: number; y: number } | null = null;
+/** 悬停检测的节流标记：每帧最多算一次 */
+let hoverPending = false;
+let hoverAt: { x: number; y: number } | null = null;
+const hoverLabel = ref<string | null>(null);
+const hoverPos = ref({ x: 0, y: 0 });
+
+const boneLabels = computed(() => new Map(store.boneList.map((bone) => [bone.id, bone.label])));
+
+function onPointerMove(event: PointerEvent): void {
+  // 只在骨骼显示时给悬停反馈，否则鼠标划过模型会一直弹名字
+  if (event.pointerType !== 'mouse' || !store.selectedPath || !store.showSkeleton) return;
+  hoverAt = { x: event.clientX, y: event.clientY };
+  if (hoverPending) return;
+  hoverPending = true;
+  requestAnimationFrame(() => {
+    hoverPending = false;
+    const point = hoverAt;
+    if (!point) return;
+    const id = store.hoverBoneAt(point.x, point.y);
+    hoverLabel.value = id ? (boneLabels.value.get(id) ?? null) : null;
+    hoverPos.value = point;
+  });
+}
 
 function onPointerDown(event: PointerEvent): void {
   if (event.button !== 0) return;
@@ -77,8 +100,21 @@ function onPointerUp(event: PointerEvent): void {
 }
 
 function onCanvasLeave(): void {
+  hoverAt = null;
+  hoverLabel.value = null;
   store.setHoveredBone(null);
 }
+
+// 关掉骨骼显示时，清掉悬停提示
+watch(
+  () => store.showSkeleton,
+  (on) => {
+    if (on) return;
+    hoverAt = null;
+    hoverLabel.value = null;
+    store.setHoveredBone(null);
+  },
+);
 </script>
 
 <template>
@@ -89,8 +125,18 @@ function onCanvasLeave(): void {
       :class="{ picking: store.showSkeleton }"
       @pointerdown="onPointerDown"
       @pointerup="onPointerUp"
+      @pointermove="onPointerMove"
       @pointerleave="onCanvasLeave"
     />
+
+    <!-- 光标下的骨骼：点选前的反馈 -->
+    <div
+      v-if="hoverLabel"
+      class="overlay bone-tip"
+      :style="{ left: `${hoverPos.x}px`, top: `${hoverPos.y}px` }"
+    >
+      {{ hoverLabel }}
+    </div>
 
     <!-- 顶部标题 -->
     <div class="overlay overlay-title">
@@ -262,6 +308,21 @@ function onCanvasLeave(): void {
 .bone-text {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 跟随光标的骨骼名提示（fixed 定位，避免被 overlay 的祖先裁剪） */
+.bone-tip {
+  position: fixed;
+  z-index: 40;
+  transform: translate(12px, 12px);
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid rgba(240, 171, 252, 0.45);
+  background: rgba(22, 23, 27, 0.9);
+  color: #f0abfc;
+  font-size: 11px;
+  pointer-events: none;
   white-space: nowrap;
 }
 

@@ -81,6 +81,9 @@ export class SkeletonOverlay {
   private readonly points: THREE.Points;
   private readonly lines: THREE.LineSegments;
   private readonly step = new THREE.Vector3();
+  /** 拾取时复用，避免每次移动都分配对象 */
+  private readonly worldPoint = new THREE.Vector3();
+  private readonly projected = new THREE.Vector3();
   private readonly linePositions: Float32Array;
   private readonly pointPositions: Float32Array;
   private readonly lineColors: Float32Array;
@@ -88,7 +91,6 @@ export class SkeletonOverlay {
   private readonly segmentBone: number[] = [];
   private hoveredId: string | null = null;
   private visible = true;
-  private pickThreshold = 0.05;
 
   constructor(model: THREE.Object3D) {
     const all: THREE.Bone[] = [];
@@ -219,9 +221,8 @@ export class SkeletonOverlay {
     return this.visible;
   }
 
-  /** 建议的拾取阈值：按骨骼包围盒尺寸自适应 */
+  /** 按模型尺寸调整关节圆点大小（拾取是按屏幕距离算的，不需要阈值） */
   calibrate(modelHeight: number): void {
-    this.pickThreshold = Math.max(0.02, modelHeight * 0.025);
     const material = this.points.material as THREE.PointsMaterial;
     material.size = Math.max(0.02, modelHeight * 0.016);
   }
@@ -232,8 +233,7 @@ export class SkeletonOverlay {
     this.refreshColors();
   }
 
-  setHovered(id: string | null): void {
-    if (this.hoveredId === id) return;
+  setHovered(id: string | null): void {    if (this.hoveredId === id) return;
     this.hoveredId = id;
     this.refreshColors();
   }
@@ -297,22 +297,54 @@ export class SkeletonOverlay {
   }
 
   /**
-   * 用屏幕射线在骨骼点云上取最近的一根。
-   * 返回骨骼 id；没命中返回 null。
+   * 屏幕空间拾取：把每根骨骼投影到屏幕上，取离光标最近的那一根。
+   *
+   * 这里刻意不用「射线到点云的距离」：`raycaster.params.Points.threshold` 是**世界单位**，
+   * 投影到屏幕上的可点半径会随距离线性变大，远处的骨骼反而拥有一大片可点区域，
+   * 于是经常抢走光标正对着的那根骨骼（表现就是"点不准"）。
+   * 改成按屏幕像素距离比较后，可点区域就是屏幕上看得见的那个圆点本身。
    */
-  pick(raycaster: THREE.Raycaster): string | null {
-    if (this.bones.length === 0) return null;
-    const previous = raycaster.params.Points?.threshold ?? 0;
-    raycaster.params.Points = { threshold: this.pickThreshold };
-    const hits = raycaster.intersectObject(this.points, false);
-    raycaster.params.Points = { threshold: previous };
-    const hit = hits[0];
-    if (!hit || hit.index === undefined) return null;
-    return this.indexToId(hit.index);
-  }
+  pick(camera: THREE.PerspectiveCamera, width: number, height: number, x: number, y: number): string | null {
+    if (this.bones.length === 0 || width <= 0 || height <= 0) return null;
 
-  private indexToId(index: number): string | null {
-    return this.bones[index]?.uuid ?? null;
+    const worldRadius = (this.points.material as THREE.PointsMaterial).size * 0.5;
+    const tanHalfFov = Math.tan(THREE.MathUtils.degToRad(camera.fov) * 0.5);
+
+    let bestIndex = -1;
+    let bestDistance = Infinity;
+    let bestDepth = Infinity;
+
+    for (let index = 0; index < this.bones.length; index += 1) {
+      const world = this.worldPoint.set(
+        this.pointPositions[index * 3]!,
+        this.pointPositions[index * 3 + 1]!,
+        this.pointPositions[index * 3 + 2]!,
+      );
+
+      // 屏幕半径按到相机的距离换算，与 sizeAttenuation 下实际画出的圆点一致
+      const depth = camera.position.distanceTo(world);
+      this.projected.copy(world).project(camera);
+      if (this.projected.z > 1) continue; // 在相机后方
+
+      const screenX = (this.projected.x * 0.5 + 0.5) * width;
+      const screenY = (-this.projected.y * 0.5 + 0.5) * height;
+      const distance = Math.hypot(screenX - x, screenY - y);
+
+      const pixelRadius = depth > 0 ? (worldRadius / (depth * tanHalfFov)) * (height * 0.5) : 0;
+      // 可点半径：跟着圆点在屏幕上的大小走，并给出一个舒适的最小值。
+      // 因为取的是"离光标最近"的那根，半径放宽不会像以前那样抢错骨骼。
+      const limit = Math.min(40, Math.max(16, pixelRadius * 2));
+      if (distance > limit) continue;
+
+      // 距离更近者优先；差在 2px 以内时选更靠前（不被遮挡）的那根
+      if (distance < bestDistance - 2 || (distance < bestDistance + 2 && this.projected.z < bestDepth)) {
+        bestIndex = index;
+        bestDistance = distance;
+        bestDepth = this.projected.z;
+      }
+    }
+
+    return bestIndex >= 0 ? this.bones[bestIndex]!.uuid : null;
   }
 
   dispose(): void {
