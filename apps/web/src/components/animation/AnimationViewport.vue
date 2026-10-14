@@ -43,10 +43,76 @@ function formatTime(seconds: number): string {
 const SPEEDS = [0.25, 0.5, 1, 1.5, 2];
 
 const POSE_MODES = [
-  { value: 'rotate' as const, label: '旋转 R', hint: '绕轴旋转骨骼' },
-  { value: 'translate' as const, label: '移动 G', hint: '平移骨骼' },
-  { value: 'scale' as const, label: '缩放 S', hint: '缩放骨骼' },
+  { value: 'rotate' as const, label: '旋转 R', hint: '按 R 进入旋转，鼠标直接转' },
+  { value: 'translate' as const, label: '移动 G', hint: '按 G 进入移动，鼠标直接拖' },
+  { value: 'scale' as const, label: '缩放 S', hint: '按 S 进入缩放，鼠标推拉' },
 ];
+
+/** 模态操作头文案，形如「旋转 Z: 45.0°」 */
+const modalLabel = computed(() => {
+  const modal = store.modalTransform;
+  if (!modal) return '';
+  const axis = modal.axis ? `${modal.axis}${modal.plane ? ' 平面' : ''}` : '';
+  const suffix = modal.numeric !== '' ? ` ${modal.numeric}` : '';
+  if (modal.kind === 'rotate') return `旋转 ${axis}`.trim() + `: ${modal.amount.toFixed(1)}°${suffix}`;
+  if (modal.kind === 'translate') return `移动 ${axis}`.trim() + `: ${modal.amount.toFixed(3)}${suffix}`;
+  return `缩放 ${axis}`.trim() + `: ${modal.amount.toFixed(3)}×${suffix}`;
+});
+
+/** 最近一次指针位置：按 G/R/S 时要知道从哪里开始 */
+let lastPointer = { x: 0, y: 0 };
+
+function isTypingTarget(target: EventTarget | null): boolean {
+  const element = target as HTMLElement | null;
+  if (!element) return false;
+  const tag = element.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || element.isContentEditable;
+}
+
+function onKeyDown(event: KeyboardEvent): void {
+  if (!store.poseMode || isTypingTarget(event.target)) return;
+  const key = event.key.toLowerCase();
+
+  // Alt+G / Alt+R / Alt+S：清空对应分量（Blender 语义）
+  if (event.altKey && !event.ctrlKey && !event.metaKey) {
+    const component = key === 'g' ? 'position' : key === 'r' ? 'rotation' : key === 's' ? 'scale' : null;
+    if (component) {
+      event.preventDefault();
+      store.clearPoseComponent(component);
+    }
+    return;
+  }
+  if (event.ctrlKey || event.metaKey) return;
+
+  if (store.modalTransform) {
+    if (key === 'escape') {
+      event.preventDefault();
+      store.cancelModalTransform();
+    } else if (key === 'enter') {
+      event.preventDefault();
+      store.confirmModalTransform();
+    } else if (key === 'x' || key === 'y' || key === 'z') {
+      event.preventDefault();
+      store.setModalAxis(key.toUpperCase() as 'X' | 'Y' | 'Z', event.shiftKey);
+    } else if (/^[0-9]$/.test(event.key) || event.key === '.' || event.key === '-') {
+      event.preventDefault();
+      store.pushModalDigit(event.key);
+    } else if (key === 'backspace') {
+      event.preventDefault();
+      store.popModalDigit();
+    }
+    return;
+  }
+
+  const kind = key === 'g' ? 'translate' : key === 'r' ? 'rotate' : key === 's' ? 'scale' : null;
+  if (kind) {
+    event.preventDefault();
+    store.beginModalTransform(kind, lastPointer.x, lastPointer.y);
+  }
+}
+
+onMounted(() => window.addEventListener('keydown', onKeyDown));
+onBeforeUnmount(() => window.removeEventListener('keydown', onKeyDown));
 
 /** 已选骨骼的名字，用于标题下方提示 */
 const selectedBoneLabels = computed(() => {
@@ -75,8 +141,15 @@ const hoverPos = ref({ x: 0, y: 0 });
 const boneLabels = computed(() => new Map(store.boneList.map((bone) => [bone.id, bone.label])));
 
 function onPointerMove(event: PointerEvent): void {
+  if (event.pointerType !== 'mouse' || !store.selectedPath) return;
+  lastPointer = { x: event.clientX, y: event.clientY };
+  // 模态变换进行中：鼠标直接驱动骨骼
+  if (store.modalTransform) {
+    store.updateModalTransform(event.clientX, event.clientY);
+    return;
+  }
   // 只在骨骼显示时给悬停反馈，否则鼠标划过模型会一直弹名字
-  if (event.pointerType !== 'mouse' || !store.selectedPath || !store.showSkeleton) return;
+  if (!store.showSkeleton) return;
   hoverAt = { x: event.clientX, y: event.clientY };
   if (hoverPending) return;
   hoverPending = true;
@@ -91,13 +164,25 @@ function onPointerMove(event: PointerEvent): void {
 }
 
 function onPointerDown(event: PointerEvent): void {
+  // 模态变换进行中：左键确认、右键取消（与 Blender 一致）
+  if (store.modalTransform) {
+    event.preventDefault();
+    if (event.button === 2) store.cancelModalTransform();
+    else if (event.button === 0) store.confirmModalTransform();
+    return;
+  }
   if (event.button !== 0) return;
   downAt = { x: event.clientX, y: event.clientY };
+}
+
+function onContextMenu(event: MouseEvent): void {
+  if (store.modalTransform) event.preventDefault();
 }
 
 function onPointerUp(event: PointerEvent): void {
   const start = downAt;
   downAt = null;
+  if (store.modalTransform) return;
   // 这一下是在拖 gizmo：交给姿态模式处理，别改骨骼选择
   const transformGesture = player?.isTransformGesture ?? false;
   player?.endPointerGesture();
@@ -137,7 +222,11 @@ watch(
       @pointerup="onPointerUp"
       @pointermove="onPointerMove"
       @pointerleave="onCanvasLeave"
+      @contextmenu="onContextMenu"
     />
+
+    <!-- 模态变换操作头：形如「旋转 Z: 45.0°」，与 Blender 一致 -->
+    <div v-if="modalLabel" class="overlay modal-hud">{{ modalLabel }}</div>
 
     <!-- 光标下的骨骼：点选前的反馈 -->
     <div
@@ -348,6 +437,23 @@ watch(
 .pose-frozen {
   font-size: 11px;
   color: #c4b5fd;
+  white-space: nowrap;
+}
+
+/* 模态变换操作头（Blender 的 header 提示） */
+.modal-hud {
+  left: 50%;
+  top: 16px;
+  transform: translateX(-50%);
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: rgba(124, 92, 255, 0.22);
+  border: 1px solid rgba(124, 92, 255, 0.6);
+  color: #ddd6fe;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
   white-space: nowrap;
 }
 

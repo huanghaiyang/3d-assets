@@ -264,8 +264,12 @@ function collapseAll(): void {
           </button>
         </div>
         <p class="pose-hint">
-          已改动 {{ store.poseChangedCount }} / {{ store.poseBoneTotal }} 根。姿态只在当前状态生效，
-          按播放会重新被动画覆盖。
+          已改动 {{ store.poseChangedCount }} / {{ store.poseBoneTotal }} 根。<br />
+          按 <span class="mono">G</span> / <span class="mono">R</span> / <span class="mono">S</span> 后用鼠标直接变换，
+          <span class="mono">X</span>/<span class="mono">Y</span>/<span class="mono">Z</span> 锁轴（+<span class="mono">Shift</span> 为平面），
+          输入数字可精确取值，<span class="mono">Enter</span>/左键确认、<span class="mono">Esc</span>/右键取消，
+          <span class="mono">Alt</span>+<span class="mono">G/R/S</span> 清空对应分量。<br />
+          姿态只在当前状态生效，按播放会重新被动画覆盖。
         </p>
       </template>
       <p v-else class="pose-hint">在模型或下面的树里选一根骨骼，然后在视口里拖 gizmo 摆姿势。</p>

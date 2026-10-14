@@ -42,6 +42,44 @@ export interface PlaybackState {
   speed: number;
 }
 
+/** 模态变换（G/R/S）的实时状态，用于界面提示，类似 Blender 的操作头 */
+export interface ModalTransformState {
+  kind: TransformMode;
+  /** 轴向约束；null 表示自由 */
+  axis: 'X' | 'Y' | 'Z' | null;
+  /** 平面约束（Shift + 轴） */
+  plane: boolean;
+  /** 用户正在输入的数字 */
+  numeric: string;
+  /** 当前量：位移距离 / 角度（度）/ 缩放系数 */
+  amount: number;
+}
+
+interface ModalTransform {
+  kind: TransformMode;
+  bone: THREE.Bone;
+  startPosition: THREE.Vector3;
+  startQuaternion: THREE.Quaternion;
+  startScale: THREE.Vector3;
+  /** 开始时的世界朝向，用来固定"局部轴"（否则旋转过程中轴会漂） */
+  startWorldQuaternion: THREE.Quaternion;
+  startPointerX: number;
+  startPointerY: number;
+  /** 骨骼在屏幕上的位置，缩放时以它为中心算半径 */
+  screenX: number;
+  screenY: number;
+  /** 固定的投影平面锚点（骨骼起始世界位置） */
+  anchor: THREE.Vector3;
+  startWorld: THREE.Vector3;
+  /** 最近一次指针位置：输入数字或切换轴向时要按它重算 */
+  lastPointerX: number;
+  lastPointerY: number;
+  axis: 'X' | 'Y' | 'Z' | null;
+  plane: boolean;
+  numeric: string;
+  amount: number;
+}
+
 /** 姿态模式下的 gizmo 操作类型（对应 Blender 的 G / R / S） */
 export type TransformMode = 'translate' | 'rotate' | 'scale';
 export type TransformSpace = 'local' | 'world';
@@ -62,6 +100,8 @@ export interface PoseState {
   /** 相对静置姿态被改过的骨骼数 */
   changedCount: number;
   total: number;
+  /** 正在进行的模态变换（G/R/S），没有则为 null */
+  modal: ModalTransformState | null;
 }
 
 const BOUNDS_SAMPLES = 6;
@@ -116,6 +156,16 @@ export class FbxPlayer {
   private poseBoneIds: string[] = [];
   private readonly poseEuler = new THREE.Euler();
   private selectedBoneId: string | null = null;
+
+  // 模态变换（Blender 的 G/R/S）用到的临时量
+  private modal: ModalTransform | null = null;
+  private readonly raycaster = new THREE.Raycaster();
+  private readonly ndc = new THREE.Vector2();
+  private readonly scratchA = new THREE.Vector3();
+  private readonly scratchB = new THREE.Vector3();
+  private readonly scratchC = new THREE.Vector3();
+  private readonly scratchQ = new THREE.Quaternion();
+  private readonly scratchPlane = new THREE.Plane();
   private disposed = false;
   private gridOn = true;
   private mirrorOn = false;
@@ -273,8 +323,253 @@ export class FbxPlayer {
       bone: bone ? this.describeBone(bone) : null,
       changedCount,
       total: this.poseBoneIds.length,
+      modal: this.modalState,
     };
     for (const listener of this.poseListeners) listener(state);
+  }
+
+  get modalState(): ModalTransformState | null {
+    const m = this.modal;
+    if (!m) return null;
+    return { kind: m.kind, axis: m.axis, plane: m.plane, numeric: m.numeric, amount: m.amount };
+  }
+
+  get isModalActive(): boolean {
+    return this.modal !== null;
+  }
+
+  // ===== 模态变换：按 G / R / S 之后鼠标直接驱动骨骼 =====
+
+  /** 把屏幕坐标投到"过 anchor、与相机平行"的平面上，得到世界坐标 */
+  private pointerToWorld(clientX: number, clientY: number, anchor: THREE.Vector3): THREE.Vector3 | null {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    this.ndc.set(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    this.raycaster.setFromCamera(this.ndc, this.camera);
+    this.camera.getWorldDirection(this.scratchC);
+    this.scratchPlane.setFromNormalAndCoplanarPoint(this.scratchC, anchor);
+    const hit = new THREE.Vector3();
+    return this.raycaster.ray.intersectPlane(this.scratchPlane, hit) ? hit : null;
+  }
+
+  /** 约束轴在世界空间的方向；space=local 时用骨骼开始时的朝向固定住 */
+  private modalAxisWorld(modal: ModalTransform): THREE.Vector3 | null {
+    if (!modal.axis) return null;
+    const axis = new THREE.Vector3(
+      modal.axis === 'X' ? 1 : 0,
+      modal.axis === 'Y' ? 1 : 0,
+      modal.axis === 'Z' ? 1 : 0,
+    );
+    if (this.transformSpace === 'local') axis.applyQuaternion(modal.startWorldQuaternion);
+    return axis.normalize();
+  }
+
+  beginModalTransform(kind: TransformMode, clientX: number, clientY: number): boolean {
+    if (!this.poseMode) return false;
+    const bone = this.bonesById.get(this.selectedBoneId ?? '');
+    if (!bone) return false;
+
+    const boneWorld = bone.getWorldPosition(new THREE.Vector3());
+    const world = this.pointerToWorld(clientX, clientY, boneWorld);
+    if (!world) return false;
+
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const projected = boneWorld.clone().project(this.camera);
+    const worldQuaternion = new THREE.Quaternion();
+    bone.getWorldQuaternion(worldQuaternion);
+
+    this.modal = {
+      kind,
+      bone,
+      startPosition: bone.position.clone(),
+      startQuaternion: bone.quaternion.clone(),
+      startScale: bone.scale.clone(),
+      startWorldQuaternion: worldQuaternion,
+      startPointerX: clientX,
+      startPointerY: clientY,
+      screenX: rect.left + (projected.x * 0.5 + 0.5) * rect.width,
+      screenY: rect.top + (-projected.y * 0.5 + 0.5) * rect.height,
+      anchor: boneWorld.clone(),
+      startWorld: world.clone(),
+      lastPointerX: clientX,
+      lastPointerY: clientY,
+      axis: null,
+      plane: false,
+      numeric: '',
+      amount: 0,
+    };
+    // 模态期间让 gizmo 让路，免得和鼠标操作抢事件
+    if (this.transformControls) this.transformControls.enabled = false;
+    this.transformMode = kind;
+    this.emitPose();
+    return true;
+  }
+
+  updateModalTransform(clientX: number, clientY: number): void {
+    const m = this.modal;
+    if (!m) return;
+    const world = this.pointerToWorld(clientX, clientY, m.anchor);
+    if (!world) return;
+    m.lastPointerX = clientX;
+    m.lastPointerY = clientY;
+
+    const numeric = m.numeric === '' ? null : Number(m.numeric);
+    const hasNumeric = numeric !== null && Number.isFinite(numeric);
+    const axisWorld = this.modalAxisWorld(m);
+
+    if (m.kind === 'translate') {
+      const move = this.scratchA.copy(world).sub(m.startWorld);
+      if (axisWorld && m.axis) {
+        const along = move.dot(axisWorld);
+        if (m.plane) {
+          move.addScaledVector(axisWorld, -along);
+          if (hasNumeric) {
+            const length = move.length();
+            if (length > 1e-6) move.multiplyScalar(numeric / length);
+          }
+        } else {
+          move.copy(axisWorld).multiplyScalar(hasNumeric ? numeric : along);
+        }
+      } else if (hasNumeric) {
+        const length = move.length();
+        if (length > 1e-6) move.multiplyScalar(numeric / length);
+      }
+      m.amount = move.length();
+
+      // 世界位移 → 父级局部位移：父级带缩放，必须用两个点来换算
+      const parent = m.bone.parent;
+      if (parent) {
+        parent.updateMatrixWorld();
+        const from = parent.worldToLocal(m.anchor.clone());
+        const to = parent.worldToLocal(m.anchor.clone().add(move));
+        m.bone.position.copy(m.startPosition).add(to.sub(from));
+      } else {
+        m.bone.position.copy(m.startPosition).add(move);
+      }
+    } else if (m.kind === 'rotate') {
+      // 没指定轴时绕视线方向旋转（Blender 的默认行为）
+      const axis = axisWorld ?? this.camera.getWorldDirection(this.scratchB).clone().negate();
+      const boneWorld = m.bone.getWorldPosition(this.scratchC);
+      const from = m.startWorld.clone().sub(boneWorld).projectOnPlane(axis);
+      const to = world.clone().sub(boneWorld).projectOnPlane(axis);
+      let angle = 0;
+      if (from.lengthSq() > 1e-10 && to.lengthSq() > 1e-10) {
+        angle = from.angleTo(to);
+        if (axis.dot(from.clone().cross(to)) < 0) angle = -angle;
+      }
+      if (hasNumeric) angle = THREE.MathUtils.degToRad(numeric);
+      m.amount = THREE.MathUtils.radToDeg(angle);
+
+      const parentQuaternion = new THREE.Quaternion();
+      if (m.bone.parent) m.bone.parent.getWorldQuaternion(parentQuaternion);
+      const localAxis = axis.clone().applyQuaternion(parentQuaternion.invert()).normalize();
+      this.scratchQ.setFromAxisAngle(localAxis, angle);
+      m.bone.quaternion.copy(this.scratchQ).multiply(m.startQuaternion);
+    } else {
+      let factor = 1;
+      if (hasNumeric) {
+        factor = numeric;
+      } else {
+        const distance0 = Math.hypot(m.startPointerX - m.screenX, m.startPointerY - m.screenY);
+        const distance1 = Math.hypot(clientX - m.screenX, clientY - m.screenY);
+        factor = distance0 > 6 ? distance1 / distance0 : 1;
+      }
+      factor = Math.min(100, Math.max(0.01, factor));
+      m.amount = factor;
+
+      const scale = m.startScale.clone();
+      if (m.axis && !m.plane) {
+        // 缩放按骨骼自身的局部轴给：世界轴映射到局部缩放分量没有唯一解
+        const key = m.axis.toLowerCase() as 'x' | 'y' | 'z';
+        scale[key] *= factor;
+      } else if (m.axis && m.plane) {
+        const skip = m.axis.toLowerCase();
+        for (const k of ['x', 'y', 'z'] as const) if (k !== skip) scale[k] *= factor;
+      } else {
+        scale.multiplyScalar(factor);
+      }
+      m.bone.scale.copy(scale);
+    }
+
+    m.bone.updateMatrixWorld(true);
+    this.emitPose();
+  }
+
+  /** 输入数字 / 切换轴向之后要立刻按当前指针位置重算，不然要等鼠标再动才生效 */
+  private reapplyModal(): void {
+    const m = this.modal;
+    if (!m) return;
+    this.updateModalTransform(m.lastPointerX, m.lastPointerY);
+  }
+
+  /** 按 X/Y/Z 设约束轴：同轴再按一次取消，Shift+轴为平面约束 */
+  setModalAxis(axis: 'X' | 'Y' | 'Z', plane: boolean): void {
+    const m = this.modal;
+    if (!m) return;
+    if (m.axis === axis) {
+      if (plane && !m.plane) m.plane = true;
+      else {
+        m.axis = null;
+        m.plane = false;
+      }
+    } else {
+      m.axis = axis;
+      m.plane = plane;
+    }
+    this.reapplyModal();
+  }
+
+  pushModalDigit(char: string): void {
+    const m = this.modal;
+    if (!m) return;
+    if (char === '-' && m.numeric !== '') return;
+    if (char === '.' && m.numeric.includes('.')) return;
+    if (m.numeric.replace('-', '').length >= 8) return;
+    m.numeric += char;
+    this.reapplyModal();
+  }
+
+  popModalDigit(): void {
+    const m = this.modal;
+    if (!m) return;
+    m.numeric = m.numeric.slice(0, -1);
+    this.reapplyModal();
+  }
+
+  /** 确认：保留当前变换 */
+  confirmModalTransform(): void {
+    if (!this.modal) return;
+    this.modal = null;
+    if (this.transformControls) this.transformControls.enabled = true;
+    this.emitPose();
+  }
+
+  /** 取消：回到按下 G/R/S 之前 */
+  cancelModalTransform(): void {
+    const m = this.modal;
+    if (!m) return;
+    m.bone.position.copy(m.startPosition);
+    m.bone.quaternion.copy(m.startQuaternion);
+    m.bone.scale.copy(m.startScale);
+    m.bone.updateMatrixWorld(true);
+    this.modal = null;
+    if (this.transformControls) this.transformControls.enabled = true;
+    this.emitPose();
+  }
+
+  /** Alt+G / Alt+R / Alt+S：把对应分量清回 FBX 绑定姿态 */
+  clearPoseComponent(component: 'position' | 'rotation' | 'scale'): void {
+    const bone = this.bonesById.get(this.selectedBoneId ?? '');
+    const rest = bone ? this.restPose.get(bone.uuid) : undefined;
+    if (!bone || !rest) return;
+    if (component === 'position') bone.position.copy(rest.p);
+    else if (component === 'rotation') bone.quaternion.copy(rest.q);
+    else bone.scale.copy(rest.s);
+    bone.updateMatrixWorld(true);
+    this.emitPose();
   }
 
   /** 记录当前姿态作为「改动」的基准 */
@@ -339,6 +634,7 @@ export class FbxPlayer {
 
   setPoseMode(on: boolean): void {
     if (this.poseMode === on) return;
+    if (!on && this.modal) this.cancelModalTransform();
     this.poseMode = on;
     if (on) {
       // 摆姿势时先把动画停下，否则每帧都会被动画覆盖
@@ -764,6 +1060,7 @@ export class FbxPlayer {
     this.clips = [];
     this.transformControls?.detach();
     this.selectedBoneId = null;
+    this.modal = null;
     this.bonesById.clear();
     this.restPose.clear();
     this.poseMode = false;

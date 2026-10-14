@@ -6,6 +6,7 @@ import {
   type BoneTransformState,
   type ClipInfo,
   type ModelStats,
+  type ModalTransformState,
   type PoseState,
   type TransformMode,
   type TransformSpace,
@@ -96,6 +97,8 @@ export const useAnimationStore = defineStore('animation', () => {
   const bonePose = ref<BoneTransformState | null>(null);
   const poseChangedCount = ref(0);
   const poseBoneTotal = ref(0);
+  /** 正在进行的 G/R/S 模态变换 */
+  const modalTransform = ref<ModalTransformState | null>(null);
 
   /** 内存封面缓存：key = 文件绝对路径（跨页保留，切回时无需重算） */
   const thumbnails = ref<Record<string, string>>({});
@@ -202,6 +205,7 @@ export const useAnimationStore = defineStore('animation', () => {
       bonePose.value = state.bone;
       poseChangedCount.value = state.changedCount;
       poseBoneTotal.value = state.total;
+      modalTransform.value = state.modal;
     });
   }
 
@@ -477,6 +481,43 @@ export const useAnimationStore = defineStore('animation', () => {
     player?.resetToRestPose();
   }
 
+  // ===== 模态变换（G / R / S） =====
+
+  /** 按下 G/R/S：开始用鼠标直接驱动骨骼 */
+  function beginModalTransform(kind: TransformMode, clientX: number, clientY: number): boolean {
+    transformMode.value = kind;
+    return player?.beginModalTransform(kind, clientX, clientY) ?? false;
+  }
+
+  function updateModalTransform(clientX: number, clientY: number): void {
+    player?.updateModalTransform(clientX, clientY);
+  }
+
+  function setModalAxis(axis: 'X' | 'Y' | 'Z', plane: boolean): void {
+    player?.setModalAxis(axis, plane);
+  }
+
+  function pushModalDigit(char: string): void {
+    player?.pushModalDigit(char);
+  }
+
+  function popModalDigit(): void {
+    player?.popModalDigit();
+  }
+
+  function confirmModalTransform(): void {
+    player?.confirmModalTransform();
+  }
+
+  function cancelModalTransform(): void {
+    player?.cancelModalTransform();
+  }
+
+  /** Alt+G / Alt+R / Alt+S：把该分量清回绑定姿态 */
+  function clearPoseComponent(component: 'position' | 'rotation' | 'scale'): void {
+    player?.clearPoseComponent(component);
+  }
+
   function toggleBone(id: string): void {
     const next = selectedBones.value.includes(id)
       ? selectedBones.value.filter((item) => item !== id)
@@ -642,6 +683,7 @@ export const useAnimationStore = defineStore('animation', () => {
     bonePose,
     poseChangedCount,
     poseBoneTotal,
+    modalTransform,
     setSkeletonVisible,
     setBoneDisplayMode,
     setPoseMode,
@@ -651,6 +693,14 @@ export const useAnimationStore = defineStore('animation', () => {
     resetBonePose,
     resetAllPoses,
     resetToRestPose,
+    beginModalTransform,
+    updateModalTransform,
+    setModalAxis,
+    pushModalDigit,
+    popModalDigit,
+    confirmModalTransform,
+    cancelModalTransform,
+    clearPoseComponent,
     setBoneSelection,
     toggleBone,
     clearBoneSelection,
