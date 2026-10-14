@@ -2,7 +2,7 @@ import { computed, ref, watch } from 'vue';
 import { defineStore } from 'pinia';
 import { animationApi, type AnimationFile, type AnimationInfoResponse } from '@/api/animation';
 import { FbxPlayer, type ClipInfo, type ModelStats } from '@/viewer/FbxPlayer';
-import type { BoneNode, FlatBone } from '@/viewer/SkeletonOverlay';
+import type { BoneDisplayMode, BoneNode, FlatBone } from '@/viewer/SkeletonOverlay';
 import { matchToken } from '@/utils/fuzzy';
 
 const THUMB_SIZE = 256;
@@ -71,6 +71,8 @@ export const useAnimationStore = defineStore('animation', () => {
 
   // 骨骼
   const showSkeleton = ref(false);
+  /** 骨骼显示方式：点线 / 八面体 */
+  const boneDisplayMode = ref<BoneDisplayMode>('stick');
   const boneTree = ref<BoneNode[]>([]);
   const boneList = ref<FlatBone[]>([]);
   const selectedBones = ref<string[]>([]);
@@ -315,6 +317,7 @@ export const useAnimationStore = defineStore('animation', () => {
       selectedBones.value = [];
       player.setSelectedBones([]);
       player.setSkeletonVisible(showSkeleton.value);
+      player.setBoneDisplayMode(boneDisplayMode.value);
       activeClipIndex.value = 0;
       if (result.clips.length > 0) {
         player.playClip(0);
@@ -392,6 +395,11 @@ export const useAnimationStore = defineStore('animation', () => {
   function setSkeletonVisible(on: boolean): void {
     showSkeleton.value = on;
     player?.setSkeletonVisible(on);
+  }
+
+  function setBoneDisplayMode(mode: BoneDisplayMode): void {
+    boneDisplayMode.value = mode;
+    player?.setBoneDisplayMode(mode);
   }
 
   function setBoneSelection(ids: string[]): void {
@@ -551,6 +559,7 @@ export const useAnimationStore = defineStore('animation', () => {
     viewError,
     toasts,
     showSkeleton,
+    boneDisplayMode,
     boneTree,
     boneList,
     selectedBones,
@@ -558,6 +567,7 @@ export const useAnimationStore = defineStore('animation', () => {
     ignoredBoneNodes,
     hoveredBoneId,
     setSkeletonVisible,
+    setBoneDisplayMode,
     setBoneSelection,
     toggleBone,
     clearBoneSelection,

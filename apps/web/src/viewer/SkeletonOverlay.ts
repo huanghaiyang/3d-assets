@@ -24,6 +24,18 @@ const DEFAULT_COLOR = new THREE.Color('#5eead4');
 const SELECTED_COLOR = new THREE.Color('#fbbf24');
 const HOVER_COLOR = new THREE.Color('#f0abfc');
 
+/**
+ * 骨骼显示方式：
+ *  - `stick` 关节圆点 + 父子连线（轻量，适合看整体结构）
+ *  - `bone`  八面体骨头 + 关节圆点（Blender 那种，一眼看出骨骼朝向与长短）
+ */
+export type BoneDisplayMode = 'stick' | 'bone';
+
+/** 八面体骨头：腰身位置与半径占骨长的比例（Blender 八面体骨骼的默认比例是 0.1，这里略放宽更清楚） */
+const OCTA_WAIST_RATIO = 0.13;
+/** 末端骨骼（没有子骨骼）补的小尾巴，长度相对父骨长度的比例 */
+const LEAF_RATIO = 0.32;
+
 /** 去掉 Mixamo 常见前缀，让树里的名字更短 */
 export function cleanBoneLabel(name: string): string {
   return name.replace(/^mixamorig[:_]?/i, '') || name;
@@ -78,8 +90,10 @@ export class SkeletonOverlay {
 
   private readonly pointGeometry = new THREE.BufferGeometry();
   private readonly lineGeometry = new THREE.BufferGeometry();
+  private readonly octaGeometry = new THREE.BufferGeometry();
   private readonly points: THREE.Points;
   private readonly lines: THREE.LineSegments;
+  private readonly octaMesh: THREE.Mesh;
   private readonly step = new THREE.Vector3();
   /** 拾取时复用，避免每次移动都分配对象 */
   private readonly worldPoint = new THREE.Vector3();
@@ -88,7 +102,16 @@ export class SkeletonOverlay {
   private readonly pointPositions: Float32Array;
   private readonly lineColors: Float32Array;
   private readonly pointColors: Float32Array;
+  private readonly octaPositions: Float32Array;
+  private readonly octaColors: Float32Array;
   private readonly segmentBone: number[] = [];
+  /**
+   * 每个八面体骨头：owner = 决定颜色的骨骼，tail 来自子骨骼位置或末端补的小尾巴。
+   * 一根骨骼有多个子级时会画成多块骨头（与 Blender 一致）。
+   */
+  private readonly boneShapes: { owner: number; child: number }[] = [];
+  private mode: BoneDisplayMode = 'stick';
+  private basePointSize = 0.035;
   private hoveredId: string | null = null;
   private visible = true;
 
@@ -125,6 +148,37 @@ export class SkeletonOverlay {
     this.linePositions = new Float32Array(this.segmentBone.length * 2 * 3);
     this.lineColors = new Float32Array(this.segmentBone.length * 2 * 3);
 
+    // 每根父→子边画一块八面体骨头；没有子级的末端骨骼补一条小尾巴，
+    // 否则手指尖、脚趾尖这些位置会只剩一个孤零零的关节圆点。
+    const hasChild = new Array<boolean>(boneCount).fill(false);
+    for (const child of this.segmentBone) {
+      const parent = this.parentIndex[child]!;
+      hasChild[parent] = true;
+      this.boneShapes.push({ owner: parent, child });
+    }
+    for (let index = 0; index < boneCount; index += 1) {
+      if (!hasChild[index]) this.boneShapes.push({ owner: index, child: -1 });
+    }
+
+    // 每块骨头 6 个顶点：头部 1 + 腰身 4 + 尾部 1
+    this.octaPositions = new Float32Array(this.boneShapes.length * 6 * 3);
+    this.octaColors = new Float32Array(this.boneShapes.length * 6 * 3);
+    const octaIndices = new Uint32Array(this.boneShapes.length * 24);
+    for (let shape = 0; shape < this.boneShapes.length; shape += 1) {
+      const base = shape * 6;
+      const at = shape * 24;
+      octaIndices.set(
+        [
+          base, base + 1, base + 2, base, base + 2, base + 3, base, base + 3, base + 4, base, base + 4, base + 1,
+          base + 1, base + 2, base + 5, base + 2, base + 3, base + 5, base + 3, base + 4, base + 5, base + 4, base + 1, base + 5,
+        ],
+        at,
+      );
+    }
+    this.octaGeometry.setAttribute('position', new THREE.BufferAttribute(this.octaPositions, 3));
+    this.octaGeometry.setAttribute('color', new THREE.BufferAttribute(this.octaColors, 3));
+    this.octaGeometry.setIndex(new THREE.BufferAttribute(octaIndices, 1));
+
     this.pointGeometry.setAttribute('position', new THREE.BufferAttribute(this.pointPositions, 3));
     this.pointGeometry.setAttribute('color', new THREE.BufferAttribute(this.pointColors, 3));
     this.lineGeometry.setAttribute('position', new THREE.BufferAttribute(this.linePositions, 3));
@@ -145,18 +199,52 @@ export class SkeletonOverlay {
       depthTest: false,
       depthWrite: false,
     });
+    // 平面着色 + 关深度测试：既保留 x-ray 的"穿透模型看骨骼"，
+    // 又能像 DCC 那样看清明暗与朝向
+    const octaMaterial = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      flatShading: true,
+      side: THREE.DoubleSide,
+      roughness: 0.5,
+      metalness: 0.05,
+      transparent: true,
+      opacity: 0.96,
+      depthTest: false,
+      depthWrite: false,
+    });
 
     this.points = new THREE.Points(this.pointGeometry, pointsMaterial);
     this.lines = new THREE.LineSegments(this.lineGeometry, lineMaterial);
+    this.octaMesh = new THREE.Mesh(this.octaGeometry, octaMaterial);
     this.points.renderOrder = 999;
     this.lines.renderOrder = 998;
+    this.octaMesh.renderOrder = 997;
     this.points.frustumCulled = false;
     this.lines.frustumCulled = false;
+    this.octaMesh.frustumCulled = false;
 
-    this.root.add(this.lines, this.points);
+    this.root.add(this.lines, this.octaMesh, this.points);
     this.buildTree();
+    this.applyMode();
     this.refreshPositions();
     this.refreshColors();
+  }
+
+  /** 按当前显示方式切换线框 / 八面体 */
+  private applyMode(): void {
+    this.lines.visible = this.mode === 'stick';
+    this.octaMesh.visible = this.mode === 'bone';
+    // 骨头模式下关节圆点稍大些，读起来更接近 DCC 里的关节球
+    (this.points.material as THREE.PointsMaterial).size = this.mode === 'bone' ? this.basePointSize * 1.25 : this.basePointSize;
+  }
+
+  get displayMode(): BoneDisplayMode {
+    return this.mode;
+  }
+
+  setDisplayMode(mode: BoneDisplayMode): void {
+    this.mode = mode;
+    this.applyMode();
   }
 
   private buildTree(): void {
@@ -223,8 +311,8 @@ export class SkeletonOverlay {
 
   /** 按模型尺寸调整关节圆点大小（拾取是按屏幕距离算的，不需要阈值） */
   calibrate(modelHeight: number): void {
-    const material = this.points.material as THREE.PointsMaterial;
-    material.size = Math.max(0.02, modelHeight * 0.016);
+    this.basePointSize = Math.max(0.02, modelHeight * 0.016);
+    this.applyMode();
   }
 
   setSelection(ids: readonly string[]): void {
@@ -265,8 +353,125 @@ export class SkeletonOverlay {
         this.lineColors[offset + vertex * 3 + 2] = color.b;
       }
     }
+    // 八面体按"拥有这块骨头"的骨骼着色（父→子这条边属于父骨骼）
+    for (let shape = 0; shape < this.boneShapes.length; shape += 1) {
+      const owner = this.bones[this.boneShapes[shape]!.owner]!;
+      const color = this.selected.has(owner.uuid)
+        ? SELECTED_COLOR
+        : owner.uuid === this.hoveredId
+          ? HOVER_COLOR
+          : DEFAULT_COLOR;
+      const offset = shape * 18;
+      for (let vertex = 0; vertex < 6; vertex += 1) {
+        this.octaColors[offset + vertex * 3] = color.r;
+        this.octaColors[offset + vertex * 3 + 1] = color.g;
+        this.octaColors[offset + vertex * 3 + 2] = color.b;
+      }
+    }
     this.pointGeometry.getAttribute('color').needsUpdate = true;
     this.lineGeometry.getAttribute('color').needsUpdate = true;
+    this.octaGeometry.getAttribute('color').needsUpdate = true;
+  }
+
+  /**
+   * 生成八面体骨头的顶点：头部一个点 → 腰身四个点 → 尾部一个点。
+   * 腰身位置与半径都取骨长的固定比例，因此骨长变化不影响形状比例。
+   */
+  private refreshBoneShapes(): void {
+    for (let shape = 0; shape < this.boneShapes.length; shape += 1) {
+      const { owner, child } = this.boneShapes[shape]!;
+      const base = shape * 18;
+
+      const hx = this.pointPositions[owner * 3]!;
+      const hy = this.pointPositions[owner * 3 + 1]!;
+      const hz = this.pointPositions[owner * 3 + 2]!;
+
+      let tx: number;
+      let ty: number;
+      let tz: number;
+      if (child >= 0) {
+        tx = this.pointPositions[child * 3]!;
+        ty = this.pointPositions[child * 3 + 1]!;
+        tz = this.pointPositions[child * 3 + 2]!;
+      } else {
+        // 末端骨骼：顺着父骨方向补一小截，让手指尖、脚趾尖也有骨头形状
+        const parent = this.parentIndex[owner]!;
+        if (parent >= 0) {
+          const dx = hx - this.pointPositions[parent * 3]!;
+          const dy = hy - this.pointPositions[parent * 3 + 1]!;
+          const dz = hz - this.pointPositions[parent * 3 + 2]!;
+          tx = hx + dx * LEAF_RATIO;
+          ty = hy + dy * LEAF_RATIO;
+          tz = hz + dz * LEAF_RATIO;
+        } else {
+          tx = hx;
+          ty = hy + 1;
+          tz = hz;
+        }
+      }
+
+      const ax = tx - hx;
+      const ay = ty - hy;
+      const az = tz - hz;
+      const length = Math.hypot(ax, ay, az);
+
+      if (length < 1e-6) {
+        // 退化骨骼（头尾重合）：收成一个点，避免出现 NaN
+        for (let vertex = 0; vertex < 6; vertex += 1) {
+          const at = base + vertex * 3;
+          this.octaPositions[at] = hx;
+          this.octaPositions[at + 1] = hy;
+          this.octaPositions[at + 2] = hz;
+        }
+        continue;
+      }
+
+      const ux = ax / length;
+      const uy = ay / length;
+      const uz = az / length;
+
+      // 取一个与骨轴不平行的参考向量，构造腰身的正交基
+      const rx = Math.abs(uy) > 0.9 ? 1 : 0;
+      const ry = Math.abs(uy) > 0.9 ? 0 : 1;
+      let px = ry * uz;
+      let py = -rx * uz;
+      let pz = rx * uy - ry * ux;
+      const pLength = Math.hypot(px, py, pz) || 1;
+      px /= pLength;
+      py /= pLength;
+      pz /= pLength;
+      const qx = uy * pz - uz * py;
+      const qy = uz * px - ux * pz;
+      const qz = ux * py - uy * px;
+
+      const waist = length * OCTA_WAIST_RATIO;
+      const cx = hx + ux * waist;
+      const cy = hy + uy * waist;
+      const cz = hz + uz * waist;
+
+      // 头部
+      this.octaPositions[base] = hx;
+      this.octaPositions[base + 1] = hy;
+      this.octaPositions[base + 2] = hz;
+      // 腰身四点：沿 p / q 两个正交方向依次绕一圈（+p → +q → -p → -q）
+      const ring: [number, number, number][] = [
+        [px, py, pz],
+        [qx, qy, qz],
+        [-px, -py, -pz],
+        [-qx, -qy, -qz],
+      ];
+      for (let vertex = 0; vertex < 4; vertex += 1) {
+        const [ox, oy, oz] = ring[vertex]!;
+        const at = base + (vertex + 1) * 3;
+        this.octaPositions[at] = cx + ox * waist;
+        this.octaPositions[at + 1] = cy + oy * waist;
+        this.octaPositions[at + 2] = cz + oz * waist;
+      }
+      // 尾部
+      this.octaPositions[base + 15] = tx;
+      this.octaPositions[base + 16] = ty;
+      this.octaPositions[base + 17] = tz;
+    }
   }
 
   /** 每帧从骨骼世界矩阵刷新几何（动画播放时骨骼一直在动） */
@@ -290,10 +495,14 @@ export class SkeletonOverlay {
       this.linePositions[offset + 5] = this.pointPositions[parent * 3 + 2]!;
     }
 
+    this.refreshBoneShapes();
+
     this.pointGeometry.getAttribute('position').needsUpdate = true;
     this.lineGeometry.getAttribute('position').needsUpdate = true;
+    this.octaGeometry.getAttribute('position').needsUpdate = true;
     this.pointGeometry.computeBoundingSphere();
     this.lineGeometry.computeBoundingSphere();
+    this.octaGeometry.computeBoundingSphere();
   }
 
   /**
@@ -350,8 +559,10 @@ export class SkeletonOverlay {
   dispose(): void {
     this.pointGeometry.dispose();
     this.lineGeometry.dispose();
+    this.octaGeometry.dispose();
     (this.points.material as THREE.Material).dispose();
     (this.lines.material as THREE.Material).dispose();
+    (this.octaMesh.material as THREE.Material).dispose();
     this.root.clear();
   }
 }

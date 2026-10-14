@@ -3,7 +3,13 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 
-import { SkeletonOverlay, filterShadowBones, type BoneNode, type FlatBone } from './SkeletonOverlay';
+import {
+  SkeletonOverlay,
+  filterShadowBones,
+  type BoneDisplayMode,
+  type BoneNode,
+  type FlatBone,
+} from './SkeletonOverlay';
 
 export interface ClipInfo {
   name: string;
@@ -64,6 +70,7 @@ export class FbxPlayer {
   private currentAction: THREE.AnimationAction | null = null;
   private skeleton: SkeletonOverlay | null = null;
   private skeletonOn = false;
+  private skeletonMode: BoneDisplayMode = 'stick';
   private disposed = false;
   private gridOn = true;
   private mirrorOn = false;
@@ -203,6 +210,16 @@ export class FbxPlayer {
     this.skeleton?.setVisible(on);
   }
 
+  get boneDisplayMode(): BoneDisplayMode {
+    return this.skeletonMode;
+  }
+
+  /** 切换骨骼显示方式：点线 / 八面体 */
+  setBoneDisplayMode(mode: BoneDisplayMode): void {
+    this.skeletonMode = mode;
+    this.skeleton?.setDisplayMode(mode);
+  }
+
   setSelectedBones(ids: readonly string[]): void {
     this.skeleton?.setSelection(ids);
   }
@@ -264,6 +281,7 @@ export class FbxPlayer {
     // 骨骼叠加层挂在场景根上（世界坐标），因此自动跟随模型的归一化缩放与镜像
     this.skeleton = new SkeletonOverlay(object);
     this.skeleton.calibrate(maxDimension * this.baseScale);
+    this.skeleton.setDisplayMode(this.skeletonMode);
     this.skeleton.setVisible(this.skeletonOn);
     this.scene.add(this.skeleton.root);
 

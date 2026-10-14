@@ -1,10 +1,16 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 import Icon from '../ui/Icon.vue';
+import SegmentedControl from '../ui/SegmentedControl.vue';
 import { useAnimationStore } from '@/stores/animation';
-import type { BoneNode } from '@/viewer/SkeletonOverlay';
+import type { BoneDisplayMode, BoneNode } from '@/viewer/SkeletonOverlay';
 
 const store = useAnimationStore();
+
+const DISPLAY_MODES = [
+  { value: 'stick', label: '点线', hint: '关节圆点 + 父子连线，看整体结构更清爽' },
+  { value: 'bone', label: '八面体', hint: 'Blender 风格的八面体骨头，能看出一根骨骼的长短与朝向' },
+];
 
 const expanded = ref<Set<string>>(new Set());
 const scrollRef = ref<HTMLDivElement | null>(null);
@@ -158,6 +164,15 @@ function collapseAll(): void {
       </button>
     </div>
 
+    <div class="mode-row">
+      <SegmentedControl
+        :model-value="store.boneDisplayMode"
+        :options="DISPLAY_MODES"
+        size="sm"
+        @update:model-value="store.setBoneDisplayMode($event as BoneDisplayMode)"
+      />
+    </div>
+
     <div class="search">
       <Icon name="search" :size="12" />
       <input v-model="store.boneKeyword" class="search-input" type="search" placeholder="搜索骨骼" />
@@ -238,6 +253,10 @@ function collapseAll(): void {
   font-size: 12px;
   color: var(--text-dim);
   cursor: pointer;
+}
+
+.mode-row {
+  padding: 0 12px 8px;
 }
 
 .icon-btn {
