@@ -42,6 +42,12 @@ function formatTime(seconds: number): string {
 
 const SPEEDS = [0.25, 0.5, 1, 1.5, 2];
 
+const POSE_MODES = [
+  { value: 'rotate' as const, label: '旋转 R', hint: '绕轴旋转骨骼' },
+  { value: 'translate' as const, label: '移动 G', hint: '平移骨骼' },
+  { value: 'scale' as const, label: '缩放 S', hint: '缩放骨骼' },
+];
+
 /** 已选骨骼的名字，用于标题下方提示 */
 const selectedBoneLabels = computed(() => {
   const byId = new Map(store.boneList.map((bone) => [bone.id, bone.label]));
@@ -92,6 +98,10 @@ function onPointerDown(event: PointerEvent): void {
 function onPointerUp(event: PointerEvent): void {
   const start = downAt;
   downAt = null;
+  // 这一下是在拖 gizmo：交给姿态模式处理，别改骨骼选择
+  const transformGesture = player?.isTransformGesture ?? false;
+  player?.endPointerGesture();
+  if (transformGesture) return;
   if (!start || event.button !== 0) return;
   if (Math.hypot(event.clientX - start.x, event.clientY - start.y) > 4) return;
   if (!store.selectedPath) return;
@@ -155,6 +165,24 @@ watch(
       <span class="bone-text">{{ selectedBoneText }}</span>
       <button class="bone-clear" type="button" title="清除骨骼选择" @click="store.clearBoneSelection()">
         <Icon name="close" :size="11" />
+      </button>
+    </div>
+
+    <!-- 姿态模式：视口里给个明确的模式提示 + G/R/S 快捷切换 -->
+    <div v-if="store.poseMode" class="overlay overlay-pose">
+      <Icon name="pose" :size="12" />
+      <span>姿态模式</span>
+      <span class="pose-sep"></span>
+      <button
+        v-for="mode in POSE_MODES"
+        :key="mode.value"
+        class="pose-tool"
+        :class="{ active: store.transformMode === mode.value }"
+        type="button"
+        :title="mode.hint"
+        @click="store.setTransformMode(mode.value)"
+      >
+        {{ mode.label }}
       </button>
     </div>
 
@@ -234,9 +262,16 @@ watch(
         <span class="mono time">{{ formatTime(store.duration) }}</span>
       </div>
       <div class="buttons">
-        <button class="btn btn-icon" type="button" :disabled="!store.selectedPath" title="播放/暂停" @click="store.togglePlay()">
+        <button
+          class="btn btn-icon"
+          type="button"
+          :disabled="!store.selectedPath || store.poseMode"
+          :title="store.poseMode ? '姿态模式下动画已暂停（播放会覆盖手动摆的姿势）' : '播放/暂停'"
+          @click="store.togglePlay()"
+        >
           <Icon :name="store.playing ? 'pause' : 'play'" :size="15" />
         </button>
+        <span v-if="store.poseMode" class="pose-frozen">姿态模式 · 已暂停</span>
         <div class="speeds">
           <button
             v-for="value in SPEEDS"
@@ -292,8 +327,7 @@ watch(
 
 .overlay-bones {
   top: 44px;
-  left: 14px;
-  display: inline-flex;
+  left: 14px;  display: inline-flex;
   align-items: center;
   gap: 6px;
   max-width: calc(100% - 90px);
@@ -309,6 +343,56 @@ watch(
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.pose-frozen {
+  font-size: 11px;
+  color: #c4b5fd;
+  white-space: nowrap;
+}
+
+/* 姿态模式提示条：左下角，避开标题与骨骼标签 */
+.overlay-pose {
+  left: 14px;
+  bottom: 88px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 6px 4px 9px;
+  border-radius: 999px;
+  background: rgba(124, 92, 255, 0.16);
+  border: 1px solid rgba(124, 92, 255, 0.5);
+  color: #c4b5fd;
+  font-size: 11.5px;
+}
+
+.pose-sep {
+  width: 1px;
+  height: 12px;
+  background: rgba(196, 181, 253, 0.35);
+  margin: 0 2px;
+}
+
+.pose-tool {
+  border: none;
+  border-radius: 999px;
+  padding: 2px 7px;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.pose-tool:hover {
+  background: rgba(124, 92, 255, 0.25);
+  opacity: 1;
+}
+
+.pose-tool.active {
+  background: rgba(124, 92, 255, 0.55);
+  color: #fff;
+  opacity: 1;
+  font-weight: 600;
 }
 
 /* 跟随光标的骨骼名提示（fixed 定位，避免被 overlay 的祖先裁剪） */

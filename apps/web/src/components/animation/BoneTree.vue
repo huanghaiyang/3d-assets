@@ -4,6 +4,7 @@ import Icon from '../ui/Icon.vue';
 import SegmentedControl from '../ui/SegmentedControl.vue';
 import { useAnimationStore } from '@/stores/animation';
 import type { BoneDisplayMode, BoneNode } from '@/viewer/SkeletonOverlay';
+import type { TransformMode, TransformSpace } from '@/viewer/FbxPlayer';
 
 const store = useAnimationStore();
 
@@ -11,6 +12,33 @@ const DISPLAY_MODES = [
   { value: 'stick', label: '点线', hint: '关节圆点 + 父子连线，看整体结构更清爽' },
   { value: 'bone', label: '八面体', hint: 'Blender 风格的八面体骨头，能看出一根骨骼的长短与朝向' },
 ];
+
+const TRANSFORM_MODES = [
+  { value: 'rotate', label: '旋转', hint: '绕轴旋转骨骼（Blender 的 R）' },
+  { value: 'translate', label: '移动', hint: '平移骨骼（Blender 的 G）' },
+  { value: 'scale', label: '缩放', hint: '缩放骨骼（Blender 的 S）' },
+];
+
+const TRANSFORM_SPACES = [
+  { value: 'local', label: '局部', hint: '沿骨骼自身的轴向操作' },
+  { value: 'world', label: '全局', hint: '沿场景世界轴操作' },
+];
+
+/** 姿态数值里的一个分量，改动后回写骨骼 */
+function editPose(field: 'rotation' | 'position' | 'scale', index: number, event: Event): void {
+  const pose = store.bonePose;
+  if (!pose) return;
+  const raw = Number((event.target as HTMLInputElement).value);
+  if (!Number.isFinite(raw)) return;
+  const next = [...pose[field]] as [number, number, number];
+  next[index] = raw;
+  store.applyBoneTransform({ [field]: next });
+}
+
+function formatPoseValue(value: number): string {
+  if (Math.abs(value) < 0.0005) return '0';
+  return value.toFixed(Math.abs(value) >= 100 ? 1 : 3).replace(/\.?0+$/, '');
+}
 
 const expanded = ref<Set<string>>(new Set());
 const scrollRef = ref<HTMLDivElement | null>(null);
@@ -173,6 +201,76 @@ function collapseAll(): void {
       />
     </div>
 
+    <label class="pose-switch" :class="{ on: store.poseMode }">
+      <input
+        type="checkbox"
+        class="checkbox"
+        :checked="store.poseMode"
+        @change="store.setPoseMode(($event.target as HTMLInputElement).checked)"
+      />
+      <Icon name="pose" :size="13" />
+      <span>姿态模式</span>
+      <span v-if="store.poseMode" class="pose-badge">G / R / S</span>
+    </label>
+
+    <div v-if="store.poseMode" class="pose-panel">
+      <SegmentedControl
+        :model-value="store.transformMode"
+        :options="TRANSFORM_MODES"
+        size="sm"
+        @update:model-value="store.setTransformMode($event as TransformMode)"
+      />
+      <SegmentedControl
+        :model-value="store.transformSpace"
+        :options="TRANSFORM_SPACES"
+        size="sm"
+        @update:model-value="store.setTransformSpace($event as TransformSpace)"
+      />
+
+      <template v-if="store.bonePose">
+        <div class="pose-title">
+          <span class="pose-bone">{{ rows.find((row) => row.node.id === store.bonePose?.boneId)?.node.label ?? '选中骨骼' }}</span>
+          <span v-if="store.bonePose.modified" class="pose-modified">已改</span>
+        </div>
+
+        <div v-for="field in (['rotation', 'position', 'scale'] as const)" :key="field" class="pose-row">
+          <span class="pose-label">{{ field === 'rotation' ? '旋转°' : field === 'position' ? '位置' : '缩放' }}</span>
+          <input
+            v-for="(value, index) in store.bonePose[field]"
+            :key="index"
+            class="pose-input"
+            type="number"
+            step="1"
+            :value="formatPoseValue(value)"
+            @change="editPose(field, index, $event)"
+          />
+        </div>
+
+        <div class="pose-actions">
+          <button class="link" type="button" title="把这根骨骼还原到进入姿态模式时的状态" @click="store.resetBonePose()">
+            还原该骨骼
+          </button>
+          <button
+            v-if="store.poseChangedCount > 0"
+            class="link"
+            type="button"
+            title="撤销本次进入姿态模式后的所有手动改动"
+            @click="store.resetAllPoses()"
+          >
+            还原全部（{{ store.poseChangedCount }}）
+          </button>
+          <button class="link" type="button" title="回到 FBX 原始的绑定姿态" @click="store.resetToRestPose()">
+            绑定姿态
+          </button>
+        </div>
+        <p class="pose-hint">
+          已改动 {{ store.poseChangedCount }} / {{ store.poseBoneTotal }} 根。姿态只在当前状态生效，
+          按播放会重新被动画覆盖。
+        </p>
+      </template>
+      <p v-else class="pose-hint">在模型或下面的树里选一根骨骼，然后在视口里拖 gizmo 摆姿势。</p>
+    </div>
+
     <div class="search">
       <Icon name="search" :size="12" />
       <input v-model="store.boneKeyword" class="search-input" type="search" placeholder="搜索骨骼" />
@@ -257,6 +355,115 @@ function collapseAll(): void {
 
 .mode-row {
   padding: 0 12px 8px;
+}
+
+.pose-switch {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 12px 8px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel-2);
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pose-switch.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-weight: 600;
+}
+
+.pose-badge {
+  margin-left: auto;
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+.pose-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 12px 8px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-app);
+}
+
+.pose-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+.pose-bone {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pose-modified {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: rgba(251, 191, 36, 0.18);
+  color: #fcd34d;
+  font-size: 10px;
+}
+
+.pose-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pose-label {
+  width: 38px;
+  flex: none;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.pose-input {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  height: 22px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-panel-2);
+  color: var(--text-dim);
+  font-size: 11px;
+  text-align: right;
+}
+
+.pose-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.pose-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.pose-hint {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--text-faint);
 }
 
 .icon-btn {

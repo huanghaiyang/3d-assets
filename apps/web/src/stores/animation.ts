@@ -1,7 +1,15 @@
 import { computed, ref, watch } from 'vue';
 import { defineStore } from 'pinia';
 import { animationApi, type AnimationFile, type AnimationInfoResponse } from '@/api/animation';
-import { FbxPlayer, type ClipInfo, type ModelStats } from '@/viewer/FbxPlayer';
+import {
+  FbxPlayer,
+  type BoneTransformState,
+  type ClipInfo,
+  type ModelStats,
+  type PoseState,
+  type TransformMode,
+  type TransformSpace,
+} from '@/viewer/FbxPlayer';
 import type { BoneDisplayMode, BoneNode, FlatBone } from '@/viewer/SkeletonOverlay';
 import { matchToken } from '@/utils/fuzzy';
 
@@ -80,6 +88,14 @@ export const useAnimationStore = defineStore('animation', () => {
   const ignoredBoneNodes = ref(0);
   /** 光标下悬停的骨骼（用于点选前的反馈） */
   const hoveredBoneId = ref<string | null>(null);
+
+  // 姿态模式
+  const poseMode = ref(false);
+  const transformMode = ref<TransformMode>('rotate');
+  const transformSpace = ref<TransformSpace>('local');
+  const bonePose = ref<BoneTransformState | null>(null);
+  const poseChangedCount = ref(0);
+  const poseBoneTotal = ref(0);
 
   /** 内存封面缓存：key = 文件绝对路径（跨页保留，切回时无需重算） */
   const thumbnails = ref<Record<string, string>>({});
@@ -179,6 +195,13 @@ export const useAnimationStore = defineStore('animation', () => {
     next.onTick((state) => {
       currentTime.value = state.time;
       duration.value = state.duration;
+      // 播放状态以播放器为准（例如进入姿态模式会主动暂停）
+      playing.value = state.playing;
+    });
+    next.onPose((state: PoseState) => {
+      bonePose.value = state.bone;
+      poseChangedCount.value = state.changedCount;
+      poseBoneTotal.value = state.total;
     });
   }
 
@@ -318,6 +341,9 @@ export const useAnimationStore = defineStore('animation', () => {
       player.setSelectedBones([]);
       player.setSkeletonVisible(showSkeleton.value);
       player.setBoneDisplayMode(boneDisplayMode.value);
+      player.setPoseMode(poseMode.value);
+      player.setTransformMode(transformMode.value);
+      player.setTransformSpace(transformSpace.value);
       activeClipIndex.value = 0;
       if (result.clips.length > 0) {
         player.playClip(0);
@@ -405,6 +431,50 @@ export const useAnimationStore = defineStore('animation', () => {
   function setBoneSelection(ids: string[]): void {
     selectedBones.value = ids;
     player?.setSelectedBones(ids);
+    // gizmo 挂在"最后选中的那根"上（Blender 的激活骨骼）
+    player?.setSelectedBone(ids.length > 0 ? ids[ids.length - 1]! : null);
+  }
+
+  // ===== 姿态模式 =====
+
+  function setPoseMode(on: boolean): void {
+    poseMode.value = on;
+    if (on && !showSkeleton.value) setSkeletonVisible(true);
+    player?.setPoseMode(on);
+    if (!on) bonePose.value = null;
+  }
+
+  function setTransformMode(mode: TransformMode): void {
+    transformMode.value = mode;
+    player?.setTransformMode(mode);
+  }
+
+  function setTransformSpace(space: TransformSpace): void {
+    transformSpace.value = space;
+    player?.setTransformSpace(space);
+  }
+
+  function applyBoneTransform(
+    patch: Partial<Pick<BoneTransformState, 'rotation' | 'position' | 'scale'>>,
+  ): void {
+    const id = bonePose.value?.boneId ?? selectedBones.value[selectedBones.value.length - 1];
+    if (!id) return;
+    player?.applyBoneTransform(id, patch);
+  }
+
+  function resetBonePose(): void {
+    const id = bonePose.value?.boneId ?? selectedBones.value[selectedBones.value.length - 1];
+    if (!id) return;
+    player?.resetBonePose(id);
+  }
+
+  function resetAllPoses(): void {
+    player?.resetAllPoses();
+  }
+
+  /** 回到 FBX 绑定姿态（Blender 里 Alt+G/R/S 的语义） */
+  function resetToRestPose(): void {
+    player?.resetToRestPose();
   }
 
   function toggleBone(id: string): void {
@@ -566,8 +636,21 @@ export const useAnimationStore = defineStore('animation', () => {
     boneKeyword,
     ignoredBoneNodes,
     hoveredBoneId,
+    poseMode,
+    transformMode,
+    transformSpace,
+    bonePose,
+    poseChangedCount,
+    poseBoneTotal,
     setSkeletonVisible,
     setBoneDisplayMode,
+    setPoseMode,
+    setTransformMode,
+    setTransformSpace,
+    applyBoneTransform,
+    resetBonePose,
+    resetAllPoses,
+    resetToRestPose,
     setBoneSelection,
     toggleBone,
     clearBoneSelection,

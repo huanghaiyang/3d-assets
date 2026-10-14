@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
 
 import {
   SkeletonOverlay,
@@ -41,6 +42,28 @@ export interface PlaybackState {
   speed: number;
 }
 
+/** 姿态模式下的 gizmo 操作类型（对应 Blender 的 G / R / S） */
+export type TransformMode = 'translate' | 'rotate' | 'scale';
+export type TransformSpace = 'local' | 'world';
+
+export interface BoneTransformState {
+  boneId: string;
+  /** 欧拉角（度），顺序 XYZ */
+  rotation: [number, number, number];
+  position: [number, number, number];
+  scale: [number, number, number];
+  /** 相对静置姿态（FBX 里原始的绑定姿态）是否被改过 */
+  modified: boolean;
+}
+
+export interface PoseState {
+  /** 当前选中骨骼的变换；未选中为 null */
+  bone: BoneTransformState | null;
+  /** 相对静置姿态被改过的骨骼数 */
+  changedCount: number;
+  total: number;
+}
+
 const BOUNDS_SAMPLES = 6;
 
 /**
@@ -71,6 +94,28 @@ export class FbxPlayer {
   private skeleton: SkeletonOverlay | null = null;
   private skeletonOn = false;
   private skeletonMode: BoneDisplayMode = 'stick';
+
+  // ===== 姿态模式 =====
+  private transformControls: TransformControls | null = null;
+  private transformMode: TransformMode = 'rotate';
+  private transformSpace: TransformSpace = 'local';
+  private poseMode = false;
+  /** 本次指针手势是否作用在 gizmo 上（用于让骨骼点选让路） */
+  private transformGesture = false;
+  private poseListeners: ((state: PoseState) => void)[] = [];
+  private readonly bonesById = new Map<string, THREE.Bone>();
+  /** 静置姿态：FBX 原始的绑定姿态，用于「回到绑定姿态」 */
+  private readonly restPose = new Map<string, { p: THREE.Vector3; q: THREE.Quaternion; s: THREE.Vector3 }>();
+  /**
+   * 进入姿态模式那一刻的姿态快照。
+   * "改过哪些骨骼"以它为基准——如果用绑定姿态当基准，动画一播放就会显示"半数骨骼已改"，
+   * 那样既没意义也会让人误以为重置会毁掉动画。
+   */
+  private readonly basePose = new Map<string, { p: THREE.Vector3; q: THREE.Quaternion; s: THREE.Vector3 }>();
+  /** 参与姿态统计的骨骼（真实骨骼，不含 FBX 的包装节点） */
+  private poseBoneIds: string[] = [];
+  private readonly poseEuler = new THREE.Euler();
+  private selectedBoneId: string | null = null;
   private disposed = false;
   private gridOn = true;
   private mirrorOn = false;
@@ -139,6 +184,22 @@ export class FbxPlayer {
 
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(container);
+
+    // 姿态模式的 gizmo（Blender 的 G/R/S）。r171 起 TransformControls 是 Controls 子类，
+    // 需要把 getHelper() 的结果加进场景，而不是控件本身。
+    this.transformControls = new TransformControls(this.camera, this.renderer.domElement);
+    this.transformControls.setMode(this.transformMode);
+    this.transformControls.setSpace(this.transformSpace);
+    this.transformControls.setSize(0.85);
+    this.scene.add(this.transformControls.getHelper());
+    this.transformControls.addEventListener('dragging-changed', (event) => {
+      const dragging = Boolean((event as { value?: unknown }).value);
+      // 拖 gizmo 时先关掉轨道控制器，松开再恢复
+      this.controls.enabled = !dragging;
+      if (dragging) this.transformGesture = true;
+    });
+    this.transformControls.addEventListener('objectChange', () => this.emitPose());
+
     this.resize();
     this.renderer.setAnimationLoop(() => this.tick());
   }
@@ -146,7 +207,8 @@ export class FbxPlayer {
   private tick(): void {
     if (this.disposed) return;
     const delta = this.clock.getDelta();
-    if (this.mixer) {
+    // 姿态模式下不再让动画覆盖手动摆的姿势
+    if (this.mixer && !this.poseMode) {
       this.mixer.update(delta * this.speed * (this.playing ? 1 : 0));
     }
     this.controls.update();
@@ -172,6 +234,202 @@ export class FbxPlayer {
     return () => {
       this.listeners = this.listeners.filter((item) => item !== listener);
     };
+  }
+
+  // ===== 姿态模式 =====
+
+  get isPoseMode(): boolean {
+    return this.poseMode;
+  }
+
+  get isTransformGesture(): boolean {
+    return this.transformGesture;
+  }
+
+  /** 一次指针手势结束，清掉 gizmo 操作标记 */
+  endPointerGesture(): void {
+    this.transformGesture = false;
+  }
+
+  onPose(listener: (state: PoseState) => void): () => void {
+    this.poseListeners.push(listener);
+    return () => {
+      this.poseListeners = this.poseListeners.filter((item) => item !== listener);
+    };
+  }
+
+  private emitPose(): void {
+    const bone = this.poseMode ? (this.bonesById.get(this.selectedBoneId ?? '') ?? null) : null;
+    let changedCount = 0;
+    for (const id of this.poseBoneIds) {
+      const target = this.bonesById.get(id);
+      const base = this.basePose.get(id);
+      if (!target || !base) continue;
+      if (!target.position.equals(base.p) || !target.quaternion.equals(base.q) || !target.scale.equals(base.s)) {
+        changedCount += 1;
+      }
+    }
+    const state: PoseState = {
+      bone: bone ? this.describeBone(bone) : null,
+      changedCount,
+      total: this.poseBoneIds.length,
+    };
+    for (const listener of this.poseListeners) listener(state);
+  }
+
+  /** 记录当前姿态作为「改动」的基准 */
+  private captureBasePose(): void {
+    this.basePose.clear();
+    for (const id of this.poseBoneIds) {
+      const bone = this.bonesById.get(id);
+      if (!bone) continue;
+      this.basePose.set(id, {
+        p: bone.position.clone(),
+        q: bone.quaternion.clone(),
+        s: bone.scale.clone(),
+      });
+    }
+  }
+
+  private isBoneModified(id: string): boolean {
+    const bone = this.bonesById.get(id);
+    const base = this.basePose.get(id);
+    if (!bone || !base) return false;
+    return !bone.position.equals(base.p) || !bone.quaternion.equals(base.q) || !bone.scale.equals(base.s);
+  }
+
+  private emitPlayback(): void {
+    if (!this.mixer || !this.currentAction) return;
+    this.emit({
+      time: this.currentAction.time,
+      duration: this.currentAction.getClip().duration,
+      playing: this.playing,
+      speed: this.speed,
+    });
+  }
+
+  private describeBone(bone: THREE.Bone): BoneTransformState {
+    this.poseEuler.setFromQuaternion(bone.quaternion, 'XYZ');
+    return {
+      boneId: bone.uuid,
+      rotation: [
+        THREE.MathUtils.radToDeg(this.poseEuler.x),
+        THREE.MathUtils.radToDeg(this.poseEuler.y),
+        THREE.MathUtils.radToDeg(this.poseEuler.z),
+      ],
+      position: [bone.position.x, bone.position.y, bone.position.z],
+      scale: [bone.scale.x, bone.scale.y, bone.scale.z],
+      modified: this.isBoneModified(bone.uuid),
+    };
+  }
+
+  setSelectedBone(id: string | null): void {
+    this.selectedBoneId = id;
+    this.syncTransformTarget();
+  }
+
+  private syncTransformTarget(): void {
+    const controls = this.transformControls;
+    if (!controls) return;
+    const bone = this.poseMode ? this.bonesById.get(this.selectedBoneId ?? '') : undefined;
+    if (bone) controls.attach(bone);
+    else controls.detach();
+    this.emitPose();
+  }
+
+  setPoseMode(on: boolean): void {
+    if (this.poseMode === on) return;
+    this.poseMode = on;
+    if (on) {
+      // 摆姿势时先把动画停下，否则每帧都会被动画覆盖
+      this.playing = false;
+      // 镜像会让骨骼的局部变换带负缩放，gizmo 的方向会变得难以预测，这里先关掉
+      this.setMirror(false);
+      // 以"进入姿态模式那一刻"为基准，之后才知道改了哪几根
+      this.captureBasePose();
+    } else {
+      // 退出时也停下动画，避免手动摆的姿势立刻被动画覆盖、看起来闪一下
+      this.playing = false;
+    }
+    this.emitPlayback();
+    this.syncTransformTarget();
+  }
+
+  setTransformMode(mode: TransformMode): void {
+    this.transformMode = mode;
+    this.transformControls?.setMode(mode);
+  }
+
+  get currentTransformMode(): TransformMode {
+    return this.transformMode;
+  }
+
+  setTransformSpace(space: TransformSpace): void {
+    this.transformSpace = space;
+    this.transformControls?.setSpace(space);
+  }
+
+  get currentTransformSpace(): TransformSpace {
+    return this.transformSpace;
+  }
+
+  /** 还原某根骨骼：回到进入姿态模式时的状态 */
+  resetBonePose(id: string): void {
+    const bone = this.bonesById.get(id);
+    const base = this.basePose.get(id);
+    if (!bone || !base) return;
+    bone.position.copy(base.p);
+    bone.quaternion.copy(base.q);
+    bone.scale.copy(base.s);
+    bone.updateMatrixWorld(true);
+    this.emitPose();
+  }
+
+  resetAllPoses(): void {
+    for (const [id, base] of this.basePose) {
+      const bone = this.bonesById.get(id);
+      if (!bone) continue;
+      bone.position.copy(base.p);
+      bone.quaternion.copy(base.q);
+      bone.scale.copy(base.s);
+      bone.updateMatrixWorld(true);
+    }
+    this.emitPose();
+  }
+
+  /** 回到 FBX 的绑定姿态（Blender 里 Alt+G/R/S 的语义） */
+  resetToRestPose(): void {
+    for (const [id, rest] of this.restPose) {
+      const bone = this.bonesById.get(id);
+      if (!bone) continue;
+      bone.position.copy(rest.p);
+      bone.quaternion.copy(rest.q);
+      bone.scale.copy(rest.s);
+      bone.updateMatrixWorld(true);
+    }
+    this.emitPose();
+  }
+
+  /** 面板里直接输数值改骨骼姿态 */
+  applyBoneTransform(
+    id: string,
+    patch: Partial<Pick<BoneTransformState, 'rotation' | 'position' | 'scale'>>,
+  ): void {
+    const bone = this.bonesById.get(id);
+    if (!bone) return;
+    if (patch.rotation) {
+      this.poseEuler.set(
+        THREE.MathUtils.degToRad(patch.rotation[0]),
+        THREE.MathUtils.degToRad(patch.rotation[1]),
+        THREE.MathUtils.degToRad(patch.rotation[2]),
+        'XYZ',
+      );
+      bone.quaternion.setFromEuler(this.poseEuler);
+    }
+    if (patch.position) bone.position.set(patch.position[0], patch.position[1], patch.position[2]);
+    if (patch.scale) bone.scale.set(patch.scale[0], patch.scale[1], patch.scale[2]);
+    bone.updateMatrixWorld(true);
+    this.emitPose();
   }
 
   resize(): void {
@@ -278,12 +536,29 @@ export class FbxPlayer {
     this.mixer = new THREE.AnimationMixer(object);
     this.applyMirror();
 
+    // 记录 FBX 原始的绑定姿态，作为「清空变换」的还原目标
+    this.bonesById.clear();
+    this.restPose.clear();
+    object.traverse((child) => {
+      const bone = child as THREE.Bone;
+      if (!bone.isBone) return;
+      this.bonesById.set(bone.uuid, bone);
+      this.restPose.set(bone.uuid, {
+        p: bone.position.clone(),
+        q: bone.quaternion.clone(),
+        s: bone.scale.clone(),
+      });
+    });
+
     // 骨骼叠加层挂在场景根上（世界坐标），因此自动跟随模型的归一化缩放与镜像
     this.skeleton = new SkeletonOverlay(object);
     this.skeleton.calibrate(maxDimension * this.baseScale);
     this.skeleton.setDisplayMode(this.skeletonMode);
     this.skeleton.setVisible(this.skeletonOn);
     this.scene.add(this.skeleton.root);
+    // 姿态统计只看真实骨骼（65 根），不算 FBX 的同名包装节点
+    this.poseBoneIds = this.skeleton.flatBones.map((bone) => bone.id);
+    this.captureBasePose();
 
     this.frameModel();
     this.currentAction = null;
@@ -487,6 +762,11 @@ export class FbxPlayer {
     }
     this.currentAction = null;
     this.clips = [];
+    this.transformControls?.detach();
+    this.selectedBoneId = null;
+    this.bonesById.clear();
+    this.restPose.clear();
+    this.poseMode = false;
     if (this.skeleton) {
       this.scene.remove(this.skeleton.root);
       this.skeleton.dispose();
@@ -505,6 +785,9 @@ export class FbxPlayer {
     this.renderer.setAnimationLoop(null);
     this.resizeObserver.disconnect();
     this.clear();
+    this.transformControls?.detach();
+    this.transformControls?.dispose();
+    this.transformControls = null;
     this.controls.dispose();
     this.pmrem.dispose();
     disposeObject(this.scene);

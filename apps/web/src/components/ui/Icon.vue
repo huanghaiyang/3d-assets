@@ -51,6 +51,7 @@ const PATHS: Record<string, string> = {
   bone: 'M7 3.5a2.5 2.5 0 0 1 3.54 3.54l3.42 3.42A2.5 2.5 0 1 1 17 17a2.5 2.5 0 1 1-3.54-3.54L10.04 10A2.5 2.5 0 1 1 7 3.5z',
   chevronDown: 'M6 9l6 6 6-6',
   chevronRight: 'M9 6l6 6-6 6',
+  pose: 'M12 2.5v6.5M12 9l-4 3.5M12 9l4 3.5M12 12v9.5M8 21.5h8M4.5 12.5h15',
 };
 
 const path = computed(() => PATHS[props.name] ?? '');
