@@ -277,32 +277,43 @@ export async function registerApiRoutes(app: FastifyInstance, deps: ApiDeps): Pr
 
   /**
    * 后端子线程渲染素材封面（不占用浏览器主线程）。
+   * - 默认已有封面直接返回缓存；
+   * - force=true 时强制重新渲染（对应素材卡片上的「重新生成封面」按钮），
+   *   并用 ?v=<时间戳> 让浏览器丢掉旧图片缓存。
    * 浏览器渲染路径仍保留：这里失败时前端会回退到 POST /api/jobs/:id/thumbnail。
    */
   app.post('/api/jobs/:id/cover', async (request, reply) => {
     const { id } = request.params as { id: string };
     const job = workspace.findJob(id);
     if (!job?.asset) return reply.code(404).send({ error: '素材不存在' });
-    if (job.asset.thumbnailUrl) return { ok: true, thumbnailUrl: job.asset.thumbnailUrl, cached: true };
 
-    const body = (request.body ?? {}) as { size?: unknown };
+    const body = (request.body ?? {}) as { size?: unknown; force?: unknown };
+    const force = body.force === true || body.force === 'true' || body.force === 1;
+    if (job.asset.thumbnailUrl && !force) return { ok: true, thumbnailUrl: job.asset.thumbnailUrl, cached: true };
+
     const size = Math.min(512, Math.max(96, Number(body.size) || 256));
     const source = await pickCoverSourcePath(id, job.asset);
     if (!source) return { ok: false, reason: '该素材没有可渲染的模型文件（或格式不支持服务端封面）' };
 
     try {
       const startedAt = Date.now();
-      const result = await getCoverRenderer().renderWithMeta({ filePath: source.filePath, size });
+      const result = await getCoverRenderer().renderWithMeta({
+        filePath: source.filePath,
+        size,
+        ground: 'shadow',
+        fov: 42,
+      });
       const saved = await saveThumbnailBuffer(id, result.png);
       if (!saved) return { ok: false, reason: '封面写入失败' };
+      const versioned = `${saved}?v=${Date.now().toString(36)}`;
       await workspace.mutate((state) => {
         const target = state.jobs.find((item) => item.id === id);
-        if (target?.asset) target.asset.thumbnailUrl = saved;
+        if (target?.asset) target.asset.thumbnailUrl = versioned;
       });
       log.info(
-        `服务端封面生成成功 ${id} (${source.format}, ${result.engine}, ${Date.now() - startedAt}ms)`,
+        `服务端封面生成成功 ${id} (${source.format}, ${result.engine}, ${force ? '重新生成, ' : ''}${Date.now() - startedAt}ms)`,
       );
-      return { ok: true, thumbnailUrl: saved, format: source.format, engine: result.engine };
+      return { ok: true, thumbnailUrl: versioned, format: source.format, engine: result.engine, regenerated: force };
     } catch (err) {
       log.warn(`服务端封面生成失败 ${id}: ${(err as Error).message}`);
       return { ok: false, reason: (err as Error).message };

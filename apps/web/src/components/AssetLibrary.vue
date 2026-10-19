@@ -442,6 +442,16 @@ const uploadProgress = computed(() => {
           >
             <Icon name="copy" :size="12" />
           </button>
+          <button
+            v-if="job.asset"
+            class="mini"
+            type="button"
+            :disabled="store.regeneratingCovers.has(job.id)"
+            :title="store.regeneratingCovers.has(job.id) ? '封面生成中…' : '重新生成封面（后端渲染）'"
+            @click.stop="store.regenerateCover(job.id)"
+          >
+            <Icon name="refresh" :size="12" :class="{ spin: store.regeneratingCovers.has(job.id) }" />
+          </button>
           <button class="mini danger" type="button" title="删除" @click.stop="confirmRemove(job)">
             <Icon name="trash" :size="12" />
           </button>

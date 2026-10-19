@@ -69,21 +69,30 @@ function decodePng(png: Buffer): { width: number; height: number; rgba: Buffer }
   return { width, height, rgba };
 }
 
-function analyze(rgba: Buffer): { coverage: number; colors: number; red: number; blue: number } {
-  let opaque = 0;
+const BACKGROUND = [0x1b, 0x1e, 0x25];
+
+function analyze(rgba: Buffer): { coverage: number; colors: number; red: number; blue: number; dark: number } {
+  let content = 0;
   let red = 0;
   let blue = 0;
+  let dark = 0;
   const colors = new Set<string>();
   for (let i = 0; i < rgba.length; i += 4) {
-    if (rgba[i + 3] > 16) {
-      opaque += 1;
-      colors.add(`${rgba[i] >> 4},${rgba[i + 1] >> 4},${rgba[i + 2] >> 4}`);
-      if (rgba[i] > 120 && rgba[i] > rgba[i + 1] * 1.5 && rgba[i] > rgba[i + 2] * 1.5) red += 1;
-      if (rgba[i + 2] > 120 && rgba[i + 2] > rgba[i + 1] * 1.5 && rgba[i + 2] > rgba[i] * 1.5) blue += 1;
+    const r = rgba[i]!;
+    const g = rgba[i + 1]!;
+    const b = rgba[i + 2]!;
+    const distance = Math.abs(r - BACKGROUND[0]) + Math.abs(g - BACKGROUND[1]) + Math.abs(b - BACKGROUND[2]);
+    if (distance > 24 && rgba[i + 3]! > 16) {
+      content += 1;
+      colors.add(`${r},${g},${b}`);
+      if (r > 120 && r > g * 1.5 && r > b * 1.5) red += 1;
+      if (b > 120 && b > g * 1.5 && b > r * 1.5) blue += 1;
     }
+    // 比背景更暗的像素 = 地面接触阴影
+    if (r + g + b < 80 && rgba[i + 3]! > 16) dark += 1;
   }
   const total = rgba.length / 4;
-  return { coverage: opaque / total, colors: colors.size, red: red / total, blue: blue / total };
+  return { coverage: content / total, colors: colors.size, red: red / total, blue: blue / total, dark: dark / total };
 }
 
 function objCube(): string {
@@ -235,16 +244,31 @@ async function main(): Promise<void> {
   const renderer = getCoverRenderer();
 
   try {
-    console.log('\n[1] OBJ 立方体（WebGL 引擎）');
+    console.log('\n[1] OBJ 立方体（WebGL 引擎 + 前端同款光照/阴影）');
     const startedAt = Date.now();
     const objResult = await renderer.renderWithMeta({ filePath: objPath, size: 128 });
     const objInfo = pngInfo(objResult.png);
-    const objStats = analyze(decodePng(objResult.png).rgba);
+    const objPixels = decodePng(objResult.png);
+    const objStats = analyze(objPixels.rgba);
     check('渲染引擎是 webgl（headless-gl）', objResult.engine === 'webgl', objResult.engine);
     check('输出是合法 PNG', objResult.png.length > 500, { bytes: objResult.png.length });
     check('尺寸正确 (128×128)', objInfo.width === 128 && objInfo.height === 128, objInfo);
     check('画出了非空内容（覆盖率 2%~95%）', objStats.coverage > 0.02 && objStats.coverage < 0.95, objStats);
     check('有明暗层次（≥3 种颜色）', objStats.colors >= 3, objStats);
+    // 前端 captureThumbnail 会铺一层 #1b1e25 深色底
+    check(
+      '深色底与前端一致 (#1b1e25)',
+      objPixels.rgba[0] === BACKGROUND[0] && objPixels.rgba[1] === BACKGROUND[1] && objPixels.rgba[2] === BACKGROUND[2] &&
+        objPixels.rgba[3] === 255,
+      [objPixels.rgba[0], objPixels.rgba[1], objPixels.rgba[2], objPixels.rgba[3]],
+    );
+    const noShadow = await renderer.renderWithMeta({ filePath: objPath, size: 128, ground: 'none' });
+    const noShadowStats = analyze(decodePng(noShadow.png).rgba);
+    check(
+      '地面软接触阴影已生效（比无阴影版本更多暗部）',
+      objStats.dark > noShadowStats.dark + 0.003,
+      { withShadow: objStats.dark, withoutShadow: noShadowStats.dark },
+    );
     console.log(`  渲染耗时 ${Date.now() - startedAt}ms`);
 
     console.log('\n[2] glTF（data URI buffer）');

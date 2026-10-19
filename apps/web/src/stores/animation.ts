@@ -569,6 +569,9 @@ export const useAnimationStore = defineStore('animation', () => {
   }
   // ===== 封面：由后端 worker 子线程渲染，浏览器只加载 URL =====
 
+  /** 正在强制重渲染当前页封面（按钮 loading 状态） */
+  const refreshingCovers = ref(false);
+
   function coverUrl(file: AnimationFile): string {
     return animationApi.animationCoverUrl(file.path, THUMB_SIZE, THUMB_POSE);
   }
@@ -592,6 +595,35 @@ export const useAnimationStore = defineStore('animation', () => {
       return;
     }
     thumbnails.value = next;
+  }
+
+  /**
+   * 重新生成本页封面：先让服务端强制重渲染（覆盖磁盘缓存），
+   * 再用带版本号的 URL 让浏览器丢掉旧图。
+   */
+  async function refreshPageCovers(): Promise<void> {
+    if (refreshingCovers.value) return;
+    const files = pagedFiles.value;
+    if (files.length === 0) return;
+    refreshingCovers.value = true;
+    const version = Date.now().toString(36);
+    try {
+      await Promise.all(
+        files.map((file) =>
+          fetch(animationApi.animationCoverUrl(file.path, THUMB_SIZE, THUMB_POSE, { refresh: true, version })).catch(
+            () => undefined,
+          ),
+        ),
+      );
+      const next = { ...thumbnails.value };
+      for (const file of files) {
+        next[file.path] = animationApi.animationCoverUrl(file.path, THUMB_SIZE, THUMB_POSE, { version });
+      }
+      thumbnails.value = next;
+      toast('success', `已重新生成本页 ${files.length} 张封面`);
+    } finally {
+      refreshingCovers.value = false;
+    }
   }
 
   function dispose(): void {
@@ -697,6 +729,8 @@ export const useAnimationStore = defineStore('animation', () => {
     setPageSize,
     requestThumbnail,
     generatePageThumbnails,
+    refreshPageCovers,
+    refreshingCovers,
     resetThumbQueue,
     dispose,
     toast,

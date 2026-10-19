@@ -244,7 +244,7 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
    * 只允许已记录文件夹内的 .fbx；带 ETag，重复请求命中缓存直接 304。
    */
   app.get('/api/anim/cover', async (request, reply) => {
-    const query = request.query as { path?: string; size?: string; pose?: string };
+    const query = request.query as { path?: string; size?: string; pose?: string; refresh?: string };
     const raw = query.path?.trim();
     if (!raw) return reply.code(400).send({ error: '缺少 path 参数' });
 
@@ -262,17 +262,18 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
 
     const size = Math.min(384, Math.max(96, Number(query.size) || 256));
     const pose = Math.min(1, Math.max(0, Number(query.pose ?? 0.35)));
+    const refresh = query.refresh === '1' || query.refresh === 'true';
     const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}-${size}-${pose}"`;
-    if (request.headers['if-none-match'] === etag) {
+    if (!refresh && request.headers['if-none-match'] === etag) {
       return reply.code(304).send();
     }
 
     try {
-      const png = await animationCover(target, { size, poseFraction: pose });
+      const png = await animationCover(target, { size, poseFraction: pose, refresh });
       return reply
         .header('Content-Type', 'image/png')
         .header('Content-Length', String(png.length))
-        .header('Cache-Control', 'public, max-age=86400')
+        .header('Cache-Control', refresh ? 'no-store' : 'public, max-age=86400')
         .header('ETag', etag)
         .send(png);
     } catch (err) {

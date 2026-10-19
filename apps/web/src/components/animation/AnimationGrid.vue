@@ -89,6 +89,15 @@ function onPageSize(event: Event): void {
         <button
           class="btn btn-ghost btn-icon"
           type="button"
+          :disabled="store.refreshingCovers"
+          :title="store.refreshingCovers ? '正在重新生成封面…' : '重新生成本页封面（服务端重渲染并覆盖缓存）'"
+          @click="store.refreshPageCovers()"
+        >
+          <Icon name="refresh" :size="14" :class="{ spin: store.refreshingCovers }" />
+        </button>
+        <button
+          class="btn btn-ghost btn-icon"
+          type="button"
           title="加载本页封面（后端渲染，缓存于服务端）"
           @click="store.generatePageThumbnails()"
         >

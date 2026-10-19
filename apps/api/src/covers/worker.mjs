@@ -965,6 +965,13 @@ function downsample(rgba, bigW, bigH, outW, outH, factor) {
 }
 
 // ===== WebGL 渲染（headless-gl，自写 WebGL1 管线）=====
+//
+// 前端封面（ModelViewer / FbxPlayer）的实际观感：
+//   - ACES Filmic tone mapping，exposure 1.05，sRGB 输出；
+//   - 半球光 white / #404652，强度 1.15；主光 white 2.1（方向 4,6.5,4.5）；
+//   - 轮廓光 #bcd0ff 0.75（方向 -5,3,-5）；RoomEnvironment 环境光强度 0.85；
+//   - 深色背景 #1b1e25；地面接触阴影（ShadowMaterial opacity ≈0.28）。
+// 后端这里用同一套光照方向/颜色/强度 + ACES + 深色底 + 软接触阴影，尽量做到与前端一致。
 
 let glModulePromise = null;
 
@@ -995,21 +1002,65 @@ uniform sampler2D uTexture;
 uniform vec3 uColor;
 uniform float uHasTexture;
 uniform vec3 uCameraPos;
-uniform vec3 uLightDir;
+uniform vec3 uKeyDir;
+uniform vec3 uRimDir;
+uniform vec3 uHemiSky;
+uniform vec3 uHemiGround;
+uniform float uHemiIntensity;
+uniform float uKeyIntensity;
+uniform float uRimIntensity;
+uniform float uEnvIntensity;
+uniform float uExposure;
 varying vec3 vWorldPos;
 varying vec3 vNormal;
 varying vec2 vUv;
+
+vec3 acesFilm(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
 void main() {
   vec3 n = normalize(vNormal);
   vec3 viewDir = normalize(uCameraPos - vWorldPos);
   if (dot(n, viewDir) < 0.0) n = -n;
-  float diffuse = max(dot(n, normalize(uLightDir)), 0.0);
-  float hemi = 0.34 + 0.26 * (n.y * 0.5 + 0.5);
+
   vec3 base = uColor;
   if (uHasTexture > 0.5) base *= texture2D(uTexture, vUv).rgb;
-  vec3 linear = pow(max(base, vec3(0.0)), vec3(2.2)) * (hemi + 0.9 * diffuse);
-  vec3 srgb = pow(clamp(linear, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.2));
-  gl_FragColor = vec4(srgb, 1.0);
+  vec3 albedo = pow(max(base, vec3(0.0)), vec3(2.2));
+
+  float hemiMix = n.y * 0.5 + 0.5;
+  vec3 hemi = mix(uHemiGround, uHemiSky, hemiMix) * uHemiIntensity * 0.55;
+  float key = max(dot(n, normalize(uKeyDir)), 0.0) * uKeyIntensity * 0.35;
+  float rim = max(dot(n, normalize(uRimDir)), 0.0) * uRimIntensity * 0.35;
+  // RoomEnvironment 的近似：中性环境辐照
+  vec3 irradiance = hemi + vec3(key + rim) + vec3(0.24 * uEnvIntensity);
+
+  vec3 linear = albedo * irradiance;
+  vec3 mapped = acesFilm(linear * uExposure);
+  gl_FragColor = vec4(pow(mapped, vec3(1.0 / 2.2)), 1.0);
+}
+`;
+
+const SHADOW_VERTEX_SHADER = `
+attribute vec2 aCorner;
+uniform mat4 uViewProjection;
+uniform vec3 uCenter;
+uniform vec2 uRadius;
+varying vec2 vUv;
+void main() {
+  vUv = aCorner;
+  vec3 position = vec3(uCenter.x + aCorner.x * uRadius.x, uCenter.y, uCenter.z + aCorner.y * uRadius.y);
+  gl_Position = uViewProjection * vec4(position, 1.0);
+}
+`;
+
+const SHADOW_FRAGMENT_SHADER = `
+precision mediump float;
+uniform float uOpacity;
+varying vec2 vUv;
+void main() {
+  float alpha = (1.0 - smoothstep(0.2, 1.0, length(vUv))) * uOpacity;
+  gl_FragColor = vec4(0.0, 0.0, 0.0, alpha);
 }
 `;
 
@@ -1025,9 +1076,9 @@ function compileShader(gl, type, source) {
   return shader;
 }
 
-function compileCoverProgram(gl) {
-  const vertexShader = compileShader(gl, gl.VERTEX_SHADER, COVER_VERTEX_SHADER);
-  const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, COVER_FRAGMENT_SHADER);
+function linkProgram(gl, vertexSource, fragmentSource) {
+  const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vertexSource);
+  const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
   const program = gl.createProgram();
   gl.attachShader(program, vertexShader);
   gl.attachShader(program, fragmentShader);
@@ -1037,6 +1088,11 @@ function compileCoverProgram(gl) {
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
     throw new Error(`WebGL program 链接失败: ${gl.getProgramInfoLog(program)}`);
   }
+  return program;
+}
+
+function compileCoverProgram(gl) {
+  const program = linkProgram(gl, COVER_VERTEX_SHADER, COVER_FRAGMENT_SHADER);
   return {
     program,
     aPosition: gl.getAttribLocation(program, 'aPosition'),
@@ -1047,7 +1103,27 @@ function compileCoverProgram(gl) {
     uColor: gl.getUniformLocation(program, 'uColor'),
     uHasTexture: gl.getUniformLocation(program, 'uHasTexture'),
     uCameraPos: gl.getUniformLocation(program, 'uCameraPos'),
-    uLightDir: gl.getUniformLocation(program, 'uLightDir'),
+    uKeyDir: gl.getUniformLocation(program, 'uKeyDir'),
+    uRimDir: gl.getUniformLocation(program, 'uRimDir'),
+    uHemiSky: gl.getUniformLocation(program, 'uHemiSky'),
+    uHemiGround: gl.getUniformLocation(program, 'uHemiGround'),
+    uHemiIntensity: gl.getUniformLocation(program, 'uHemiIntensity'),
+    uKeyIntensity: gl.getUniformLocation(program, 'uKeyIntensity'),
+    uRimIntensity: gl.getUniformLocation(program, 'uRimIntensity'),
+    uEnvIntensity: gl.getUniformLocation(program, 'uEnvIntensity'),
+    uExposure: gl.getUniformLocation(program, 'uExposure'),
+  };
+}
+
+function compileShadowProgram(gl) {
+  const program = linkProgram(gl, SHADOW_VERTEX_SHADER, SHADOW_FRAGMENT_SHADER);
+  return {
+    program,
+    aCorner: gl.getAttribLocation(program, 'aCorner'),
+    uViewProjection: gl.getUniformLocation(program, 'uViewProjection'),
+    uCenter: gl.getUniformLocation(program, 'uCenter'),
+    uRadius: gl.getUniformLocation(program, 'uRadius'),
+    uOpacity: gl.getUniformLocation(program, 'uOpacity'),
   };
 }
 
@@ -1072,6 +1148,15 @@ function createGlTexture(gl, image) {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   return texture;
+}
+
+/** sRGB 颜色 → 线性（和 three 的颜色管理一致） */
+function srgbColor(hex) {
+  return [
+    Math.pow(((hex >> 16) & 0xff) / 255, 2.2),
+    Math.pow(((hex >> 8) & 0xff) / 255, 2.2),
+    Math.pow((hex & 0xff) / 255, 2.2),
+  ];
 }
 
 /**
@@ -1174,7 +1259,6 @@ function extractRenderBatches(root) {
             worldNormals[ic * 3], worldNormals[ic * 3 + 1], worldNormals[ic * 3 + 2],
           );
         } else {
-          // 蒙皮 / 无顶点法线：用面法线做平面着色
           let nx = (by - ay) * (cz - az) - (bz - az) * (cy - ay);
           let ny = (bz - az) * (cx - ax) - (bx - ax) * (cz - az);
           let nz = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
@@ -1201,7 +1285,10 @@ function extractRenderBatches(root) {
   return [...batches.values()].filter((batch) => batch.positions.length >= 9);
 }
 
-async function renderWithWebGL({ filePath, size = 256, poseFraction = null }) {
+/** 深色底：与前端 captureThumbnail / captureFrame 填充的 #1b1e25 一致 */
+const COVER_BACKGROUND = [0x1b / 255, 0x1e / 255, 0x25 / 255];
+
+async function renderWithWebGL({ filePath, size = 256, poseFraction = null, ground = 'shadow', fov = 42 }) {
   const createGL = await loadGLModule();
   const { root, animations } = await loadModel(filePath, { realTextures: true });
   applyPose(root, animations, poseFraction);
@@ -1228,7 +1315,6 @@ async function renderWithWebGL({ filePath, size = 256, poseFraction = null }) {
   const center = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5);
   const dimensions = new THREE.Vector3().subVectors(max, min);
   const radius = Math.max(0.01, dimensions.length() * 0.5);
-  const fov = 32;
   const distance = (radius / Math.tan(THREE.MathUtils.degToRad(fov / 2))) * 1.12;
   const direction = new THREE.Vector3(0.55, 0.42, 1).normalize();
   const eye = center.clone().addScaledVector(direction, distance);
@@ -1239,24 +1325,59 @@ async function renderWithWebGL({ filePath, size = 256, poseFraction = null }) {
   camera.updateMatrixWorld(true);
   camera.updateProjectionMatrix();
   const viewProjection = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-  const lightDirection = new THREE.Vector3(-0.45, 0.85, 0.35).normalize();
 
   const gl = createGL(size, size, { preserveDrawingBuffer: true, antialias: true, alpha: true });
   if (!gl) throw new Error('headless-gl 无法创建 WebGL 上下文');
   try {
     const shader = compileCoverProgram(gl);
+    const shadowShader = compileShadowProgram(gl);
     gl.viewport(0, 0, size, size);
-    gl.clearColor(0, 0, 0, 0);
+    gl.clearColor(COVER_BACKGROUND[0], COVER_BACKGROUND[1], COVER_BACKGROUND[2], 1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     gl.enable(gl.DEPTH_TEST);
     gl.depthFunc(gl.LEQUAL);
     gl.disable(gl.CULL_FACE);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    // ===== 地面软接触阴影（对应前端 ShadowMaterial opacity 0.28）=====
+    if (ground === 'shadow') {
+      gl.useProgram(shadowShader.program);
+      gl.uniformMatrix4fv(shadowShader.uViewProjection, false, viewProjection.elements);
+      const footprint = Math.max(dimensions.x, dimensions.z, 0.4);
+      const shadowRadius = footprint * 0.8 + 0.15;
+      gl.uniform3f(shadowShader.uCenter, center.x, min.y + 0.0015, center.z);
+      gl.uniform2f(shadowShader.uRadius, shadowRadius * 1.15, shadowRadius * 0.85);
+      gl.uniform1f(shadowShader.uOpacity, 0.42);
+      const quad = new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1]);
+      const quadBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(shadowShader.aCorner);
+      gl.vertexAttribPointer(shadowShader.aCorner, 2, gl.FLOAT, false, 0, 0);
+      gl.depthMask(false);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      gl.depthMask(true);
+      gl.deleteBuffer(quadBuffer);
+    }
+
+    // ===== 模型 =====
     gl.useProgram(shader.program);
     gl.uniformMatrix4fv(shader.uViewProjection, false, viewProjection.elements);
     gl.uniform3f(shader.uCameraPos, eye.x, eye.y, eye.z);
-    gl.uniform3f(shader.uLightDir, lightDirection.x, lightDirection.y, lightDirection.z);
+    const keyDirection = new THREE.Vector3(4, 6.5, 4.5).normalize();
+    const rimDirection = new THREE.Vector3(-5, 3, -5).normalize();
+    gl.uniform3f(shader.uKeyDir, keyDirection.x, keyDirection.y, keyDirection.z);
+    gl.uniform3f(shader.uRimDir, rimDirection.x, rimDirection.y, rimDirection.z);
+    const hemiSky = srgbColor(0xffffff);
+    const hemiGround = srgbColor(0x404652);
+    gl.uniform3f(shader.uHemiSky, hemiSky[0], hemiSky[1], hemiSky[2]);
+    gl.uniform3f(shader.uHemiGround, hemiGround[0], hemiGround[1], hemiGround[2]);
+    gl.uniform1f(shader.uHemiIntensity, 1.15);
+    gl.uniform1f(shader.uKeyIntensity, 2.1);
+    gl.uniform1f(shader.uRimIntensity, 0.75);
+    gl.uniform1f(shader.uEnvIntensity, 0.85);
+    gl.uniform1f(shader.uExposure, 1.05);
     gl.uniform1i(shader.uTexture, 0);
 
     const whiteTexture = createGlTexture(gl, { width: 1, height: 1, data: new Uint8Array([255, 255, 255, 255]) });
@@ -1265,7 +1386,7 @@ async function renderWithWebGL({ filePath, size = 256, poseFraction = null }) {
       const count = batch.positions.length / 3;
       const positionBuffer = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, batch.positions instanceof Float32Array ? batch.positions : new Float32Array(batch.positions), gl.STATIC_DRAW);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(batch.positions), gl.STATIC_DRAW);
       gl.enableVertexAttribArray(shader.aPosition);
       gl.vertexAttribPointer(shader.aPosition, 3, gl.FLOAT, false, 0, 0);
 
@@ -1323,15 +1444,32 @@ async function renderWithSoftware({ filePath, size = 256, poseFraction = null })
   const big = size * factor;
   const rgba = renderCover(triangles, big, big);
   const final = downsample(rgba, big, big, size, size, factor);
-  return encodePng(size, size, final);
+  // 与 WebGL 版本一致的深色底（前端封面填充 #1b1e25）
+  const background = [0x1b, 0x1e, 0x25];
+  const composited = Buffer.alloc(size * size * 4);
+  for (let i = 0; i < final.length; i += 4) {
+    const alpha = final[i + 3] / 255;
+    composited[i] = Math.round(final[i] * alpha + background[0] * (1 - alpha));
+    composited[i + 1] = Math.round(final[i + 1] * alpha + background[1] * (1 - alpha));
+    composited[i + 2] = Math.round(final[i + 2] * alpha + background[2] * (1 - alpha));
+    composited[i + 3] = 255;
+  }
+  return encodePng(size, size, composited);
 }
 
-async function renderCoverForFile({ filePath, size = 256, poseFraction = null, engine = 'auto' }) {
+async function renderCoverForFile({
+  filePath,
+  size = 256,
+  poseFraction = null,
+  engine = 'auto',
+  ground = 'shadow',
+  fov = 42,
+}) {
   if (engine === 'software') {
     return { png: await renderWithSoftware({ filePath, size, poseFraction }), engine: 'software' };
   }
   try {
-    return { png: await renderWithWebGL({ filePath, size, poseFraction }), engine: 'webgl' };
+    return { png: await renderWithWebGL({ filePath, size, poseFraction, ground, fov }), engine: 'webgl' };
   } catch (err) {
     if (engine === 'webgl') throw err;
     // headless-gl 不可用（例如其它平台缺原生模块）时，退回软件光栅器
@@ -1355,9 +1493,9 @@ parentPort.on('message', async (message) => {
     }
     return;
   }
-  const { id, filePath, size, poseFraction, engine } = message ?? {};
+  const { id, filePath, size, poseFraction, engine, ground, fov } = message ?? {};
   try {
-    const result = await renderCoverForFile({ filePath, size, poseFraction, engine });
+    const result = await renderCoverForFile({ filePath, size, poseFraction, engine, ground, fov });
     parentPort.postMessage({ id, ok: true, png: result.png, engine: result.engine, fallbackReason: result.fallbackReason });
   } catch (err) {
     parentPort.postMessage({ id, ok: false, error: err instanceof Error ? err.stack ?? err.message : String(err) });

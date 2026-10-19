@@ -77,6 +77,15 @@ export const animationApi = {
   fileUrl: (filePath: string) => `/api/anim/file?path=${encodeURIComponent(filePath)}`,
 
   /** 封面：后端 worker 子线程渲染（浏览器只当图片加载，不占主线程） */
-  animationCoverUrl: (filePath: string, size = 192, pose = 0.35) =>
-    `/api/anim/cover?path=${encodeURIComponent(filePath)}&size=${size}&pose=${pose}`,
+  animationCoverUrl: (
+    filePath: string,
+    size = 192,
+    pose = 0.35,
+    options: { version?: string | number; refresh?: boolean } = {},
+  ) => {
+    const params = new URLSearchParams({ path: filePath, size: String(size), pose: String(pose) });
+    if (options.version !== undefined) params.set('v', String(options.version));
+    if (options.refresh) params.set('refresh', '1');
+    return `/api/anim/cover?${params.toString()}`;
+  },
 };

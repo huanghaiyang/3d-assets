@@ -28,6 +28,10 @@ export interface CoverRequest {
   poseFraction?: number | null;
   /** 渲染引擎：auto = 优先 WebGL，失败退回软件光栅器 */
   engine?: CoverEngine;
+  /** 地面软接触阴影（对应前端 ShadowMaterial）；默认 shadow */
+  ground?: 'shadow' | 'none';
+  /** 相机垂直视角，默认 42（工作台 ModelViewer 的 42 / 动画 FbxPlayer 的 40） */
+  fov?: number;
   timeoutMs?: number;
 }
 
@@ -145,6 +149,8 @@ export class CoverRenderer {
       size: task.request.size ?? 256,
       poseFraction: task.request.poseFraction ?? null,
       engine: task.request.engine ?? 'auto',
+      ground: task.request.ground ?? 'shadow',
+      fov: task.request.fov ?? 42,
     });
   }
 
@@ -250,39 +256,50 @@ async function writeCacheFile(target: string, png: Buffer): Promise<void> {
  *   1. 内存 LRU（最近 400 张）
  *   2. 磁盘缓存 data/cache/covers/<sha1>.png（重启后仍生效）
  *   3. 真正渲染（worker 子线程，优先 WebGL）
+ *
+ * refresh=true 时跳过前两层缓存强制重渲染（对应前端「重新生成封面」按钮），
+ * 渲染完会覆盖磁盘缓存。
  */
 export async function animationCover(
   filePath: string,
-  options: { size?: number; poseFraction?: number } = {},
+  options: { size?: number; poseFraction?: number; refresh?: boolean } = {},
 ): Promise<Buffer> {
   const stat = await fs.stat(filePath);
   const size = options.size ?? 256;
   const pose = options.poseFraction ?? 0.35;
   const key = `${filePath}|${stat.mtimeMs}|${size}|${pose}`;
 
-  const cached = animationCache.get(key);
-  if (cached) {
-    // 命中后移到队尾（Map 保持插入顺序，配合下面的删除实现 LRU）
-    animationCache.delete(key);
-    animationCache.set(key, cached);
-    return cached.png;
+  if (!options.refresh) {
+    const cached = animationCache.get(key);
+    if (cached) {
+      // 命中后移到队尾（Map 保持插入顺序，配合下面的删除实现 LRU）
+      animationCache.delete(key);
+      animationCache.set(key, cached);
+      return cached.png;
+    }
+
+    const cacheFile = coverCacheFile(filePath, stat.mtimeMs, size, pose);
+    const fromDisk = await fs.readFile(cacheFile).catch(() => null);
+    if (fromDisk) {
+      animationCache.set(key, { png: fromDisk, at: Date.now() });
+      return fromDisk;
+    }
   }
 
-  const cacheFile = coverCacheFile(filePath, stat.mtimeMs, size, pose);
-  const fromDisk = await fs.readFile(cacheFile).catch(() => null);
-  if (fromDisk) {
-    animationCache.set(key, { png: fromDisk, at: Date.now() });
-    return fromDisk;
-  }
-
-  const png = await getCoverRenderer().render({ filePath, size, poseFraction: pose });
+  const png = await getCoverRenderer().render({
+    filePath,
+    size,
+    poseFraction: pose,
+    ground: 'shadow',
+    fov: 40,
+  });
   animationCache.set(key, { png, at: Date.now() });
   while (animationCache.size > ANIMATION_CACHE_MAX) {
     const oldest = animationCache.keys().next().value;
     if (oldest === undefined) break;
     animationCache.delete(oldest);
   }
-  await writeCacheFile(cacheFile, png);
+  await writeCacheFile(coverCacheFile(filePath, stat.mtimeMs, size, pose), png);
   return png;
 }
 

@@ -256,6 +256,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   // ===== 缩略图补全（上传的模型没有接口预览图，需要在浏览器里渲染）=====
   const thumbnailTask = ref<{ done: number; total: number; current: string | null } | null>(null);
+  /** 正在单独重新生成封面的任务 id（素材卡片按钮的 loading 状态） */
+  const regeneratingCovers = ref<Set<string>>(new Set());
   let thumbnailRunning = false;
   let bootThumbnailScanDone = false;
 
@@ -575,7 +577,31 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   /**
-   * 为缺少缩略图的素材批量生成预览图。
+   * 重新生成单个素材的封面（强制后端重渲染，忽略已有封面）。
+   * 返回的新 URL 带 ?v=<时间戳>，浏览器不会继续用旧图。
+   */
+  async function regenerateCover(jobId: string): Promise<void> {
+    if (regeneratingCovers.value.has(jobId)) return;
+    regeneratingCovers.value = new Set(regeneratingCovers.value).add(jobId);
+    try {
+      const result = await api.generateCover(jobId, { force: true, size: 256 });
+      if (result.ok && result.thumbnailUrl) {
+        const target = jobs.value.find((item) => item.id === jobId);
+        if (target?.asset) target.asset.thumbnailUrl = result.thumbnailUrl;
+        toast('success', result.engine === 'software' ? '封面已重新生成（软件渲染兜底）' : '封面已重新生成');
+      } else {
+        toast('error', result.reason ?? '封面生成失败（该格式暂不支持服务端渲染）');
+      }
+    } catch (err) {
+      toast('error', err instanceof Error ? err.message : '封面生成失败');
+    } finally {
+      const next = new Set(regeneratingCovers.value);
+      next.delete(jobId);
+      regeneratingCovers.value = next;
+    }
+  }
+
+  /** 为缺少缩略图的素材批量生成预览图。
    * 优先请求后端 worker 子线程渲染（不占用浏览器主线程）；
    * 后端不支持/失败时回退到原来的离屏 WebGL 渲染。
    */
@@ -802,6 +828,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     viewCount,
     canSubmit,
     thumbnailsMissing,
+    regeneratingCovers,
     providers,
     activeProviderInfo,
     providerCapabilities,
@@ -830,6 +857,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     cancelUpload,
     clearUploadQueue,
     fillMissingThumbnails,
+    regenerateCover,
     submit,
     retry,
     cancel,

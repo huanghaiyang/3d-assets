@@ -104,11 +104,19 @@ export const api = {
       body: JSON.stringify({ dataUrl }),
     }),
   /** 后端 worker 子线程渲染封面（不占浏览器主线程；失败时回退到 uploadThumbnail） */
-  generateCover: (id: string, size = 256) =>
-    request<{ ok: boolean; thumbnailUrl?: string; reason?: string; cached?: boolean; format?: string }>(
-      `/api/jobs/${id}/cover`,
-      { method: 'POST', body: JSON.stringify({ size }) },
-    ),
+  generateCover: (id: string, options: { size?: number; force?: boolean } = {}) =>
+    request<{
+      ok: boolean;
+      thumbnailUrl?: string;
+      reason?: string;
+      cached?: boolean;
+      format?: string;
+      engine?: string;
+      regenerated?: boolean;
+    }>(`/api/jobs/${id}/cover`, {
+      method: 'POST',
+      body: JSON.stringify({ size: options.size ?? 256, force: options.force === true }),
+    }),
 
   // ===== 素材库上传 =====
   uploadInfo: () => request<UploadInfo>('/api/library/upload-info'),

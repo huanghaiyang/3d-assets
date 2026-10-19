@@ -18,10 +18,10 @@
 | 生成设置 | **生成引擎（混元生3D / Tripo3D / Meshy，默认混元）**、引擎内的模型版本、生成类型 Normal / LowPoly / Geometry / Sketch（按引擎支持范围显示）、面数（对数滑块 + 预设 + 精确输入，按引擎区间收窄）、PBR 材质、多边形类型、输出格式（按引擎支持范围） |
 | 中间视口 | three.js 实时预览（GLB / GLTF / OBJ+MTL / STL / FBX）、线框叠加、网格地面、自动旋转、重置视角、全屏、三角面 / 顶点 / 网格 / 积分统计、生成进度（阶段 + 耗时）、**右下角 XYZ 轴向指示器**（随视角实时旋转） |
 | 右侧栏 | **「素材库 / 节点」两个页签**：素材库见下一行；**节点**页签展示当前模型的对象层级树，**点击节点即高亮**（琥珀色包围盒 + 淡暖色自发光，`Ctrl/⌘` 多选），支持按名字/类型搜索与折叠 |
-| 右侧「素材库」 | 上传 / 批量上传本地模型（按钮选择，或直接把文件拖进面板）、**逐文件上传进度 + 整批取消**（取消会清理服务端暂存）、**分页（每页 12/24/48/96，只渲染当前页）**、全部 / 进行中 / 已完成 / 失败筛选、名称与提示词搜索、缩略图、重命名、重试、取消、删除、下载主文件 / 全部文件、复用参数新建 |
+| 右侧「素材库」 | 上传 / 批量上传本地模型（按钮选择，或直接把文件拖进面板）、**逐文件上传进度 + 整批取消**（取消会清理服务端暂存）、**分页（每页 12/24/48/96，只渲染当前页）**、**每个素材卡片可「重新生成封面」**（后端 WebGL 重渲染，带版本号刷新缓存）、全部 / 进行中 / 已完成 / 失败筛选、名称与提示词搜索、缩略图、重命名、重试、取消、删除、下载主文件 / 全部文件、复用参数新建 |
 | 底部任务条 | 当前任务阶段、耗时、JobId、积分消耗、取消 / 重试（区分「续查」与「重新生成」）、导出菜单（按格式与贴图 / 材质单独下载） |
 | 设置弹窗 | 按生成引擎分别填写 API Key（优先于 `.env`）、测试连接、清除、自定义接口域名（代理 / 私有化部署）、切换默认引擎、运行参数展示 |
-| **动画预览页** | 顶栏「动画预览」进入：**多文件夹**（可添加/移除，服务端持久记录）、分页浏览、**只加载当前页封面**、模糊搜索、点击即在 3D 视口播放、**骨骼渲染 + 骨骼树多选高亮（可在模型上直接点选骨骼）**、**姿态模式（G/R/S 模态变换）**、**场景节点树（点击节点高亮）**、播放/暂停/进度/倍速、原地播放、左右镜像、地面网格、片段切换、文件与骨骼统计、**右下角 XYZ 轴向指示器**（抬高到播放控制条上方，不被遮挡） |
+| **动画预览页** | 顶栏「动画预览」进入：**多文件夹**（可添加/移除，服务端持久记录）、分页浏览、**只加载当前页封面**、**「重新生成本页封面」按钮（服务端重渲染并覆盖缓存）**、模糊搜索、点击即在 3D 视口播放、**骨骼渲染 + 骨骼树多选高亮（可在模型上直接点选骨骼）**、**姿态模式（G/R/S 模态变换）**、**场景节点树（点击节点高亮）**、播放/暂停/进度/倍速、原地播放、左右镜像、地面网格、片段切换、文件与骨骼统计、**右下角 XYZ 轴向指示器**（抬高到播放控制条上方，不被遮挡） |
 
 ### 动画预览（只读）
 
@@ -265,9 +265,12 @@ Content-Type:  application/json
   `POST /api/jobs/:id/cover` 由 worker 子线程渲染（三引擎产物与上传件都支持 GLB/glTF/OBJ/FBX/STL），
   后端不支持或失败时才回退浏览器离屏渲染（`POST /api/jobs/:id/thumbnail`）。
 - **封面 Worker**：`apps/api/src/covers/worker.mjs` 在 `worker_threads` 里跑 three 的 Loader（无 DOM 垫片）：
-  - 首选 **headless-gl（`gl`）** 提供真实 WebGL1 上下文，自写一套最小的 shader 管线（顶点色/法线/UV + 贴图采样 + 半球光/方向光），
-    贴图用 `pngjs` / `jpeg-js` 解码成 RGBA 上传，封面与浏览器里看到的模型一致（棋盘格/角色贴图都按 UV 真实采样）；
-  - headless-gl 不可用时自动退回纯 JS 软件光栅器（Z-buffer + 双面光照 + 2× 超采样，贴图只取主色），封面仍能生成；
+  - 首选 **headless-gl（`gl`）** 提供真实 WebGL1 上下文，自写一套最小的 shader 管线（顶点色/法线/UV + 贴图采样），
+    贴图用 `pngjs` / `jpeg-js` 解码成 RGBA 上传，封面与浏览器里看到的模型一致；
+  - **光照/色调/阴影与前端一致**：ACES Filmic tone mapping + exposure 1.05、sRGB 输出；半球光 white/#404652 强度 1.15、
+    主光 white 2.1（4,6.5,4.5）、轮廓光 #bcd0ff 0.75（-5,3,-5）、环境光强度 0.85；深色背景 **#1b1e25**（与前端
+    `captureThumbnail` / `captureFrame` 填充一致）；地面画一层软接触阴影（近似前端 `ShadowMaterial` opacity ≈0.28）；
+  - headless-gl 不可用时自动退回纯 JS 软件光栅器（贴图只取主色，但同样补深色底），封面仍能生成；
   - PNG 用 `node:zlib` 自己编码；只跑 **1 个 worker**（headless-gl 原生模块不能在同一进程的多个 worker 里重复加载），
     串行复用、超时销毁重建。
 - **封面缓存（不写系统盘）**：动画封面三级缓存 —— 内存 LRU（400 张）→ 项目内磁盘 `data/cache/covers/<sha1>.png`
@@ -325,7 +328,7 @@ Content-Type:  application/json
 | POST | `/api/jobs/:id/retry` | 重试（自动选择续查 / 重新提交） |
 | POST | `/api/jobs/:id/cancel` | 取消（本地立即生效 + best-effort 通知远端，返回 `remote: ok/unsupported/failed/not-submitted`） |
 | DELETE | `/api/jobs/:id` | 删除任务与本地素材文件 |
-| POST | `/api/jobs/:id/cover` | 后端子线程渲染素材封面（GLB/glTF/OBJ/FBX/STL），返回 `thumbnailUrl`；失败时前端回退到 `thumbnail` |
+| POST | `/api/jobs/:id/cover` | 后端子线程渲染素材封面（GLB/glTF/OBJ/FBX/STL）；`force=true` 强制重渲染（带 `?v=` 版本号刷新缓存），失败时前端回退到 `thumbnail` |
 | POST | `/api/jobs/:id/thumbnail` | 回填浏览器渲染的缩略图 |
 | GET | `/api/jobs/:id/preview` | 输入参考图预览 |
 | GET | `/api/settings` | 设置摘要（按引擎的 Key 状态、能力、限制、枚举） |
@@ -343,7 +346,7 @@ Content-Type:  application/json
 | GET | `/api/anim/list?dir=&dir=` | 递归列出多个文件夹下的 `.fbx`（重复 `?dir=`；不传则用已记录的） |
 | GET | `/api/anim/browse?dir=` | 浏览子目录，用于「选择文件夹」（只读） |
 | GET | `/api/anim/file?path=\|dir=&name=` | 读取单个 `.fbx`（只读、不落盘、不锁文件、`no-store`） |
-| GET | `/api/anim/cover?path=&size=&pose=` | 后端子线程渲染动画封面（PNG，ETag + 服务端 LRU 缓存，不写源目录） |
+| GET | `/api/anim/cover?path=&size=&pose=&refresh=` | 后端子线程渲染动画封面（PNG，ETag + LRU/磁盘缓存；`refresh=1` 跳过缓存强制重渲染） |
 
 ### 上传 / 批量上传规则
 
@@ -396,7 +399,8 @@ Content-Type:  application/json
 | 前端拆包 | 动画预览页改为动态 `import()`：主包 950.9 KB → **860.6 KB**，另拆出 `AnimationPage` 94.7 KB + 20.9 KB CSS，首次进入动画页才加载；dev（5173）与生产（8787）均验证：切换页面正常、视口与轴向指示器出现、返回工作台无残留、0 控制台错误 |
 | 素材库分页 | 13 个素材、每页 12：第 1 页渲染 12 张卡片（`1/2 · 共 13`）、点「2」后渲染 1 张（`2/2`）；每页改 24 后一页 13 张（`1/1`）；搜索/筛选/改每页数量自动回第 1 页；0 控制台错误 |
 | 上传进度 / 取消 | 用 CDP 限制上传带宽到 3 MB/s 传 20 MB `.glb`：捕获到进度条 `1%`（`upload.onprogress` + 整批百分比）；点「取消」后条目变「已取消」、上传按钮恢复可用、队列 3.5s 后自动收起；**服务端 `data/uploads/.staging` 目录数归零、任务总数仍为 13**（没有产生半成品素材）；0 控制台错误 |
-| 封面 Worker 自测 | `npm run test:cover -w @h3d/api` **20 项断言全通过**：实际引擎为 **headless-gl WebGL**、OBJ 立方体（明暗层次）、glTF 材质色、**带 PNG 棋盘格贴图的 GLB（红/蓝两色都按 UV 采样出来）**、并发排队 + Worker 复用、软件引擎显式兜底、不支持格式明确失败、**磁盘缓存写在项目内 `data/cache/covers` 且二次命中 0ms**（首次约 457ms）、Mixamo FBX 带姿态 |
+| 封面 Worker 自测 | `npm run test:cover -w @h3d/api` **22 项断言全通过**：实际引擎为 **headless-gl WebGL**、OBJ 立方体（明暗层次）、**深色底 #1b1e25 与前端一致**、**地面软接触阴影生效（比 ground:'none' 更多暗部）**、glTF 材质色、**带 PNG 棋盘格贴图的 GLB（红/蓝两色都按 UV 采样出来）**、并发排队 + Worker 复用、软件引擎显式兜底、不支持格式明确失败、**磁盘缓存写在项目内 `data/cache/covers` 且二次命中 0ms**（首次约 620ms）、Mixamo FBX 带姿态 |
+| 封面重新生成按钮 | 素材库 12 张卡片都出现「重新生成封面（后端渲染）」按钮；点击后浏览器发出 `POST /api/jobs/:id/cover`（`force`），封面 URL 变为 `.../thumb.png?v=mvf5oie8` 且 **`naturalWidth > 0` 加载成功**，0 控制台错误；动画库点「重新生成本页封面」后对当前页 24 项各发一个 `refresh=1` 请求，完成后 24 个封面 URL 都带 `&v=`、`24/24` 加载成功（服务端单 worker 串行约 12~15s，按钮期间显示 loading） |
 | 动画封面后置 | 冷启动 `GET /api/anim/cover` 1,203ms → 4,657 B PNG（`ETag` 命中第二次 **304**），磁盘缓存文件落在 `data/cache/covers/<sha1>.png`（`git check-ignore` 确认被忽略）；动画页 24 张卡片全部使用 `/api/anim/cover`、**`#anim-thumb-host` 离屏渲染容器不存在**、12/12 可见封面加载成功、0 控制台错误 |
 | 素材封面后置 | 上传 3.77 MB GLB → `POST /api/jobs/:id/cover` 返回 **`engine: "webgl"`**、1,412ms 生成 18,959 B `thumb.png`；渲染结果是带真实贴图的角色封面（绿色长袍纹理清晰，不再是一块平均色）；浏览器真实上传后首张卡片 `<img>` 加载成功；测试任务已删除，`data/storage` 回到 13 个目录 |
 | 类型与构建 | `tsc` 后端 + `vue-tsc` 前端类型检查 0 错误；`vite build` 主包 gzip 245.7 KB + 动画页 gzip 29.3 KB |
