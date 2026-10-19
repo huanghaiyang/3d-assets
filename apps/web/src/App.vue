@@ -3,7 +3,7 @@ import { onBeforeUnmount, onMounted, ref } from 'vue';
 import TopBar from './components/TopBar.vue';
 import GeneratePanel from './components/GeneratePanel.vue';
 import ViewportPanel from './components/ViewportPanel.vue';
-import AssetLibrary from './components/AssetLibrary.vue';
+import WorkbenchSidePanel from './components/WorkbenchSidePanel.vue';
 import TaskBar from './components/TaskBar.vue';
 import SettingsDialog from './components/SettingsDialog.vue';
 import ToastStack from './components/ToastStack.vue';
@@ -30,7 +30,7 @@ onBeforeUnmount(() => store.stopPolling());
     <main v-if="page === 'workbench'" class="workbench">
       <GeneratePanel />
       <ViewportPanel />
-      <AssetLibrary />
+      <WorkbenchSidePanel />
     </main>
     <main v-else class="anim-host">
       <AnimationPage />

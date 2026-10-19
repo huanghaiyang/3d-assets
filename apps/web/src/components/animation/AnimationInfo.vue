@@ -2,11 +2,12 @@
 import { computed, ref } from 'vue';
 import Icon from '../ui/Icon.vue';
 import BoneTree from './BoneTree.vue';
+import NodeTree from './NodeTree.vue';
 import { useAnimationStore } from '@/stores/animation';
 import { formatBytes } from '@/utils/image';
 
 const store = useAnimationStore();
-const tab = ref<'info' | 'bones'>('info');
+const tab = ref<'info' | 'bones' | 'nodes'>('info');
 
 const file = computed(() => store.selectedFile);
 
@@ -21,17 +22,32 @@ function clipDuration(seconds: number): string {
       <div class="tabs">
         <button class="tab" :class="{ active: tab === 'info' }" type="button" @click="tab = 'info'">
           <Icon name="info" :size="13" />
-          动画信息
+          信息
         </button>
         <button class="tab" :class="{ active: tab === 'bones' }" type="button" @click="tab = 'bones'">
           <Icon name="bone" :size="13" />
           骨骼
           <span v-if="store.boneList.length" class="chip">{{ store.boneList.length }}</span>
         </button>
+        <button class="tab" :class="{ active: tab === 'nodes' }" type="button" @click="tab = 'nodes'">
+          <Icon name="cube" :size="13" />
+          节点
+        </button>
       </div>
     </header>
 
-    <BoneTree v-if="tab === 'bones'" />
+    <NodeTree
+      v-if="tab === 'nodes'"
+      :tree="store.nodeTree"
+      :selected="store.selectedNodeIds"
+      :keyword="store.nodeKeyword"
+      :show-bones="store.nodeShowBones"
+      @update:keyword="store.nodeKeyword = $event"
+      @update:show-bones="store.nodeShowBones = $event"
+      @select="(id, additive) => store.selectNode(id, additive)"
+      @clear="store.clearNodeSelection()"
+    />
+    <BoneTree v-else-if="tab === 'bones'" />
 
     <div v-else class="body">
       <template v-if="file">
@@ -163,22 +179,25 @@ function clipDuration(seconds: number): string {
 
 .tabs {
   display: flex;
-  gap: 4px;
+  gap: 3px;
 }
 
 .tab {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  flex: 1;
+  flex: 1 1 0;
+  min-width: 0;
   justify-content: center;
   height: 28px;
-  padding: 0 8px;
+  padding: 0 6px;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 .tab:hover {

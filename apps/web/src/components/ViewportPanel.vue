@@ -68,9 +68,13 @@ async function loadAsset(target: Asset | null): Promise<void> {
     instance.setWireframe(store.wireframe);
     instance.setGrid(store.showGrid);
     instance.setAutoRotate(store.autoRotate);
+    // 回填节点树，并按当前选择恢复高亮
+    store.setNodeTree(instance.sceneNodes);
+    instance.setNodeSelection(store.selectedNodeIds);
   } catch (err) {
     loadError.value = (err as Error).message;
     stats.value = null;
+    store.setNodeTree([]);
   } finally {
     loading.value = false;
   }
@@ -90,6 +94,12 @@ watch(
 watch(
   () => store.autoRotate,
   (value) => viewer.value?.setAutoRotate(value),
+);
+// 节点选择变化 → 同步高亮（加选逻辑在 store 里）
+watch(
+  () => store.selectedNodeIds,
+  (ids) => viewer.value?.setNodeSelection(ids),
+  { deep: true },
 );
 
 onMounted(() => {

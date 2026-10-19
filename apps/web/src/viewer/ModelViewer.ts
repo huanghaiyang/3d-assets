@@ -6,6 +6,9 @@ import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { NodeHighlighter, type SceneNode } from './sceneNodes';
+
+export type { SceneNode };
 
 export interface MeshStats {
   format: string;
@@ -47,6 +50,10 @@ export class ModelViewer {
   private disposed = false;
   private wireframeOn = false;
   private gridOn = true;
+
+  // ===== 场景节点树（与动画页共用 NodeHighlighter）=====
+  private sceneTree: SceneNode[] = [];
+  private nodeHighlighter: NodeHighlighter | null = null;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -136,6 +143,8 @@ export class ModelViewer {
   private tick(): void {
     if (this.disposed) return;
     this.controls.update();
+    // 高亮包围盒跟着自动旋转/模型动作刷新
+    this.nodeHighlighter?.refreshBoxes();
     this.renderer.render(this.scene, this.camera);
   }
 
@@ -188,9 +197,31 @@ export class ModelViewer {
     this.modelRoot = root;
     this.scene.add(root);
     this.stats = stats;
+    // 节点树：展示模型的对象层级，并支持点击高亮
+    if (!this.nodeHighlighter) this.nodeHighlighter = new NodeHighlighter(this.scene);
+    this.sceneTree = this.nodeHighlighter.reset(root);
     this.applyWireframeState();
     this.frameCamera(size.y * scale);
     return stats;
+  }
+
+  // ===== 场景节点树 =====
+
+  get sceneNodes(): SceneNode[] {
+    return this.sceneTree;
+  }
+
+  get selectedNodeList(): string[] {
+    return this.nodeHighlighter?.selection ?? [];
+  }
+
+  /** 指定要高亮的节点（加选逻辑在上层 store 里） */
+  setNodeSelection(ids: readonly string[]): void {
+    this.nodeHighlighter?.setSelection(ids);
+  }
+
+  clearNodeSelection(): void {
+    this.nodeHighlighter?.clear();
   }
 
   private async loadObject(target: LoadTarget): Promise<THREE.Object3D> {
@@ -252,6 +283,8 @@ export class ModelViewer {
   }
 
   clear(): void {
+    this.clearNodeSelection();
+    this.sceneTree = [];
     if (this.wireOverlay) {
       this.scene.remove(this.wireOverlay);
       disposeObject(this.wireOverlay);

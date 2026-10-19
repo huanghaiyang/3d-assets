@@ -1,6 +1,7 @@
 import { computed, ref, watch } from 'vue';
 import { defineStore } from 'pinia';
 import { api, ApiError } from '@/api/client';
+import type { SceneNode } from '@/viewer/sceneNodes';
 import type {
   GenerateType,
   GenerationParams,
@@ -115,6 +116,32 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const wireframe = ref(false);
   const showGrid = ref(true);
   const autoRotate = ref(false);
+
+  // 场景节点树（由视口加载完模型后回填）
+  const nodeTree = ref<SceneNode[]>([]);
+  const selectedNodeIds = ref<string[]>([]);
+  const nodeKeyword = ref('');
+  const nodeShowBones = ref(false);
+
+  function setNodeTree(tree: SceneNode[]): void {
+    nodeTree.value = tree;
+    selectedNodeIds.value = [];
+  }
+
+  /** 点击节点：additive = Ctrl/⌘ 加选/取消 */
+  function selectNode(id: string, additive = false): void {
+    if (additive) {
+      selectedNodeIds.value = selectedNodeIds.value.includes(id)
+        ? selectedNodeIds.value.filter((item) => item !== id)
+        : [...selectedNodeIds.value, id];
+    } else {
+      selectedNodeIds.value = [id];
+    }
+  }
+
+  function clearNodeSelection(): void {
+    selectedNodeIds.value = [];
+  }
 
   // ===== 素材上传 =====
   const uploadQueue = ref<UploadItem[]>([]);
@@ -572,6 +599,10 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     wireframe,
     showGrid,
     autoRotate,
+    nodeTree,
+    selectedNodeIds,
+    nodeKeyword,
+    nodeShowBones,
     uploadQueue,
     uploading,
     uploadInfo,
@@ -584,6 +615,9 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     canSubmit,
     thumbnailsMissing,
     // actions
+    setNodeTree,
+    selectNode,
+    clearNodeSelection,
     startPolling,
     stopPolling,
     refresh,

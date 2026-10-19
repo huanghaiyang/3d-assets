@@ -8,6 +8,7 @@ import {
   type ModelStats,
   type ModalTransformState,
   type PoseState,
+  type SceneNode,
   type TransformMode,
   type TransformSpace,
 } from '@/viewer/FbxPlayer';
@@ -99,6 +100,13 @@ export const useAnimationStore = defineStore('animation', () => {
   const poseBoneTotal = ref(0);
   /** 正在进行的 G/R/S 模态变换 */
   const modalTransform = ref<ModalTransformState | null>(null);
+
+  // 场景节点树
+  const nodeTree = ref<SceneNode[]>([]);
+  const selectedNodeIds = ref<string[]>([]);
+  const nodeKeyword = ref('');
+  /** 节点树是否包含骨骼节点（骨骼在「骨骼」页签里有更细的界面） */
+  const nodeShowBones = ref(false);
 
   /** 内存封面缓存：key = 文件绝对路径（跨页保留，切回时无需重算） */
   const thumbnails = ref<Record<string, string>>({});
@@ -348,6 +356,9 @@ export const useAnimationStore = defineStore('animation', () => {
       player.setPoseMode(poseMode.value);
       player.setTransformMode(transformMode.value);
       player.setTransformSpace(transformSpace.value);
+      // 换模型后重建节点树
+      selectedNodeIds.value = [];
+      syncNodes();
       activeClipIndex.value = 0;
       if (result.clips.length > 0) {
         player.playClip(0);
@@ -518,6 +529,34 @@ export const useAnimationStore = defineStore('animation', () => {
     player?.clearPoseComponent(component);
   }
 
+  // ===== 场景节点树 =====
+
+  function syncNodes(): void {
+    nodeTree.value = player?.sceneNodes ?? [];
+    selectedNodeIds.value = player?.selectedNodeList ?? [];
+  }
+
+  /** 点击节点：高亮对应对象（additive = Ctrl/⌘ 加选） */
+  function selectNode(id: string | null, additive = false): void {
+    let next: string[];
+    if (!id) {
+      next = additive ? [...selectedNodeIds.value] : [];
+    } else if (additive) {
+      next = selectedNodeIds.value.includes(id)
+        ? selectedNodeIds.value.filter((item) => item !== id)
+        : [...selectedNodeIds.value, id];
+    } else {
+      next = [id];
+    }
+    selectedNodeIds.value = next;
+    player?.setNodeSelection(next);
+  }
+
+  function clearNodeSelection(): void {
+    selectedNodeIds.value = [];
+    player?.clearNodeSelection();
+  }
+
   function toggleBone(id: string): void {
     const next = selectedBones.value.includes(id)
       ? selectedBones.value.filter((item) => item !== id)
@@ -684,6 +723,10 @@ export const useAnimationStore = defineStore('animation', () => {
     poseChangedCount,
     poseBoneTotal,
     modalTransform,
+    nodeTree,
+    selectedNodeIds,
+    nodeKeyword,
+    nodeShowBones,
     setSkeletonVisible,
     setBoneDisplayMode,
     setPoseMode,
@@ -701,6 +744,9 @@ export const useAnimationStore = defineStore('animation', () => {
     confirmModalTransform,
     cancelModalTransform,
     clearPoseComponent,
+    selectNode,
+    clearNodeSelection,
+    syncNodes,
     setBoneSelection,
     toggleBone,
     clearBoneSelection,

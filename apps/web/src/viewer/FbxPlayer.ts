@@ -55,8 +55,12 @@ export interface ModalTransformState {
   amount: number;
 }
 
-interface ModalTransform {
-  kind: TransformMode;
+/** 场景节点树的一个节点（对象层级，不含骨骼以外的特殊语义） */
+import { NodeHighlighter, type SceneNode } from './sceneNodes';
+
+export type { SceneNode };
+
+interface ModalTransform {  kind: TransformMode;
   bone: THREE.Bone;
   startPosition: THREE.Vector3;
   startQuaternion: THREE.Quaternion;
@@ -156,6 +160,10 @@ export class FbxPlayer {
   private poseBoneIds: string[] = [];
   private readonly poseEuler = new THREE.Euler();
   private selectedBoneId: string | null = null;
+
+  // ===== 场景节点树（共用 NodeHighlighter）=====
+  private sceneTree: SceneNode[] = [];
+  private nodeHighlighter: NodeHighlighter | null = null;
 
   // 模态变换（Blender 的 G/R/S）用到的临时量
   private modal: ModalTransform | null = null;
@@ -264,6 +272,7 @@ export class FbxPlayer {
     this.controls.update();
     // 骨骼随动画移动，逐帧刷新叠加层与拾取用的点云
     this.skeleton?.refreshPositions();
+    this.nodeHighlighter?.refreshBoxes();
     this.renderer.render(this.scene, this.camera);
     if (this.mixer && this.currentAction) {
       this.emit({
@@ -336,6 +345,31 @@ export class FbxPlayer {
 
   get isModalActive(): boolean {
     return this.modal !== null;
+  }
+
+  // ===== 场景节点树 =====
+
+  get sceneNodes(): SceneNode[] {
+    return this.sceneTree;
+  }
+
+  get selectedNodeList(): string[] {
+    return this.nodeHighlighter?.selection ?? [];
+  }
+
+  /** 重建节点树（加载模型后调用） */
+  private rebuildSceneTree(): void {
+    if (!this.nodeHighlighter) this.nodeHighlighter = new NodeHighlighter(this.scene);
+    this.sceneTree = this.nodeHighlighter.reset(this.model);
+  }
+
+  /** 指定要高亮的节点（加选逻辑在上层 store 里） */
+  setNodeSelection(ids: readonly string[]): void {
+    this.nodeHighlighter?.setSelection(ids);
+  }
+
+  clearNodeSelection(): void {
+    this.nodeHighlighter?.clear();
   }
 
   // ===== 模态变换：按 G / R / S 之后鼠标直接驱动骨骼 =====
@@ -855,6 +889,8 @@ export class FbxPlayer {
     // 姿态统计只看真实骨骼（65 根），不算 FBX 的同名包装节点
     this.poseBoneIds = this.skeleton.flatBones.map((bone) => bone.id);
     this.captureBasePose();
+    // 节点树：对象层级（含骨骼节点），供「节点」面板展示与高亮
+    this.rebuildSceneTree();
 
     this.frameModel();
     this.currentAction = null;
@@ -1061,6 +1097,8 @@ export class FbxPlayer {
     this.transformControls?.detach();
     this.selectedBoneId = null;
     this.modal = null;
+    this.clearNodeSelection();
+    this.sceneTree = [];
     this.bonesById.clear();
     this.restPose.clear();
     this.poseMode = false;
