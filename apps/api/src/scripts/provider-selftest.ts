@@ -5,8 +5,10 @@
  *   npm run test:providers -w @h3d/api
  */
 import { getProvider, listProviders, providerDefaults } from '../providers/registry.js';
+import { ProviderError } from '../providers/types.js';
 import type { GenerationParams, ProviderMeta } from '../store/types.js';
 import { materializeAsset, removeAssetFiles } from '../services/assets.js';
+import { withRetry } from '../services/retry.js';
 import { parseCreateJobBody, parseParams, ValidationError } from '../routes/validate.js';
 
 type Handler = (url: string, init: RequestInit) => unknown;
@@ -414,6 +416,87 @@ async function testMaterialize(): Promise<void> {
   }
 }
 
+async function testRetry(): Promise<void> {
+  console.log('\n[retry / cancel]');
+  const silent = { onRetry: () => {} };
+
+  let calls = 0;
+  const value = await withRetry(
+    async () => {
+      calls += 1;
+      if (calls < 3) throw new ProviderError('网络抖动', 'NetworkError');
+      return 'ok';
+    },
+    { attempts: 4, baseDelayMs: 5, ...silent },
+  );
+  check('可重试错误重试后成功', value === 'ok' && calls === 3, { calls });
+
+  let exhausted = 0;
+  let threw = false;
+  try {
+    await withRetry(
+      async () => {
+        exhausted += 1;
+        throw new ProviderError('一直失败', 'NetworkError');
+      },
+      { attempts: 3, baseDelayMs: 5, ...silent },
+    );
+  } catch {
+    threw = true;
+  }
+  check('重试耗尽后抛出原错误', threw && exhausted === 3, { exhausted, threw });
+
+  let nonRetryCalls = 0;
+  try {
+    await withRetry(
+      async () => {
+        nonRetryCalls += 1;
+        throw new ProviderError('参数错误', 'InvalidParameter.Foo');
+      },
+      { attempts: 3, baseDelayMs: 5, ...silent },
+    );
+  } catch {
+    /* 预期抛出 */
+  }
+  check('不可重试错误只尝试一次', nonRetryCalls === 1, nonRetryCalls);
+}
+
+async function testCancel(): Promise<void> {
+  check('混元引擎没有远端取消接口（契约可选）', getProvider('hunyuan3d').cancel === undefined);
+
+  handlers = [
+    {
+      match: /\/task\/tripo-cancel\/cancel$/,
+      handler: (_url, init) => {
+        check('Tripo 取消用 POST /task/{id}/cancel', (init.method ?? '') === 'POST');
+        return { code: 0, data: {} };
+      },
+    },
+    { match: /\/task\/tripo-gone\/cancel$/, handler: () => json({ message: 'not found' }, 404) },
+  ];
+  check('Tripo 取消成功返回 true', (await getProvider('tripo3d').cancel!(CTX, 'tripo-cancel', {})) === true);
+  check('Tripo 404 视为不支持（返回 false）', (await getProvider('tripo3d').cancel!(CTX, 'tripo-gone', {})) === false);
+
+  handlers = [
+    {
+      match: /\/text-to-3d\/ms-cancel$/,
+      handler: (_url, init) => {
+        check('Meshy 取消用 DELETE /{kind}/{id}', (init.method ?? '') === 'DELETE');
+        return { ok: true };
+      },
+    },
+    { match: /\/image-to-3d\/ms-gone$/, handler: () => json({ message: 'method not allowed' }, 405) },
+  ];
+  check(
+    'Meshy 文生任务取消成功返回 true',
+    (await getProvider('meshy').cancel!(CTX, 'ms-cancel', { kind: 'text' })) === true,
+  );
+  check(
+    'Meshy 405 视为不支持（返回 false）',
+    (await getProvider('meshy').cancel!(CTX, 'ms-gone', { kind: 'image' })) === false,
+  );
+}
+
 async function main(): Promise<void> {
   installMockFetch();
   console.log('生成引擎自测（mock 网络，不消耗积分）');
@@ -423,6 +506,8 @@ async function main(): Promise<void> {
   await testMeshy();
   await testValidation();
   await testMaterialize();
+  await testRetry();
+  await testCancel();
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   if (failed > 0) process.exit(1);

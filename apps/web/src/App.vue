@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue';
+import { defineAsyncComponent, onBeforeUnmount, onMounted, ref } from 'vue';
 import TopBar from './components/TopBar.vue';
 import GeneratePanel from './components/GeneratePanel.vue';
 import ViewportPanel from './components/ViewportPanel.vue';
@@ -7,12 +7,21 @@ import WorkbenchSidePanel from './components/WorkbenchSidePanel.vue';
 import TaskBar from './components/TaskBar.vue';
 import SettingsDialog from './components/SettingsDialog.vue';
 import ToastStack from './components/ToastStack.vue';
-import AnimationPage from './components/animation/AnimationPage.vue';
 import { useWorkspaceStore } from './stores/workspace';
+
+// 动画预览页（FBX 播放器 + 骨骼/节点树）只在真正用时才加载，首屏包体因此小一半
+const AnimationPage = defineAsyncComponent(() => import('./components/animation/AnimationPage.vue'));
 
 const store = useWorkspaceStore();
 const settingsOpen = ref(false);
 const page = ref<'workbench' | 'animations'>('workbench');
+/** 动画页是异步组件，首次切换时显示占位，避免空白无反馈 */
+const animationLoaded = ref(false);
+
+function changePage(value: 'workbench' | 'animations'): void {
+  page.value = value;
+  if (value === 'animations') animationLoaded.value = true;
+}
 
 onMounted(() => store.startPolling());
 onBeforeUnmount(() => store.stopPolling());
@@ -23,7 +32,7 @@ onBeforeUnmount(() => store.stopPolling());
     <TopBar
       :settings-open="settingsOpen"
       :page="page"
-      @change-page="(value) => (page = value)"
+      @change-page="changePage"
       @open-settings="settingsOpen = true"
     />
 
@@ -33,7 +42,7 @@ onBeforeUnmount(() => store.stopPolling());
       <WorkbenchSidePanel />
     </main>
     <main v-else class="anim-host">
-      <AnimationPage />
+      <AnimationPage v-if="animationLoaded" />
     </main>
 
     <TaskBar v-if="page === 'workbench'" />

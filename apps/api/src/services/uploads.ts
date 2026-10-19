@@ -54,6 +54,32 @@ export function stagingDirFor(batchId: string): string {
   return path.join(uploadsStagingDir, batchId);
 }
 
+/**
+ * 清理过期上传暂存目录（默认 24 小时）。
+ * 正常批次在 commit / abort 时就会删掉，这里只兜底“浏览器中途关闭/进程崩溃”留下的残留。
+ */
+export async function sweepStaging(maxAgeMs = 24 * 60 * 60 * 1000): Promise<number> {
+  let removed = 0;
+  let entries: string[];
+  try {
+    entries = await fs.readdir(uploadsStagingDir);
+  } catch {
+    return 0;
+  }
+  const now = Date.now();
+  for (const name of entries) {
+    const dir = path.join(uploadsStagingDir, name);
+    const stat = await fs.stat(dir).catch(() => null);
+    if (!stat?.isDirectory()) continue;
+    const age = now - stat.mtimeMs;
+    if (age < maxAgeMs) continue;
+    await fs.rm(dir, { recursive: true, force: true });
+    removed += 1;
+    log.info(`清理过期上传暂存目录 ${name}（${Math.round(age / 3_600_000)} 小时前）`);
+  }
+  return removed;
+}
+
 export async function ensureStagingDir(batchId: string): Promise<string> {
   const dir = stagingDirFor(batchId);
   await fs.mkdir(dir, { recursive: true });

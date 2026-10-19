@@ -75,4 +75,8 @@ export const animationApi = {
 
   /** 只取流，不进 HTTP 缓存（服务端 no-store，客户端只在内存里留一份） */
   fileUrl: (filePath: string) => `/api/anim/file?path=${encodeURIComponent(filePath)}`,
+
+  /** 封面：后端 worker 子线程渲染（浏览器只当图片加载，不占主线程） */
+  animationCoverUrl: (filePath: string, size = 192, pose = 0.35) =>
+    `/api/anim/cover?path=${encodeURIComponent(filePath)}&size=${size}&pose=${pose}`,
 };

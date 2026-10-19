@@ -33,7 +33,9 @@ export interface UploadItem {
   key: string;
   name: string;
   size: number;
-  status: 'pending' | 'uploading' | 'done' | 'error';
+  status: 'pending' | 'uploading' | 'done' | 'error' | 'canceled';
+  /** 当前文件上传进度 0-100 */
+  progress: number;
   error?: string;
 }
 
@@ -244,6 +246,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   // ===== 素材上传 =====
   const uploadQueue = ref<UploadItem[]>([]);
   const uploading = ref(false);
+  /** 当前批量上传的取消句柄（abort 会中止 XHR 并清理服务端暂存） */
+  const uploadController = ref<AbortController | null>(null);
   const uploadInfo = ref<{ acceptedExtensions: string[]; maxBytes: number; hint: string }>({
     acceptedExtensions: FALLBACK_UPLOAD_EXTENSIONS,
     maxBytes: FALLBACK_UPLOAD_MAX_BYTES,
@@ -446,24 +450,33 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   /**
    * 上传本地模型到素材库（一次选择多个文件即批量上传）。
    * 逐个文件暂存 → 服务端按批次分组提交；同批次的 `.obj/.gltf` 与材质、贴图会合并成一个素材。
+   * 支持进度显示与中途取消（XHR abort + 删除服务端暂存批次）。
    */
   async function uploadFiles(files: File[]): Promise<void> {
     if (files.length === 0 || uploading.value) return;
 
     const batchId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+    const controller = new AbortController();
+    uploadController.value = controller;
     uploadQueue.value = files.map((file, index) => ({
       key: `${index}-${file.name}`,
       name: file.name,
       size: file.size,
       status: 'pending' as const,
+      progress: 0,
     }));
     uploading.value = true;
 
     const failures: string[] = [];
     let staged = 0;
+    let canceled = false;
 
     try {
       for (let index = 0; index < files.length; index += 1) {
+        if (controller.signal.aborted) {
+          canceled = true;
+          break;
+        }
         const file = files[index]!;
         const item = uploadQueue.value[index]!;
         const ext = extensionOf(file.name);
@@ -488,15 +501,43 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         }
 
         item.status = 'uploading';
+        item.progress = 0;
         try {
-          await api.stageFile(batchId, file);
+          await api.stageFile(batchId, file, {
+            signal: controller.signal,
+            onProgress: (loaded, total) => {
+              item.progress = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+            },
+          });
           item.status = 'done';
+          item.progress = 100;
           staged += 1;
         } catch (err) {
+          if ((err as Error)?.name === 'AbortError') {
+            item.status = 'canceled';
+            canceled = true;
+            break;
+          }
           item.status = 'error';
           item.error = err instanceof Error ? err.message : '上传失败';
           failures.push(`${file.name}：${item.error}`);
         }
+      }
+
+      if (canceled) {
+        for (const item of uploadQueue.value) {
+          if (item.status === 'pending' || item.status === 'uploading') item.status = 'canceled';
+        }
+        await api.abortUpload(batchId).catch(() => undefined);
+        toast('info', `已取消上传（本批次 ${staged} 个已暂存文件已清理）`);
+        return;
+      }
+
+      // 最后一份文件刚传完就点了取消：也要走取消分支，不能悄悄提交
+      if (controller.signal.aborted) {
+        await api.abortUpload(batchId).catch(() => undefined);
+        toast('info', '已取消上传');
+        return;
       }
 
       if (staged === 0) {
@@ -517,10 +558,16 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       toast('error', err instanceof Error ? err.message : '上传失败');
     } finally {
       uploading.value = false;
+      uploadController.value = null;
       window.setTimeout(() => {
         if (!uploading.value) uploadQueue.value = [];
       }, 3500);
     }
+  }
+
+  /** 取消正在进行的批量上传（中止当前文件并清理服务端暂存） */
+  function cancelUpload(): void {
+    uploadController.value?.abort();
   }
 
   function clearUploadQueue(): void {
@@ -529,7 +576,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   /**
    * 为缺少缩略图的素材批量生成预览图。
-   * 用离屏渲染器顺序处理（同一时刻只占一个 WebGL 上下文），不会打断当前视口。
+   * 优先请求后端 worker 子线程渲染（不占用浏览器主线程）；
+   * 后端不支持/失败时回退到原来的离屏 WebGL 渲染。
    */
   async function fillMissingThumbnails(options: { ids?: string[]; max?: number } = {}): Promise<void> {
     if (thumbnailRunning) return;
@@ -548,19 +596,30 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         const asset = job.asset;
         if (!asset) continue;
         thumbnailTask.value.current = job.name;
+        let rendered = false;
         try {
-          const dataUrl = await renderAssetThumbnail(asset);
-          if (dataUrl) {
-            const response = await api.uploadThumbnail(job.id, dataUrl);
+          // 1) 后端子线程渲染（快且完全不占浏览器主线程）
+          const server = await api.generateCover(job.id).catch(() => null);
+          if (server?.ok) {
             const target = jobs.value.find((item) => item.id === job.id);
-            if (target?.asset) {
-              target.asset.thumbnailUrl = response.thumbnailUrl ?? `/files/${job.id}/thumb.png`;
+            if (target?.asset && server.thumbnailUrl) target.asset.thumbnailUrl = server.thumbnailUrl;
+            rendered = true;
+          } else {
+            // 2) 回退：浏览器离屏渲染
+            const dataUrl = await renderAssetThumbnail(asset);
+            if (dataUrl) {
+              const response = await api.uploadThumbnail(job.id, dataUrl);
+              const target = jobs.value.find((item) => item.id === job.id);
+              if (target?.asset) {
+                target.asset.thumbnailUrl = response.thumbnailUrl ?? `/files/${job.id}/thumb.png`;
+              }
+              rendered = true;
             }
-            succeeded += 1;
           }
         } catch {
           // 单个失败不影响其它素材
         }
+        if (rendered) succeeded += 1;
         thumbnailTask.value.done += 1;
         // 让出主线程，避免长时间阻塞界面
         await new Promise((resolve) => setTimeout(resolve, 0));
@@ -633,8 +692,11 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   async function cancel(jobId: string): Promise<void> {
     try {
-      await api.cancelJob(jobId);
-      toast('info', '已取消任务');
+      const result = await api.cancelJob(jobId);
+      // 远端取消是 best-effort：引擎不支持/失败时如实告诉用户"可能仍会计费"
+      if (result.remote === 'ok') toast('success', '已取消任务，并已通知远端停止');
+      else if (result.remote === 'not-submitted') toast('info', '已取消任务（尚未提交到远端）');
+      else toast('info', result.message || '已取消本地任务，远端可能仍会计费');
       await refresh();
     } catch (err) {
       toast('error', err instanceof Error ? err.message : '取消失败');
@@ -765,6 +827,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     clearViews,
     reuseParams,
     uploadFiles,
+    cancelUpload,
     clearUploadQueue,
     fillMissingThumbnails,
     submit,

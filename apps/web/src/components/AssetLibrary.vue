@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 import Icon from './ui/Icon.vue';
 import { downloadUrl } from '@/api/client';
 import { useWorkspaceStore, isActive } from '@/stores/workspace';
@@ -35,7 +35,7 @@ const PHASE_LABEL: Record<Job['phase'], string> = {
   canceled: '已取消',
 };
 
-const visibleJobs = computed(() => {
+const filteredJobs = computed(() => {
   const key = keyword.value.trim().toLowerCase();
   return store.jobs.filter((job) => {
     if (filter.value === 'active' && !isActive(job.phase)) return false;
@@ -48,6 +48,42 @@ const visibleJobs = computed(() => {
       job.params.generateType.toLowerCase().includes(key)
     );
   });
+});
+
+// ===== 分页：素材多起来后不再把 300 张卡片一次性塞进 DOM =====
+const page = ref(1);
+const pageSize = ref(12);
+const PAGE_SIZES = [12, 24, 48, 96];
+
+const pageCount = computed(() => Math.max(1, Math.ceil(filteredJobs.value.length / pageSize.value)));
+const pagedJobs = computed(() =>
+  filteredJobs.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value),
+);
+
+/** 页码窗口：当前页前后各 2 页，首尾恒显示 */
+const pageNumbers = computed(() => {
+  const total = pageCount.value;
+  const current = page.value;
+  const windowSize = 5;
+  let start = Math.max(1, current - Math.floor(windowSize / 2));
+  const end = Math.min(total, start + windowSize - 1);
+  start = Math.max(1, end - windowSize + 1);
+  const numbers: number[] = [];
+  for (let value = start; value <= end; value += 1) numbers.push(value);
+  return numbers;
+});
+
+function goPage(target: number): void {
+  page.value = Math.min(pageCount.value, Math.max(1, target));
+}
+
+watch([keyword, filter, pageSize], () => {
+  page.value = 1;
+});
+
+// 任务被删除 / 过滤后页数变少时，把当前页夹回合法范围
+watch(pageCount, (count) => {
+  if (page.value > count) page.value = count;
 });
 
 const counts = computed(() => ({
@@ -165,8 +201,21 @@ function statusText(status: string): string {
   if (status === 'pending') return '等待上传';
   if (status === 'uploading') return '上传中';
   if (status === 'done') return '已暂存';
+  if (status === 'canceled') return '已取消';
   return '失败';
 }
+
+/** 上传进度百分比（整批：已暂存文件按 100% 计） */
+const uploadProgress = computed(() => {
+  const queue = store.uploadQueue;
+  if (queue.length === 0) return 0;
+  const total = queue.reduce((sum, item) => {
+    if (item.status === 'done') return sum + 100;
+    if (item.status === 'uploading') return sum + item.progress;
+    return sum;
+  }, 0);
+  return Math.round(total / queue.length);
+});
 </script>
 
 <template>
@@ -245,27 +294,52 @@ function statusText(status: string): string {
         <div class="upload-head">
           <span class="section-title">
             <Icon name="upload" :size="12" />
-            上传中
+            {{ store.uploading ? '上传中' : '上传结果' }}
             {{ store.uploadQueue.filter((item) => item.status === 'done').length }}/{{ store.uploadQueue.length }}
+            <span v-if="store.uploading" class="mono faint">{{ uploadProgress }}%</span>
           </span>
-          <button class="mini" type="button" title="收起" @click="store.clearUploadQueue()">
-            <Icon name="close" :size="11" />
-          </button>
+          <div class="upload-actions">
+            <button
+              v-if="store.uploading"
+              class="mini danger"
+              type="button"
+              title="取消本次上传（已暂存文件会清理）"
+              @click="store.cancelUpload()"
+            >
+              <Icon name="ban" :size="11" />
+              取消
+            </button>
+            <button v-else class="mini" type="button" title="收起" @click="store.clearUploadQueue()">
+              <Icon name="close" :size="11" />
+            </button>
+          </div>
         </div>
         <ul class="upload-list">
           <li v-for="item in store.uploadQueue" :key="item.key" class="upload-item" :class="item.status">
             <Icon
-              :name="item.status === 'error' ? 'alert' : item.status === 'done' ? 'check' : 'refresh'"
+              :name="
+                item.status === 'error'
+                  ? 'alert'
+                  : item.status === 'done'
+                    ? 'check'
+                    : item.status === 'canceled'
+                      ? 'ban'
+                      : 'refresh'
+              "
               :size="11"
               :class="{ spin: item.status === 'uploading' }"
             />
             <span class="upload-name" :title="item.name">{{ item.name }}</span>
-            <span class="upload-status">{{ item.error ?? statusText(item.status) }}</span>
+            <span v-if="item.status === 'uploading'" class="upload-status mono">{{ item.progress }}%</span>
+            <span v-else class="upload-status">{{ item.error ?? statusText(item.status) }}</span>
+            <span v-if="item.status === 'uploading'" class="upload-bar">
+              <span class="upload-bar-fill" :style="{ width: `${item.progress}%` }" />
+            </span>
           </li>
         </ul>
       </div>
 
-      <p v-if="visibleJobs.length === 0" class="empty">
+      <p v-if="filteredJobs.length === 0" class="empty">
         {{
           store.jobs.length === 0
             ? '还没有素材：可上传本地模型，或在左侧生成一个'
@@ -274,7 +348,7 @@ function statusText(status: string): string {
       </p>
 
       <article
-        v-for="job in visibleJobs"
+        v-for="job in pagedJobs"
         :key="job.id"
         class="card"
         :class="{ selected: store.selectedId === job.id }"
@@ -375,6 +449,32 @@ function statusText(status: string): string {
       </article>
     </div>
 
+    <!-- 分页：只渲染当前页的卡片，素材多了也不会把 DOM / 图片请求打满 -->
+    <div v-if="filteredJobs.length > 0" class="pager">
+      <select v-model.number="pageSize" class="page-size" aria-label="每页数量">
+        <option v-for="size in PAGE_SIZES" :key="size" :value="size">每页 {{ size }}</option>
+      </select>
+      <div class="page-buttons">
+        <button class="page-btn" type="button" :disabled="page <= 1" title="上一页" @click="goPage(page - 1)">
+          <Icon name="chevronRight" :size="12" class="flip" />
+        </button>
+        <button
+          v-for="value in pageNumbers"
+          :key="value"
+          class="page-btn"
+          :class="{ active: value === page }"
+          type="button"
+          @click="goPage(value)"
+        >
+          {{ value }}
+        </button>
+        <button class="page-btn" type="button" :disabled="page >= pageCount" title="下一页" @click="goPage(page + 1)">
+          <Icon name="chevronRight" :size="12" />
+        </button>
+      </div>
+      <span class="page-info mono">{{ page }}/{{ pageCount }} · 共 {{ filteredJobs.length }}</span>
+    </div>
+
     <!-- 拖拽上传提示 -->
     <div v-if="dragging" class="drop-overlay">
       <Icon name="upload" :size="26" />
@@ -471,6 +571,19 @@ function statusText(status: string): string {
   height: 18px;
 }
 
+.upload-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 取消上传按钮带文字，宽一点 */
+.upload-head .upload-actions .mini:first-child {
+  width: auto;
+  padding: 0 6px;
+  gap: 3px;
+}
+
 .upload-list {
   margin: 0;
   padding: 0;
@@ -486,8 +599,24 @@ function statusText(status: string): string {
   display: flex;
   align-items: center;
   gap: 5px;
+  flex-wrap: wrap;
   font-size: 10.5px;
   color: var(--text-dim);
+}
+
+.upload-bar {
+  flex: 0 0 100%;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.upload-bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.15s linear;
 }
 
 .upload-item.error {
@@ -641,6 +770,78 @@ function statusText(status: string): string {
   text-align: center;
   font-size: 12px;
   color: var(--text-faint);
+}
+
+/* ===== 分页 ===== */
+.pager {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-panel-2);
+}
+
+.page-size {
+  flex: none;
+  height: 22px;
+  padding: 0 4px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+}
+
+.page-buttons {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-width: 0;
+}
+
+.page-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  color: var(--text-dim);
+  font-size: 10.5px;
+}
+
+.page-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.page-btn.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+
+.page-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.page-btn .flip {
+  transform: rotate(180deg);
+}
+
+.page-info {
+  flex: none;
+  font-size: 10px;
+  color: var(--text-faint);
+  white-space: nowrap;
 }
 
 .card {

@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import { config } from '../config.js';
 import { createLogger } from '../lib/logger.js';
+import { animationCover } from '../services/covers.js';
 
 const log = createLogger('anim');
 
@@ -236,6 +237,48 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
 
     log.debug(`扫描 ${dirs.length} 个文件夹 → ${unique.length} 个 FBX`);
     return { dirs, files: unique, truncated, missing };
+  });
+
+  /**
+   * 动画封面（由后端子线程渲染，浏览器只负责显示 <img>）。
+   * 只允许已记录文件夹内的 .fbx；带 ETag，重复请求命中缓存直接 304。
+   */
+  app.get('/api/anim/cover', async (request, reply) => {
+    const query = request.query as { path?: string; size?: string; pose?: string };
+    const raw = query.path?.trim();
+    if (!raw) return reply.code(400).send({ error: '缺少 path 参数' });
+
+    const target = path.resolve(raw);
+    if (!isFbx(target)) return reply.code(415).send({ error: '动画封面只支持 .fbx 文件' });
+
+    const { dirs } = await effectiveDirs();
+    const inside = dirs.some(
+      (dir) => target === dir || target.startsWith(`${dir}${path.sep}`) || target.startsWith(`${dir}/`),
+    );
+    if (!inside) return reply.code(403).send({ error: '只能为已记录的动画文件夹生成封面' });
+
+    const stat = await fs.stat(target).catch(() => null);
+    if (!stat?.isFile()) return reply.code(404).send({ error: '文件不存在' });
+
+    const size = Math.min(384, Math.max(96, Number(query.size) || 256));
+    const pose = Math.min(1, Math.max(0, Number(query.pose ?? 0.35)));
+    const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}-${size}-${pose}"`;
+    if (request.headers['if-none-match'] === etag) {
+      return reply.code(304).send();
+    }
+
+    try {
+      const png = await animationCover(target, { size, poseFraction: pose });
+      return reply
+        .header('Content-Type', 'image/png')
+        .header('Content-Length', String(png.length))
+        .header('Cache-Control', 'public, max-age=86400')
+        .header('ETag', etag)
+        .send(png);
+    } catch (err) {
+      log.warn(`动画封面生成失败 ${path.basename(target)}: ${(err as Error).message}`);
+      return reply.code(500).send({ error: `封面生成失败：${(err as Error).message}` });
+    }
   });
 
   /** 浏览子目录，用于“选择文件夹” */

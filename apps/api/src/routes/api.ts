@@ -7,7 +7,8 @@ import { newId } from '../lib/ids.js';
 import { createLogger } from '../lib/logger.js';
 import type { GenerationWorker } from '../services/worker.js';
 import { deletePayload, savePayload, savePreview, loadPreview } from '../services/payload.js';
-import { removeAssetFiles, saveThumbnailDataUrl, deriveName } from '../services/assets.js';
+import { removeAssetFiles, saveThumbnailDataUrl, saveThumbnailBuffer, pickCoverSourcePath, deriveName } from '../services/assets.js';
+import { getCoverRenderer } from '../services/covers.js';
 import {
   activeProvider,
   maskApiKey,
@@ -269,9 +270,43 @@ export async function registerApiRoutes(app: FastifyInstance, deps: ApiDeps): Pr
 
   app.post('/api/jobs/:id/cancel', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const ok = await worker.cancel(id);
-    if (!ok) return reply.code(409).send({ error: '任务不在进行中，无法取消' });
-    return { ok: true };
+    const result = await worker.cancel(id);
+    if (!result.canceled) return reply.code(409).send({ error: result.message });
+    return { ok: true, remote: result.remote, message: result.message };
+  });
+
+  /**
+   * 后端子线程渲染素材封面（不占用浏览器主线程）。
+   * 浏览器渲染路径仍保留：这里失败时前端会回退到 POST /api/jobs/:id/thumbnail。
+   */
+  app.post('/api/jobs/:id/cover', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const job = workspace.findJob(id);
+    if (!job?.asset) return reply.code(404).send({ error: '素材不存在' });
+    if (job.asset.thumbnailUrl) return { ok: true, thumbnailUrl: job.asset.thumbnailUrl, cached: true };
+
+    const body = (request.body ?? {}) as { size?: unknown };
+    const size = Math.min(512, Math.max(96, Number(body.size) || 256));
+    const source = await pickCoverSourcePath(id, job.asset);
+    if (!source) return { ok: false, reason: '该素材没有可渲染的模型文件（或格式不支持服务端封面）' };
+
+    try {
+      const startedAt = Date.now();
+      const result = await getCoverRenderer().renderWithMeta({ filePath: source.filePath, size });
+      const saved = await saveThumbnailBuffer(id, result.png);
+      if (!saved) return { ok: false, reason: '封面写入失败' };
+      await workspace.mutate((state) => {
+        const target = state.jobs.find((item) => item.id === id);
+        if (target?.asset) target.asset.thumbnailUrl = saved;
+      });
+      log.info(
+        `服务端封面生成成功 ${id} (${source.format}, ${result.engine}, ${Date.now() - startedAt}ms)`,
+      );
+      return { ok: true, thumbnailUrl: saved, format: source.format, engine: result.engine };
+    } catch (err) {
+      log.warn(`服务端封面生成失败 ${id}: ${(err as Error).message}`);
+      return { ok: false, reason: (err as Error).message };
+    }
   });
 
   /** 浏览器渲染的缩略图回填（远端未返回预览图时使用） */

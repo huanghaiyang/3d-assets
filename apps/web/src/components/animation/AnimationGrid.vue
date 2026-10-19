@@ -86,15 +86,10 @@ function onPageSize(event: Event): void {
         <span class="chip">{{ store.filteredFiles.length }}</span>
       </div>
       <div class="actions">
-        <span v-if="store.thumbBusy" class="chip chip-info">
-          <Icon name="refresh" :size="11" class="spin" />
-          封面 {{ store.pageThumbCount }}/{{ files.length }}
-        </span>
         <button
-          v-else
           class="btn btn-ghost btn-icon"
           type="button"
-          title="生成本页封面（仅在内存中）"
+          title="加载本页封面（后端渲染，缓存于服务端）"
           @click="store.generatePageThumbnails()"
         >
           <Icon name="image" :size="14" />

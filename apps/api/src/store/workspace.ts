@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createLogger } from '../lib/logger.js';
-import { dataDir, stateFile } from '../lib/paths.js';
+import { dataDir, stateBackupFile, stateFile } from '../lib/paths.js';
 import { DEFAULT_PROVIDER_ID, PROVIDER_IDS, type AppSettings, type Job, type PersistedState } from './types.js';
 
 const log = createLogger('store');
@@ -18,26 +18,51 @@ function emptyState(): PersistedState {
 /**
  * 工作区状态存储：单个 JSON 文件 + 原子写入。
  * 所有写操作串行化，避免并发 rename 竞争。
+ *
+ * 数据安全：
+ * - 启动时把当时的状态写一份 `state.json.bak` 快照
+ * - 主文件损坏/丢失时从快照恢复；损坏文件改名隔离，不会被静默覆盖
+ * - `recoveredFromCorrupt` 告知上层（app.ts）本次启动**不要**清理素材目录，
+ *   否则记录丢失 + 启动 sweep 会把 data/storage 下的模型一起删掉
  */
 export class Workspace {
   private state: PersistedState;
   private writeChain: Promise<void> = Promise.resolve();
+  /** 本次启动是否发生过状态恢复/损坏隔离（为 true 时上层必须跳过素材清理） */
+  readonly recoveredFromCorrupt: boolean;
 
-  private constructor(state: PersistedState) {
+  private constructor(state: PersistedState, recoveredFromCorrupt = false) {
     this.state = state;
+    this.recoveredFromCorrupt = recoveredFromCorrupt;
   }
 
   static async open(): Promise<Workspace> {
     await fs.mkdir(dataDir, { recursive: true });
     let state = emptyState();
-    try {
-      const raw = await fs.readFile(stateFile, 'utf8');
-      state = normalize(JSON.parse(raw) as Partial<PersistedState>);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'ENOENT') log.warn(`读取 state.json 失败，将重建: ${(err as Error).message}`);
+    let recovered = false;
+
+    const primary = await readStateFile(stateFile);
+    if (primary.ok) {
+      state = primary.state;
+    } else if (primary.reason === 'invalid') {
+      recovered = true;
+      await quarantine(stateFile);
+      log.error(`state.json 无法解析（${primary.error ?? '未知原因'}），已隔离为 state.json.corrupt-*`);
     }
-    const ws = new Workspace(state);
+
+    if (!primary.ok) {
+      const backup = await readStateFile(stateBackupFile);
+      if (backup.ok) {
+        state = backup.state;
+        recovered = true;
+        log.warn(`已从备份 state.json.bak 恢复 ${state.jobs.length} 个任务、${state.animationDirs.length} 个动画目录`);
+      } else if (primary.reason === 'missing') {
+        log.info('未找到 state.json，按全新工作区启动');
+      }
+    }
+
+    const ws = new Workspace(state, recovered);
+
     // 启动时把中断的任务重新排队（远端可能仍在运行，交由 worker 恢复）
     let requeued = 0;
     for (const job of ws.state.jobs) {
@@ -49,7 +74,13 @@ export class Workspace {
     if (requeued > 0) {
       log.info(`恢复 ${requeued} 个中断的提交任务`);
       await ws.persist();
+    } else if (recovered) {
+      // 把恢复后的状态写回主文件，避免下次启动又走恢复分支
+      await ws.persist();
     }
+
+    // 每次启动都刷新一次快照，覆盖“会话中途被外部改坏”的情况
+    await ws.writeBackup();
     return ws;
   }
 
@@ -92,9 +123,55 @@ export class Workspace {
     return this.writeChain;
   }
 
-  /** 等待所有挂起的写入完成 */
+  /** 写一份当前状态的快照（启动 / 退出时调用，不参与高频写入） */
+  async writeBackup(): Promise<void> {
+    const tmp = `${stateBackupFile}.tmp`;
+    try {
+      await fs.mkdir(dataDir, { recursive: true });
+      await fs.writeFile(tmp, JSON.stringify(this.state, null, 2), 'utf8');
+      await fs.rename(tmp, stateBackupFile);
+    } catch (err) {
+      log.warn(`写入 state.json.bak 失败: ${(err as Error).message}`);
+      await fs.rm(tmp, { force: true });
+    }
+  }
+
+  /** 等待所有挂起的写入完成，并刷新一次退出快照 */
   async flush(): Promise<void> {
     await this.writeChain;
+    await this.writeBackup();
+  }
+}
+
+type StateReadResult =
+  | { ok: true; state: PersistedState }
+  | { ok: false; reason: 'missing' | 'invalid'; error?: string };
+
+async function readStateFile(file: string): Promise<StateReadResult> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(file, 'utf8');
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return { ok: false, reason: code === 'ENOENT' ? 'missing' : 'invalid', error: (err as Error).message };
+  }
+  if (!raw.trim()) return { ok: false, reason: 'invalid', error: '文件为空' };
+  try {
+    return { ok: true, state: normalize(JSON.parse(raw) as Partial<PersistedState>) };
+  } catch (err) {
+    return { ok: false, reason: 'invalid', error: (err as Error).message };
+  }
+}
+
+/** 把损坏的状态文件改名隔离，保留现场供排查，避免被下一次写入静默覆盖 */
+async function quarantine(file: string): Promise<void> {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const target = `${file}.corrupt-${stamp}`;
+  try {
+    await fs.rename(file, target);
+    log.warn(`损坏的状态文件已隔离到 ${path.basename(target)}`);
+  } catch (err) {
+    log.warn(`隔离损坏状态文件失败: ${(err as Error).message}`);
   }
 }
 

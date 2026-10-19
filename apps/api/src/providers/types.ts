@@ -167,6 +167,11 @@ export interface GenerationProvider {
   query(ctx: ProviderContext, remoteJobId: string, meta: ProviderMeta): Promise<ProviderQueryResult>;
   download(ctx: ProviderContext, url: string): Promise<{ buffer: Buffer; contentType: string }>;
   verify(ctx: ProviderContext): Promise<ProviderVerifyResult>;
+  /**
+   * 可选：通知远端取消任务。返回 true 表示远端已接受；false 表示该引擎/该阶段不支持取消。
+   * 调用方只做 best-effort（失败不影响本地取消），因此这里抛错只会被记录成提示。
+   */
+  cancel?(ctx: ProviderContext, remoteJobId: string, meta: ProviderMeta): Promise<boolean>;
 }
 
 // ===== 小工具 =====

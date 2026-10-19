@@ -263,6 +263,25 @@ export const tripo3dProvider: GenerationProvider = {
     return httpBuffer(url, { headers: headers(ctx), label: 'Tripo 下载结果' });
   },
 
+  /**
+   * 通知 Tripo 取消任务（best-effort）。
+   * 取消入口以官方文档为准：`POST /task/{task_id}/cancel`；若接口不存在/不支持会返回 404/405，
+   * 这里返回 false 让上层提示「已停止本地跟踪，远端可能仍会计费」。
+   */
+  async cancel(ctx: ProviderContext, remoteJobId: string): Promise<boolean> {
+    try {
+      const { data } = await httpJson<TripoEnvelope<unknown>>(
+        `${ctx.baseUrl}/task/${encodeURIComponent(remoteJobId)}/cancel`,
+        { method: 'POST', headers: headers(ctx), label: 'Tripo 取消任务', timeoutMs: 20_000, retries: 0 },
+      );
+      assertOk(data, 'Tripo 取消任务');
+      return true;
+    } catch (err) {
+      if (err instanceof ProviderError && (err.httpStatus === 404 || err.httpStatus === 405)) return false;
+      throw err;
+    }
+  },
+
   async verify(ctx: ProviderContext): Promise<ProviderVerifyResult> {
     try {
       const { data } = await httpJson<TripoEnvelope<{ balance?: number; frozen?: number }>>(

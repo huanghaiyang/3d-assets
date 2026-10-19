@@ -17,8 +17,10 @@
     "build": "npm run build -w @h3d/web && npm run build -w @h3d/api",
     "start": "node apps/api/dist/index.js",
     "typecheck": "npm run typecheck -w @h3d/api && npm run typecheck -w @h3d/web",
-    "test": "npm run test:fuzzy -w @h3d/web",
+    "test": "npm run test:fuzzy -w @h3d/web && npm run test:state -w @h3d/api && npm run test:cover -w @h3d/api && npm run test:providers -w @h3d/api",
     "test:providers": "npm run test:providers -w @h3d/api",
+    "test:state": "npm run test:state -w @h3d/api",
+    "test:cover": "npm run test:cover -w @h3d/api",
     "check:secrets": "node scripts/check-secrets.mjs",
     "prepare": "git config core.hooksPath .githooks || echo \"[prepare] 跳过 git hooks 配置\"",
     "smoke": "npm run smoke -w @h3d/api"

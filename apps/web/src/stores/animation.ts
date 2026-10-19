@@ -15,33 +15,12 @@ import {
 import type { BoneDisplayMode, BoneNode, FlatBone } from '@/viewer/SkeletonOverlay';
 import { matchToken } from '@/utils/fuzzy';
 
-const THUMB_SIZE = 256;
-/** 封面只在内存里保存，绝不写盘（源文件夹必须保持只读） */
-const MAX_THUMBNAILS = 300;
-const THUMB_HOST_ID = 'anim-thumb-host';
+/** 封面尺寸：由后端 worker 子线程渲染，浏览器只负责 <img> 显示 */
+const THUMB_SIZE = 192;
+/** 取片段 35% 处的姿势，比 T-pose 更能区分不同动作 */
+const THUMB_POSE = 0.35;
 const PAGE_SIZES = [12, 24, 48, 96];
 const ALL_FOLDERS = '__all__';
-
-/** 离屏渲染容器：必须挂在 DOM 上且有实际尺寸，否则渲染器尺寸为 1×1 */
-function ensureThumbHost(): HTMLDivElement {
-  const existing = document.getElementById(THUMB_HOST_ID);
-  if (existing instanceof HTMLDivElement) return existing;
-  const host = document.createElement('div');
-  host.id = THUMB_HOST_ID;
-  host.setAttribute('aria-hidden', 'true');
-  host.style.cssText = [
-    'position:fixed',
-    'left:-10000px',
-    'top:0',
-    `width:${THUMB_SIZE}px`,
-    `height:${THUMB_SIZE}px`,
-    'pointer-events:none',
-    'opacity:0',
-    'z-index:-1',
-  ].join(';');
-  document.body.appendChild(host);
-  return host;
-}
 
 export interface AnimationToast {
   id: number;
@@ -108,16 +87,11 @@ export const useAnimationStore = defineStore('animation', () => {
   /** 节点树是否包含骨骼节点（骨骼在「骨骼」页签里有更细的界面） */
   const nodeShowBones = ref(false);
 
-  /** 内存封面缓存：key = 文件绝对路径（跨页保留，切回时无需重算） */
+  /** 封面 URL 缓存：key = 文件绝对路径（后端渲染 + 浏览器 HTTP 缓存，跨页保留） */
   const thumbnails = ref<Record<string, string>>({});
-  const thumbBusy = ref(false);
 
   let player: FbxPlayer | null = null;
   let toastSeq = 0;
-  let thumbWorker: FbxPlayer | null = null;
-  let thumbQueue: AnimationFile[] = [];
-  let thumbRunning = false;
-  const thumbRequests = new Set<string>();
 
   // ===== 列表 / 分页 =====
 
@@ -185,7 +159,6 @@ export const useAnimationStore = defineStore('animation', () => {
   });
 
   const selectedFile = computed(() => files.value.find((file) => file.path === selectedPath.value) ?? null);
-  const pageThumbCount = computed(() => pagedFiles.value.filter((file) => thumbnails.value[file.path]).length);
 
   const folderOptions = computed(() => {
     const map = new Map<string, string>();
@@ -230,13 +203,9 @@ export const useAnimationStore = defineStore('animation', () => {
     duration.value = 0;
     viewError.value = null;
   }
+  /** 兼容旧接口：封面现在是后端渲染的 URL，没有待办队列需要清空 */
+  function resetThumbQueue(): void {}
 
-  /** 只对当前页的卡片生成封面：切页/搜索/切文件夹时丢掉待办队列（已生成的缓存保留） */
-  function resetThumbQueue(): void {
-    for (const file of thumbQueue) thumbRequests.delete(file.path);
-    thumbQueue = [];
-    if (!thumbRunning) thumbBusy.value = false;
-  }
 
   function clampPage(): void {
     if (page.value > totalPages.value) page.value = totalPages.value;
@@ -598,78 +567,34 @@ export const useAnimationStore = defineStore('animation', () => {
   function setPageSize(size: number): void {
     pageSize.value = PAGE_SIZES.includes(size) ? size : 24;
   }
+  // ===== 封面：由后端 worker 子线程渲染，浏览器只加载 URL =====
 
-  // ===== 封面：只在内存中生成，且只针对当前页 =====
+  function coverUrl(file: AnimationFile): string {
+    return animationApi.animationCoverUrl(file.path, THUMB_SIZE, THUMB_POSE);
+  }
 
   function requestThumbnail(file: AnimationFile): void {
-    if (thumbnails.value[file.path] || thumbRequests.has(file.path)) return;
-    thumbRequests.add(file.path);
-    thumbQueue.push(file);
-    void drainThumbnailQueue();
+    if (thumbnails.value[file.path]) return;
+    thumbnails.value = { ...thumbnails.value, [file.path]: coverUrl(file) };
   }
 
-  /** 为当前页所有缺封面的动画排队 */
+  /** 提前给当前页所有卡片挂上封面 URL（图片由浏览器并发加载） */
   function generatePageThumbnails(): void {
-    const pending = pagedFiles.value.filter(
-      (file) => !thumbnails.value[file.path] && !thumbRequests.has(file.path),
-    );
-    if (pending.length === 0) {
-      toast('info', '本页封面都已生成');
+    const next = { ...thumbnails.value };
+    let added = 0;
+    for (const file of pagedFiles.value) {
+      if (next[file.path]) continue;
+      next[file.path] = coverUrl(file);
+      added += 1;
+    }
+    if (added === 0) {
+      toast('info', '本页封面都已加载');
       return;
     }
-    for (const file of pending) thumbRequests.add(file.path);
-    thumbQueue.push(...pending);
-    void drainThumbnailQueue();
-  }
-
-  async function drainThumbnailQueue(): Promise<void> {
-    if (thumbRunning) return;
-    thumbRunning = true;
-    thumbBusy.value = true;
-    try {
-      while (thumbQueue.length > 0) {
-        const file = thumbQueue.shift()!;
-        try {
-          if (!thumbWorker) thumbWorker = new FbxPlayer(ensureThumbHost(), { axisIndicator: false });
-          const result = await thumbWorker.load(animationApi.fileUrl(file.path));
-          if (result.clips.length > 0) {
-            thumbWorker.playClip(0);
-            thumbWorker.resetView();
-            // 取片段 35% 处的姿势，比 T-pose 更能区分不同动作
-            thumbWorker.poseAt(0.35);
-            await nextFrame();
-          }
-          const dataUrl = thumbWorker.captureFrame(THUMB_SIZE);
-          if (dataUrl) {
-            const next = { ...thumbnails.value, [file.path]: dataUrl };
-            const keys = Object.keys(next);
-            if (keys.length > MAX_THUMBNAILS) {
-              for (const key of keys.slice(0, keys.length - MAX_THUMBNAILS)) delete next[key];
-            }
-            thumbnails.value = next;
-          }
-        } catch {
-          // 单个失败不影响其它；同时允许它以后被重新尝试
-          thumbRequests.delete(file.path);
-        }
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
-    } finally {
-      thumbRunning = false;
-      thumbBusy.value = false;
-      releaseThumbWorker();
-    }
-  }
-
-  function releaseThumbWorker(): void {
-    if (thumbQueue.length > 0) return;
-    thumbWorker?.dispose();
-    thumbWorker = null;
-    document.getElementById(THUMB_HOST_ID)?.remove();
+    thumbnails.value = next;
   }
 
   function dispose(): void {
-    releaseThumbWorker();
     player?.dispose();
     player = null;
   }
@@ -692,7 +617,6 @@ export const useAnimationStore = defineStore('animation', () => {
     filteredFiles,
     matchIndices,
     pagedFiles,
-    pageThumbCount,
     selectedPath,
     selectedFile,
     selectedClips,
@@ -754,7 +678,6 @@ export const useAnimationStore = defineStore('animation', () => {
     hoverBoneAt,
     pickBoneAt,
     thumbnails,
-    thumbBusy,
     attachPlayer,
     detachPlayer,
     loadInfo,
@@ -780,9 +703,3 @@ export const useAnimationStore = defineStore('animation', () => {
     ALL_FOLDERS,
   };
 });
-
-function nextFrame(): Promise<void> {
-  return new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-  });
-}

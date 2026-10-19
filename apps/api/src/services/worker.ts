@@ -7,6 +7,7 @@ import { isActivePhase } from '../store/types.js';
 import type { Workspace } from '../store/workspace.js';
 import { deriveName, materializeAsset } from './assets.js';
 import { loadPayload, type JobPayload } from './payload.js';
+import { describeRetryFailure, withRetry } from './retry.js';
 
 const log = createLogger('worker');
 
@@ -16,6 +17,15 @@ export interface WorkerOptions {
 }
 
 export type RetryMode = 'resume' | 'resubmit';
+
+/** 远端取消的结果：ok=远端已接受；unsupported=引擎/阶段不支持；failed=调用失败；not-submitted=还没提交到远端 */
+export type RemoteCancelStatus = 'ok' | 'unsupported' | 'failed' | 'not-submitted';
+
+export interface CancelResult {
+  canceled: boolean;
+  remote: RemoteCancelStatus;
+  message: string;
+}
 
 /** 把落盘的输入转换成引擎契约里的 ProviderInput */
 function toProviderInput(job: Job, payload: JobPayload) {
@@ -164,7 +174,36 @@ export class GenerationWorker {
         }
 
         const meta: ProviderMeta = current.providerMeta ?? {};
-        const result = await provider.query(ctx, remoteJobId, meta);
+        if (!remoteJobId) {
+          await this.fail(jobId, '任务缺少远端 ID，无法查询；请重新提交', 'LocalRemoteIdMissing');
+          return;
+        }
+        const currentRemoteJobId: string = remoteJobId;
+        // 轮询是幂等操作：网络抖动 / 限流 / 5xx 自动退避重试，避免一次抖动就把付费任务判死
+        let result;
+        try {
+          result = await withRetry(() => provider.query(ctx, currentRemoteJobId, meta), {
+            attempts: 4,
+            baseDelayMs: Math.max(300, Math.round(this.options.pollIntervalMs / 2)),
+            maxDelayMs: Math.max(2_000, this.options.pollIntervalMs * 2),
+            label: `${provider.info.label} 查询任务`,
+          });
+        } catch (err) {
+          const providerError = err instanceof ProviderError ? err : null;
+          await this.fail(jobId, describeRetryFailure(err, 4), providerError?.code ?? 'NetworkError');
+          return;
+        }
+
+        // 查询期间用户可能已经取消：先落地取消状态，避免被下面的 mutate 改回 running
+        const afterQuery = this.workspace.findJob(jobId);
+        if (!afterQuery) return;
+        if (afterQuery.cancelRequested) {
+          await this.mutate(jobId, (job) => {
+            job.phase = 'canceled';
+            job.finishedAt = job.finishedAt ?? new Date().toISOString();
+          });
+          return;
+        }
 
         if (result.nextRemoteJobId) remoteJobId = result.nextRemoteJobId;
         if (result.status === 'WAIT' || result.status === 'RUN') {
@@ -220,7 +259,8 @@ export class GenerationWorker {
 
         await this.mutate(jobId, (job) => {
           job.asset = asset;
-          job.phase = 'done';
+          // 下载期间用户取消：保留已转存的结果，但仍尊重“已取消”的状态
+          job.phase = job.cancelRequested ? 'canceled' : 'done';
           job.finishedAt = new Date().toISOString();
           job.error = null;
           job.errorCode = null;
@@ -242,13 +282,21 @@ export class GenerationWorker {
   }
 
   private async fail(jobId: string, message: string, code: string): Promise<void> {
+    // 用户已经取消的任务不要再改成失败，否则界面会「取消后变失败」
+    let canceled = false;
     await this.mutate(jobId, (job) => {
+      if (job.cancelRequested) {
+        canceled = true;
+        job.phase = 'canceled';
+        job.finishedAt = job.finishedAt ?? new Date().toISOString();
+        return;
+      }
       job.phase = 'failed';
       job.error = message;
       job.errorCode = code;
       job.finishedAt = new Date().toISOString();
     });
-    log.warn(`任务失败 ${jobId} [${code}] ${message}`);
+    log.warn(canceled ? `任务已取消 ${jobId}（忽略失败：${code}）` : `任务失败 ${jobId} [${code}] ${message}`);
   }
 
   private async mutate(jobId: string, mutator: (job: Job) => void): Promise<void> {
@@ -260,22 +308,80 @@ export class GenerationWorker {
     });
   }
 
-  /** 取消任务；已提交到远端的任务只停止本地轮询 */
-  async cancel(jobId: string): Promise<boolean> {
+  /**
+   * 取消任务。
+   * - 本地立即置为「已取消」（界面无需等下一轮轮询）
+   * - 已提交远端的任务 best-effort 通知引擎取消，结果写进 providerMeta 供界面提示
+   */
+  async cancel(jobId: string): Promise<CancelResult> {
     const job = this.workspace.findJob(jobId);
-    if (!job || !isActivePhase(job.phase)) return false;
-    if (!this.running.has(jobId)) {
-      await this.mutate(jobId, (item) => {
-        item.phase = 'canceled';
-        item.cancelRequested = true;
-        item.finishedAt = new Date().toISOString();
-      });
-      return true;
+    if (!job || !isActivePhase(job.phase)) {
+      return { canceled: false, remote: 'not-submitted', message: '任务不在进行中，无法取消' };
     }
+
+    const remoteJobId = job.remoteJobId;
     await this.mutate(jobId, (item) => {
+      item.phase = 'canceled';
       item.cancelRequested = true;
+      item.finishedAt = new Date().toISOString();
     });
-    return true;
+
+    const remote = await this.cancelRemote(job, remoteJobId);
+    await this.mutate(jobId, (item) => {
+      item.providerMeta = {
+        ...item.providerMeta,
+        remoteCancel: remote.remote,
+        remoteCancelMessage: remote.message,
+      };
+    });
+    log.info(`任务已取消 ${jobId}（远端：${remote.remote}${remote.message ? ` - ${remote.message}` : ''}）`);
+    return { canceled: true, remote: remote.remote, message: remote.message };
+  }
+
+  /** 尽量通知远端取消；任何失败都只降级成提示，不影响本地取消 */
+  private async cancelRemote(
+    job: Job,
+    remoteJobId: string | null,
+  ): Promise<{ remote: RemoteCancelStatus; message: string }> {
+    if (!remoteJobId) {
+      return { remote: 'not-submitted', message: '任务尚未提交到远端，无需通知' };
+    }
+
+    let provider: GenerationProvider;
+    try {
+      provider = getProvider(job.params.provider);
+    } catch (err) {
+      return { remote: 'unsupported', message: (err as Error).message };
+    }
+    if (!provider.cancel) {
+      return {
+        remote: 'unsupported',
+        message: `${provider.info.label} 未提供远端取消接口，已停止本地跟踪（远端可能仍会计费）`,
+      };
+    }
+
+    const ctx = providerContext(this.workspace, provider.info.id);
+    if (!ctx) {
+      return { remote: 'failed', message: '缺少该引擎的 API Key，无法通知远端取消' };
+    }
+
+    try {
+      const accepted = await withRetry(() => provider.cancel!(ctx, remoteJobId, job.providerMeta ?? {}), {
+        attempts: 2,
+        baseDelayMs: 500,
+        label: `${provider.info.label} 取消任务`,
+      });
+      return accepted
+        ? { remote: 'ok', message: '已通知远端取消' }
+        : {
+            remote: 'unsupported',
+            message: `${provider.info.label} 远端不支持取消，已停止本地跟踪（远端可能仍会计费）`,
+          };
+    } catch (err) {
+      const message = (err as Error)?.message ?? '未知错误';
+      log.warn(`远端取消失败 ${job.id}: ${message}`);
+      return { remote: 'failed', message: `远端取消失败（${message}），已停止本地跟踪` };
+    }
   }
 
   /**

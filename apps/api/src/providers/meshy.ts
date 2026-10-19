@@ -266,6 +266,27 @@ export const meshyProvider: GenerationProvider = {
     return httpBuffer(url, { headers: { Authorization: `Bearer ${ctx.apiKey}` }, label: 'Meshy 下载结果' });
   },
 
+  /**
+   * 通知 Meshy 取消任务（best-effort）。
+   * 入口以官方文档为准：`DELETE /{text-to-3d|image-to-3d}/{task_id}`；不支持时返回 404/405 → false。
+   */
+  async cancel(ctx: ProviderContext, remoteJobId: string, meta: ProviderMeta): Promise<boolean> {
+    const kind = meta.kind === 'image' ? 'image-to-3d' : 'text-to-3d';
+    try {
+      await httpJson<unknown>(`${ctx.baseUrl}/${kind}/${encodeURIComponent(remoteJobId)}`, {
+        method: 'DELETE',
+        headers: headers(ctx),
+        label: 'Meshy 取消任务',
+        timeoutMs: 20_000,
+        retries: 0,
+      });
+      return true;
+    } catch (err) {
+      if (err instanceof ProviderError && (err.httpStatus === 404 || err.httpStatus === 405)) return false;
+      throw err;
+    }
+  },
+
   async verify(ctx: ProviderContext): Promise<ProviderVerifyResult> {
     try {
       await httpJson<unknown>(`${ctx.baseUrl}/text-to-3d?page_size=1`, {

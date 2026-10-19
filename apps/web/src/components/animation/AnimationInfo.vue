@@ -155,7 +155,7 @@ function clipDuration(seconds: number): string {
         <p>
           本页只使用 <span class="mono">readdir / stat / readFile</span> 读取
           <span class="mono">.fbx</span>，不会写入、修改或锁定源文件夹中的任何文件；
-          缩略图只在浏览器内存中生成，不落盘。
+          封面由后端子线程渲染，只缓存 192px 的 PNG 到内存（不落盘、不占浏览器主线程）。
         </p>
       </section>
     </div>

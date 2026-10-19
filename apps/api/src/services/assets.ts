@@ -208,6 +208,15 @@ export async function sweepStorage(workspace: { jobs: readonly { id: string }[] 
   }
   const known = new Set(workspace.jobs.map((job) => job.id));
 
+  // 安全阀：状态里一个任务都没有、却有一堆素材目录时，几乎一定是 state.json 丢了/坏了。
+  // 此时绝不能按“无对应任务”批量删除，否则模型文件会被一起清空。
+  if (known.size === 0 && names.length > 0) {
+    log.warn(
+      `状态中没有任务记录，但发现 ${names.length} 个素材目录：已跳过素材清理以避免误删（确认无用后可手动清空 data/storage）`,
+    );
+    return 0;
+  }
+
   for (const name of names) {
     const dir = path.join(storageDir, name);
     const stat = await fs.stat(dir).catch(() => null);
@@ -241,6 +250,45 @@ export async function saveThumbnailDataUrl(jobId: string, dataUrl: string): Prom
     log.error(`写入缩略图失败: ${(err as Error).message}`);
     return null;
   }
+}
+
+/** 保存后端子线程渲染出的封面 PNG，返回可访问 URL */
+export async function saveThumbnailBuffer(jobId: string, png: Buffer, ext = 'png'): Promise<string | null> {
+  const rel = `thumb.${ext}`;
+  try {
+    const dir = path.join(storageDir, jobId);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, rel), png);
+    return fileUrl(jobId, rel);
+  } catch (err) {
+    log.error(`写入封面失败: ${(err as Error).message}`);
+    return null;
+  }
+}
+
+/** 封面渲染支持的格式（与浏览器可预览格式保持一致） */
+const COVER_FORMAT_PREFERENCE = ['glb', 'gltf', 'obj', 'fbx', 'stl'] as const;
+
+/**
+ * 找出素材里最适合做封面的本地模型文件（绝对路径）。
+ * 优先单文件 GLB，其次 glTF/OBJ/FBX/STL；找不到返回 null。
+ */
+export async function pickCoverSourcePath(
+  jobId: string,
+  asset: Pick<Asset, 'files'>,
+): Promise<{ filePath: string; format: string } | null> {
+  for (const format of COVER_FORMAT_PREFERENCE) {
+    for (const file of asset.files) {
+      for (const entry of file.entries) {
+        if (entry.role !== 'model') continue;
+        if (extensionOf(entry.name) !== format) continue;
+        const filePath = path.join(storageDir, jobId, ...entry.name.split('/'));
+        const stat = await fs.stat(filePath).catch(() => null);
+        if (stat?.isFile()) return { filePath, format };
+      }
+    }
+  }
+  return null;
 }
 
 /** 从提示词生成一个可读的默认名称 */
