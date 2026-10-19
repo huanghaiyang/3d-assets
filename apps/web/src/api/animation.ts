@@ -55,6 +55,12 @@ export interface AnimationDirsResponse {
   saved: string[];
 }
 
+/**
+ * 封面缓存版本：后端渲染逻辑升级（例如修复 T-pose）时 +1，
+ * 让所有已缓存在浏览器/中间的旧封面 URL 直接失效。
+ */
+export const ANIMATION_COVER_VERSION = 3;
+
 export const animationApi = {
   info: () => request<AnimationInfoResponse>('/api/anim/info'),
 
@@ -83,8 +89,12 @@ export const animationApi = {
     pose = 0.35,
     options: { version?: string | number; refresh?: boolean } = {},
   ) => {
-    const params = new URLSearchParams({ path: filePath, size: String(size), pose: String(pose) });
-    if (options.version !== undefined) params.set('v', String(options.version));
+    const params = new URLSearchParams({
+      path: filePath,
+      size: String(size),
+      pose: String(pose),
+      v: String(options.version ?? ANIMATION_COVER_VERSION),
+    });
     if (options.refresh) params.set('refresh', '1');
     return `/api/anim/cover?${params.toString()}`;
   },

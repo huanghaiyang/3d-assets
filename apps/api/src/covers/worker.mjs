@@ -708,11 +708,14 @@ function loadModel(filePath, options = {}) {
 // ===== 参数归一化与姿态 =====
 
 function applyPose(root, animations, poseFraction) {
-  if (!animations.length || poseFraction === null || poseFraction === undefined) {
+  // 与前端 FbxPlayer 保持一致：过滤掉空片段（Mixamo 的 FBX 经常带一个
+  // "Take 001"：duration=0、0 条轨道；直接用 animations[0] 会渲染成 T-pose）
+  const clips = (animations ?? []).filter((clip) => clip.duration > 0 && clip.tracks.length > 0);
+  if (clips.length === 0 || poseFraction === null || poseFraction === undefined) {
     root.updateMatrixWorld(true);
     return;
   }
-  const clip = animations[0];
+  const clip = clips[0];
   try {
     const mixer = new THREE.AnimationMixer(root);
     const action = mixer.clipAction(clip);

@@ -26,6 +26,7 @@ dist/
 .npm-cache/
 .tmp/
 .tmp-test/
+.tmp-build/
 .tmp-probe/
 *.tsbuildinfo
 *.log

@@ -231,11 +231,14 @@ export function getCoverCacheDir(): string {
   return coversCacheDir;
 }
 
+// 封面渲染行为变化时 +1，让旧缓存自然失效（文件 mtime 之外的第二层保险）
+export const COVER_CACHE_VERSION = '2';
+
 /** 缓存 key → 文件名：包含路径、mtime、尺寸、姿态，文件更新会自动失效 */
 function coverCacheFile(filePath: string, mtimeMs: number, size: number, pose: number): string {
   const hash = crypto
     .createHash('sha1')
-    .update(`${filePath}|${mtimeMs}|${size}|${pose}`)
+    .update(`${COVER_CACHE_VERSION}|${filePath}|${mtimeMs}|${size}|${pose}`)
     .digest('hex');
   return path.join(coversCacheDir, `${hash}.png`);
 }

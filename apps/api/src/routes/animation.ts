@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import { config } from '../config.js';
 import { createLogger } from '../lib/logger.js';
-import { animationCover } from '../services/covers.js';
+import { animationCover, COVER_CACHE_VERSION } from '../services/covers.js';
 
 const log = createLogger('anim');
 
@@ -263,7 +263,8 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
     const size = Math.min(384, Math.max(96, Number(query.size) || 256));
     const pose = Math.min(1, Math.max(0, Number(query.pose ?? 0.35)));
     const refresh = query.refresh === '1' || query.refresh === 'true';
-    const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}-${size}-${pose}"`;
+    // ETag 带上渲染器版本：渲染逻辑升级后浏览器不会继续用旧图（例如修掉 T-pose 封面）
+    const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}-${size}-${pose}-v${COVER_CACHE_VERSION}"`;
     if (!refresh && request.headers['if-none-match'] === etag) {
       return reply.code(304).send();
     }
@@ -273,7 +274,8 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
       return reply
         .header('Content-Type', 'image/png')
         .header('Content-Length', String(png.length))
-        .header('Cache-Control', refresh ? 'no-store' : 'public, max-age=86400')
+        // 必须回源校验：前端 URL 带的 v 只用于升级时换缓存，平时靠 ETag 304 省流量
+        .header('Cache-Control', refresh ? 'no-store' : 'no-cache')
         .header('ETag', etag)
         .send(png);
     } catch (err) {

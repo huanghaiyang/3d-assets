@@ -267,6 +267,8 @@ Content-Type:  application/json
 - **封面 Worker**：`apps/api/src/covers/worker.mjs` 在 `worker_threads` 里跑 three 的 Loader（无 DOM 垫片）：
   - 首选 **headless-gl（`gl`）** 提供真实 WebGL1 上下文，自写一套最小的 shader 管线（顶点色/法线/UV + 贴图采样），
     贴图用 `pngjs` / `jpeg-js` 解码成 RGBA 上传，封面与浏览器里看到的模型一致；
+  - **姿态**：与前端一致，先过滤掉空片段（Mixamo 的 FBX 常带 `Take 001`：duration=0、0 条轨道，
+    直接用 `animations[0]` 会渲染成 **T-pose**），再取第一个有效片段 35% 处姿态；
   - **光照/色调/阴影与前端一致**：ACES Filmic tone mapping + exposure 1.05、sRGB 输出；半球光 white/#404652 强度 1.15、
     主光 white 2.1（4,6.5,4.5）、轮廓光 #bcd0ff 0.75（-5,3,-5）、环境光强度 0.85；深色背景 **#1b1e25**（与前端
     `captureThumbnail` / `captureFrame` 填充一致）；地面画一层软接触阴影（近似前端 `ShadowMaterial` opacity ≈0.28）；
@@ -274,7 +276,8 @@ Content-Type:  application/json
   - PNG 用 `node:zlib` 自己编码；只跑 **1 个 worker**（headless-gl 原生模块不能在同一进程的多个 worker 里重复加载），
     串行复用、超时销毁重建。
 - **封面缓存（不写系统盘）**：动画封面三级缓存 —— 内存 LRU（400 张）→ 项目内磁盘 `data/cache/covers/<sha1>.png`
-  （key 含文件 mtime，命中后毫秒级返回；启动时清理 30 天前的旧文件；`data/` 已 gitignore）→ 真正渲染。
+  （key 含 **渲染器版本 + 文件 mtime**，命中后毫秒级返回；启动时清理 30 天前的旧文件；`data/` 已 gitignore）→ 真正渲染。
+  渲染逻辑升级时同时提高缓存版本与前端 URL 里的 `v`，ETag 也带版本，浏览器不会继续显示旧封面（例如修掉 T-pose 后无需手动清缓存）。
 - **图片输入**：前端在浏览器内校验格式 / 最小边长（≥128）、等比压缩到长边 1600、控制体积 ≤6MB，
   再以 base64 提交（`apps/web/src/utils/image.ts`）。
 
@@ -399,7 +402,8 @@ Content-Type:  application/json
 | 前端拆包 | 动画预览页改为动态 `import()`：主包 950.9 KB → **860.6 KB**，另拆出 `AnimationPage` 94.7 KB + 20.9 KB CSS，首次进入动画页才加载；dev（5173）与生产（8787）均验证：切换页面正常、视口与轴向指示器出现、返回工作台无残留、0 控制台错误 |
 | 素材库分页 | 13 个素材、每页 12：第 1 页渲染 12 张卡片（`1/2 · 共 13`）、点「2」后渲染 1 张（`2/2`）；每页改 24 后一页 13 张（`1/1`）；搜索/筛选/改每页数量自动回第 1 页；0 控制台错误 |
 | 上传进度 / 取消 | 用 CDP 限制上传带宽到 3 MB/s 传 20 MB `.glb`：捕获到进度条 `1%`（`upload.onprogress` + 整批百分比）；点「取消」后条目变「已取消」、上传按钮恢复可用、队列 3.5s 后自动收起；**服务端 `data/uploads/.staging` 目录数归零、任务总数仍为 13**（没有产生半成品素材）；0 控制台错误 |
-| 封面 Worker 自测 | `npm run test:cover -w @h3d/api` **22 项断言全通过**：实际引擎为 **headless-gl WebGL**、OBJ 立方体（明暗层次）、**深色底 #1b1e25 与前端一致**、**地面软接触阴影生效（比 ground:'none' 更多暗部）**、glTF 材质色、**带 PNG 棋盘格贴图的 GLB（红/蓝两色都按 UV 采样出来）**、并发排队 + Worker 复用、软件引擎显式兜底、不支持格式明确失败、**磁盘缓存写在项目内 `data/cache/covers` 且二次命中 0ms**（首次约 620ms）、Mixamo FBX 带姿态 |
+| 封面 Worker 自测 | `npm run test:cover -w @h3d/api` **23 项断言全通过**：实际引擎为 **headless-gl WebGL**、OBJ 立方体（明暗层次）、**深色底 #1b1e25 与前端一致**、**地面软接触阴影生效（比 ground:'none' 更多暗部）**、glTF 材质色、**带 PNG 棋盘格贴图的 GLB（红/蓝两色都按 UV 采样出来）**、并发排队 + Worker 复用、软件引擎显式兜底、不支持格式明确失败、**磁盘缓存写在项目内 `data/cache/covers` 且二次命中 0ms**、Mixamo FBX 带姿态、**空 `Take 001` 片段的 FBX 不再出 T-pose（姿态与绑定姿态差异 >5%）** |
+| T-pose 封面修复 | 扫描 162 个 FBX 找出 6 个「`animations[0]` 是空 `Take 001`」的文件（如 `2hand Idle.fbx`、`Body Block.fbx`）：修复前这些封面是 T-pose，修复后渲染出 35% 处的蹲姿/出拳姿态；动画库首屏 12 张封面 **12/12 加载且全部为有效姿势**，0 控制台错误；浏览器旧缓存通过「ETag 带渲染器版本 + URL `v=3`」自动失效 |
 | 封面重新生成按钮 | 素材库 12 张卡片都出现「重新生成封面（后端渲染）」按钮；点击后浏览器发出 `POST /api/jobs/:id/cover`（`force`），封面 URL 变为 `.../thumb.png?v=mvf5oie8` 且 **`naturalWidth > 0` 加载成功**，0 控制台错误；动画库点「重新生成本页封面」后对当前页 24 项各发一个 `refresh=1` 请求，完成后 24 个封面 URL 都带 `&v=`、`24/24` 加载成功（服务端单 worker 串行约 12~15s，按钮期间显示 loading） |
 | 动画封面后置 | 冷启动 `GET /api/anim/cover` 1,203ms → 4,657 B PNG（`ETag` 命中第二次 **304**），磁盘缓存文件落在 `data/cache/covers/<sha1>.png`（`git check-ignore` 确认被忽略）；动画页 24 张卡片全部使用 `/api/anim/cover`、**`#anim-thumb-host` 离屏渲染容器不存在**、12/12 可见封面加载成功、0 控制台错误 |
 | 素材封面后置 | 上传 3.77 MB GLB → `POST /api/jobs/:id/cover` 返回 **`engine: "webgl"`**、1,412ms 生成 18,959 B `thumb.png`；渲染结果是带真实贴图的角色封面（绿色长袍纹理清晰，不再是一块平均色）；浏览器真实上传后首张卡片 `<img>` 加载成功；测试任务已删除，`data/storage` 回到 13 个目录 |

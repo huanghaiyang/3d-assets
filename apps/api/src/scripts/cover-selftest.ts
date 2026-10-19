@@ -95,6 +95,21 @@ function analyze(rgba: Buffer): { coverage: number; colors: number; red: number;
   return { coverage: content / total, colors: colors.size, red: red / total, blue: blue / total, dark: dark / total };
 }
 
+/** 两张同尺寸 PNG 的像素差异比例（用于判断“姿态到底有没有生效”） */
+function diffFraction(left: Buffer, right: Buffer): number {
+  if (left.length !== right.length) return 1;
+  let diff = 0;
+  for (let i = 0; i < left.length; i += 4) {
+    if (
+      Math.abs(left[i]! - right[i]!) + Math.abs(left[i + 1]! - right[i + 1]!) + Math.abs(left[i + 2]! - right[i + 2]!) >
+      30
+    ) {
+      diff += 1;
+    }
+  }
+  return diff / (left.length / 4);
+}
+
 function objCube(): string {
   const lines = ['o cube'];
   const points: [number, number, number][] = [
@@ -329,6 +344,18 @@ async function main(): Promise<void> {
       check('缓存命中明显更快', secondMs < firstMs, { firstMs, secondMs });
       const stats = analyze(decodePng(second).rgba);
       check('FBX 姿态封面非空', stats.coverage > 0.02, stats);
+    }
+
+    console.log('\n[7] 空 "Take 001" 片段的 FBX（回归：不能出 T-pose）');
+    const poseProbe = 'D:/sgames/animation-ai/mixamo/2hand Idle.fbx';
+    const poseProbeStat = await fs.stat(poseProbe).catch(() => null);
+    if (!poseProbeStat?.isFile()) {
+      console.log('  - 本机没有该 FBX，跳过');
+    } else {
+      const posed = await renderer.renderWithMeta({ filePath: poseProbe, size: 96, poseFraction: 0.35 });
+      const bind = await renderer.renderWithMeta({ filePath: poseProbe, size: 96, poseFraction: null });
+      const diff = diffFraction(decodePng(posed.png).rgba, decodePng(bind.png).rgba);
+      check('animations[0] 是空片段时仍取有效片段摆姿势', diff > 0.05, { diff: Number(diff.toFixed(3)) });
     }
   } finally {
     await shutdownCoverRenderer();
