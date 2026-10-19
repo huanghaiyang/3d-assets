@@ -6,6 +6,7 @@ import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { AxisIndicator } from './axisIndicator';
 import { NodeHighlighter, type SceneNode } from './sceneNodes';
 
 export type { SceneNode };
@@ -22,6 +23,11 @@ export interface LoadTarget {
   url: string;
   format: string;
   materialUrl?: string | null;
+}
+
+export interface ModelViewerOptions {
+  /** 是否在右下角显示 XYZ 轴向指示器（离屏缩略图渲染器会关掉） */
+  axisIndicator?: boolean;
 }
 
 const MAX_WIREFRAME_OVERLAY_TRIANGLES = 150_000;
@@ -43,6 +49,7 @@ export class ModelViewer {
   private readonly pmrem: THREE.PMREMGenerator;
   private readonly container: HTMLElement;
   private readonly resizeObserver: ResizeObserver;
+  private readonly axis: AxisIndicator | null;
 
   private modelRoot: THREE.Object3D | null = null;
   private wireOverlay: THREE.Group | null = null;
@@ -55,7 +62,7 @@ export class ModelViewer {
   private sceneTree: SceneNode[] = [];
   private nodeHighlighter: NodeHighlighter | null = null;
 
-  constructor(container: HTMLElement) {
+  constructor(container: HTMLElement, options: ModelViewerOptions = {}) {
     this.container = container;
 
     this.renderer = new THREE.WebGLRenderer({
@@ -73,6 +80,9 @@ export class ModelViewer {
     this.renderer.domElement.style.width = '100%';
     this.renderer.domElement.style.height = '100%';
     container.appendChild(this.renderer.domElement);
+
+    // 右下角 XYZ 轴向指示器（离屏缩略图渲染时不需要）
+    this.axis = options.axisIndicator === false ? null : new AxisIndicator(container);
 
     this.camera = new THREE.PerspectiveCamera(42, 1, 0.05, 500);
     this.camera.position.set(2.6, 2.1, 3.4);
@@ -145,6 +155,7 @@ export class ModelViewer {
     this.controls.update();
     // 高亮包围盒跟着自动旋转/模型动作刷新
     this.nodeHighlighter?.refreshBoxes();
+    this.axis?.update(this.camera);
     this.renderer.render(this.scene, this.camera);
   }
 
@@ -395,6 +406,7 @@ export class ModelViewer {
     this.disposed = true;
     this.renderer.setAnimationLoop(null);
     this.resizeObserver.disconnect();
+    this.axis?.dispose();
     this.clear();
     this.controls.dispose();
     this.pmrem.dispose();

@@ -57,8 +57,16 @@ export interface ModalTransformState {
 
 /** 场景节点树的一个节点（对象层级，不含骨骼以外的特殊语义） */
 import { NodeHighlighter, type SceneNode } from './sceneNodes';
+import { AxisIndicator } from './axisIndicator';
 
 export type { SceneNode };
+
+export interface FbxPlayerOptions {
+  /** 是否在右下角显示 XYZ 轴向指示器（离屏封面 / 缩略图渲染会关掉） */
+  axisIndicator?: boolean;
+  /** 轴向指示器距底边的距离（动画页底部有播放控制条，需要抬高到它上方） */
+  axisIndicatorBottom?: number;
+}
 
 interface ModalTransform {  kind: TransformMode;
   bone: THREE.Bone;
@@ -127,6 +135,7 @@ export class FbxPlayer {
   private readonly pmrem: THREE.PMREMGenerator;
   private readonly container: HTMLElement;
   private readonly resizeObserver: ResizeObserver;
+  private readonly axis: AxisIndicator | null;
   private readonly clock = new THREE.Clock();
 
   private model: THREE.Object3D | null = null;
@@ -182,7 +191,7 @@ export class FbxPlayer {
   private playing = false;
   private listeners: ((state: PlaybackState) => void)[] = [];
 
-  constructor(container: HTMLElement) {
+  constructor(container: HTMLElement, options: FbxPlayerOptions = {}) {
     this.container = container;
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
@@ -194,6 +203,12 @@ export class FbxPlayer {
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.domElement.style.cssText = 'display:block;width:100%;height:100%';
     container.appendChild(this.renderer.domElement);
+
+    // 右下角 XYZ 轴向指示器（与工作台视口一致；离屏封面渲染不需要）
+    this.axis =
+      options.axisIndicator === false
+        ? null
+        : new AxisIndicator(container, { bottom: options.axisIndicatorBottom ?? 14 });
 
     this.camera = new THREE.PerspectiveCamera(40, 1, 0.05, 500);
     this.camera.position.set(2.4, 2.0, 3.2);
@@ -273,6 +288,7 @@ export class FbxPlayer {
     // 骨骼随动画移动，逐帧刷新叠加层与拾取用的点云
     this.skeleton?.refreshPositions();
     this.nodeHighlighter?.refreshBoxes();
+    this.axis?.update(this.camera);
     this.renderer.render(this.scene, this.camera);
     if (this.mixer && this.currentAction) {
       this.emit({
@@ -1119,6 +1135,7 @@ export class FbxPlayer {
     this.disposed = true;
     this.renderer.setAnimationLoop(null);
     this.resizeObserver.disconnect();
+    this.axis?.dispose();
     this.clear();
     this.transformControls?.detach();
     this.transformControls?.dispose();

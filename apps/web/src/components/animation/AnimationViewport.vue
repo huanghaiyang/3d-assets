@@ -11,7 +11,8 @@ let player: FbxPlayer | null = null;
 
 onMounted(() => {
   if (!hostRef.value) return;
-  player = new FbxPlayer(hostRef.value);
+  // 底部是播放控制条（约 76px 高），轴向指示器抬到它上方，避免被盖住
+  player = new FbxPlayer(hostRef.value, { axisIndicatorBottom: 100 });
   store.attachPlayer(player);
   // 自动加载已记录的文件夹（reload 内部会选中并预览第一个动画）
   void (async () => {

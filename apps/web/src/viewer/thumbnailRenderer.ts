@@ -32,7 +32,8 @@ function ensureViewer(): ModelViewer {
     'z-index:-1',
   ].join(';');
   document.body.appendChild(holder);
-  viewer = new ModelViewer(holder);
+  // 离屏渲染不需要轴向指示器（缩略图只截 WebGL 画布，多余 DOM 也不该生成）
+  viewer = new ModelViewer(holder, { axisIndicator: false });
   viewer.setGrid(false);
   return viewer;
 }

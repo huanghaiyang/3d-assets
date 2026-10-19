@@ -630,7 +630,7 @@ export const useAnimationStore = defineStore('animation', () => {
       while (thumbQueue.length > 0) {
         const file = thumbQueue.shift()!;
         try {
-          if (!thumbWorker) thumbWorker = new FbxPlayer(ensureThumbHost());
+          if (!thumbWorker) thumbWorker = new FbxPlayer(ensureThumbHost(), { axisIndicator: false });
           const result = await thumbWorker.load(animationApi.fileUrl(file.path));
           if (result.clips.length > 0) {
             thumbWorker.playClip(0);
