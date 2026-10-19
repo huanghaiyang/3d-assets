@@ -1,27 +1,37 @@
 import { createLogger } from '../lib/logger.js';
-import { Hunyuan3DClient, HunyuanApiError, MissingApiKeyError } from '../hunyuan/client.js';
-import type { Workspace } from '../store/workspace.js';
-import type { Job, PersistedState } from '../store/types.js';
+import { getProvider } from '../providers/registry.js';
+import { MissingProviderKeyError, ProviderError, type GenerationProvider } from '../providers/types.js';
+import { providerContext } from '../services/settings.js';
+import type { Job, ProviderMeta, PersistedState } from '../store/types.js';
 import { isActivePhase } from '../store/types.js';
+import type { Workspace } from '../store/workspace.js';
 import { deriveName, materializeAsset } from './assets.js';
-import { buildSubmitRequest, loadPayload } from './payload.js';
+import { loadPayload, type JobPayload } from './payload.js';
 
 const log = createLogger('worker');
 
 export interface WorkerOptions {
-  baseUrl: string;
   pollIntervalMs: number;
   maxConcurrency: number;
-  /** 每次调用时动态解析 API Key，支持运行期在界面中修改 */
-  resolveApiKey: () => string | null;
 }
 
 export type RetryMode = 'resume' | 'resubmit';
 
+/** 把落盘的输入转换成引擎契约里的 ProviderInput */
+function toProviderInput(job: Job, payload: JobPayload) {
+  return {
+    mode: job.input.mode === 'upload' ? ('text' as const) : job.input.mode,
+    prompt: payload.prompt,
+    image: payload.imageBase64 ? { base64: payload.imageBase64, name: payload.imageName } : null,
+    views: payload.views.map((view) => ({ viewType: view.viewType, base64: view.base64, name: view.name })),
+  };
+}
+
 /**
  * 生成任务调度器。
  *
- * - 串行化本地状态写入，最多同时推进 maxConcurrency 个远端任务（接口默认并发 3）
+ * - 串行化本地状态写入，最多同时推进 maxConcurrency 个远端任务
+ * - 每个任务按自己的 params.provider 选择生成引擎（默认混元，可切 Tripo3D / Meshy）
  * - 服务重启后自动接管已有 remoteJobId 的任务继续轮询（不重复计费）
  * - 网络类错误标记失败，重试时优先“续查”远端任务
  */
@@ -88,22 +98,33 @@ export class GenerationWorker {
     const snapshot = this.workspace.findJob(jobId);
     if (!snapshot) return;
 
-    const apiKey = this.options.resolveApiKey();
-    if (!apiKey) {
-      await this.fail(jobId, new MissingApiKeyError().message, 'AuthFailure.MissingApiKey');
+    let provider: GenerationProvider;
+    try {
+      provider = getProvider(snapshot.params.provider);
+    } catch (err) {
+      await this.fail(jobId, (err as Error).message, 'InvalidParameter.Provider');
       return;
     }
-    const client = new Hunyuan3DClient({ apiKey, baseUrl: this.options.baseUrl });
+
+    const ctx = providerContext(this.workspace, provider.info.id);
+    if (!ctx) {
+      const missing = new MissingProviderKeyError(provider.info.label, provider.info.envKeyName);
+      await this.fail(jobId, missing.message, missing.code);
+      return;
+    }
 
     try {
       let remoteJobId = snapshot.remoteJobId;
       if (!remoteJobId) {
         const payload = await loadPayload(jobId);
         if (!payload) {
-          await this.fail(jobId, '任务的输入数据已丢失（data/payloads 下找不到记录），请重新创建任务。', 'LocalPayloadMissing');
+          await this.fail(
+            jobId,
+            '任务的输入数据已丢失（data/payloads 下找不到记录），请重新创建任务。',
+            'LocalPayloadMissing',
+          );
           return;
         }
-        const request = buildSubmitRequest(snapshot.params, payload);
         await this.mutate(jobId, (job) => {
           job.phase = 'submitting';
           job.attempts += 1;
@@ -111,15 +132,16 @@ export class GenerationWorker {
           job.errorCode = null;
           job.startedAt = job.startedAt ?? new Date().toISOString();
         });
-        const submitted = await client.submitJob(request);
-        remoteJobId = submitted.jobId;
+        const submitted = await provider.submit(ctx, snapshot.params, toProviderInput(snapshot, payload));
+        remoteJobId = submitted.remoteJobId;
         await this.mutate(jobId, (job) => {
-          job.remoteJobId = submitted.jobId;
+          job.remoteJobId = submitted.remoteJobId;
           job.requestId = submitted.requestId;
+          job.providerMeta = { ...job.providerMeta, ...(submitted.meta ?? {}) };
           job.phase = 'running';
           job.remoteStatus = 'WAIT';
         });
-        log.info(`任务已提交 ${jobId} -> JobId=${submitted.jobId}`);
+        log.info(`任务已提交 ${jobId} [${provider.info.id}] -> ${submitted.remoteJobId}`);
       } else {
         await this.mutate(jobId, (job) => {
           job.phase = 'running';
@@ -129,7 +151,7 @@ export class GenerationWorker {
         });
       }
 
-      // 轮询远端状态
+      // 轮询远端状态（部分引擎会在这里推进 preview → refine 等多步流程）
       for (;;) {
         const current = this.workspace.findJob(jobId);
         if (!current) return;
@@ -141,13 +163,22 @@ export class GenerationWorker {
           return;
         }
 
-        const result = await client.queryJob(remoteJobId);
+        const meta: ProviderMeta = current.providerMeta ?? {};
+        const result = await provider.query(ctx, remoteJobId, meta);
 
+        if (result.nextRemoteJobId) remoteJobId = result.nextRemoteJobId;
         if (result.status === 'WAIT' || result.status === 'RUN') {
           await this.mutate(jobId, (job) => {
-            job.remoteStatus = result.status;
+            job.remoteStatus = result.status as 'WAIT' | 'RUN';
             job.phase = 'running';
             if (result.requestId) job.requestId = result.requestId;
+            job.providerMeta = {
+              ...job.providerMeta,
+              ...(result.meta ?? {}),
+              ...(result.nextRemoteJobId ? { remoteJobId: result.nextRemoteJobId } : {}),
+              ...(typeof result.progress === 'number' ? { progress: result.progress } : {}),
+              ...(result.remoteStatus ? { remoteStatus: result.remoteStatus } : {}),
+            };
           });
           await delay(this.options.pollIntervalMs);
           continue;
@@ -158,9 +189,10 @@ export class GenerationWorker {
             job.phase = 'failed';
             job.remoteStatus = 'FAIL';
             job.remoteFailed = true;
-            job.errorCode = result.errorCode ?? 'FailedOperation';
+            job.errorCode = result.errorCode ?? `${provider.info.id}.Failed`;
             job.error = result.errorMessage ?? '远端任务执行失败';
             job.finishedAt = new Date().toISOString();
+            job.providerMeta = { ...job.providerMeta, ...(result.meta ?? {}) };
           });
           return;
         }
@@ -171,16 +203,17 @@ export class GenerationWorker {
           job.remoteStatus = 'DONE';
           job.creditConsumed = result.creditConsumed ?? null;
           job.creditDetails = result.creditDetails ?? null;
+          job.providerMeta = { ...job.providerMeta, ...(result.meta ?? {}) };
         });
 
         const asset = await materializeAsset({
-          client,
+          download: (url) => provider.download(ctx, url),
           jobId,
           name: current.name || deriveName(current.input.prompt, current.input.mode, current.input.imageName),
           prompt: current.input.prompt,
-          mode: current.input.mode,
+          mode: current.input.mode === 'upload' ? 'text' : current.input.mode,
           params: current.params,
-          files: result.files,
+          files: result.files ?? [],
           creditConsumed: result.creditConsumed ?? null,
           creditDetails: result.creditDetails ?? null,
         });
@@ -193,13 +226,18 @@ export class GenerationWorker {
           job.errorCode = null;
         });
         log.info(
-          `任务完成 ${jobId}: ${asset.files.length} 个文件, ${asset.files.filter((f) => f.primaryUrl).length} 个可预览`,
+          `任务完成 ${jobId} [${provider.info.id}]: ${asset.files.length} 个文件, ` +
+            `${asset.files.filter((file) => file.primaryUrl).length} 个可预览`,
         );
         return;
       }
     } catch (err) {
-      const apiError = err instanceof HunyuanApiError ? err : null;
-      await this.fail(jobId, (err as Error).message ?? '未知错误', apiError?.code ?? 'LocalError');
+      const providerError = err instanceof ProviderError ? err : null;
+      await this.fail(
+        jobId,
+        (err as Error).message ?? '未知错误',
+        providerError?.code ?? 'LocalError',
+      );
     }
   }
 
@@ -258,7 +296,10 @@ export class GenerationWorker {
       item.cancelRequested = false;
       item.finishedAt = null;
       item.remoteStatus = null;
-      if (mode === 'resubmit') item.remoteJobId = null;
+      if (mode === 'resubmit') {
+        item.remoteJobId = null;
+        item.providerMeta = {};
+      }
     });
     void this.tick();
     return mode;

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { payloadDir } from '../lib/paths.js';
 import { safeFileName } from '../lib/ids.js';
 import { createLogger } from '../lib/logger.js';
-import type { SubmitJobRequest, ViewType } from '../hunyuan/types.js';
+import type { ViewType } from '../store/types.js';
 
 const log = createLogger('payload');
 
@@ -59,47 +59,4 @@ export async function loadPreview(jobId: string): Promise<{ mime: string; buffer
   } catch {
     return null;
   }
-}
-
-/** 根据任务参数与输入构造混元接口请求体 */
-export function buildSubmitRequest(
-  params: {
-    model: '3.0' | '3.1';
-    generateType: 'Normal' | 'LowPoly' | 'Geometry' | 'Sketch';
-    faceCount: number;
-    enablePbr: boolean;
-    polygonType: 'triangle' | 'quadrilateral';
-    resultFormat: string | null;
-  },
-  payload: JobPayload,
-): SubmitJobRequest {
-  const req: SubmitJobRequest = { Model: params.model, GenerateType: params.generateType };
-
-  const prompt = payload.prompt.trim();
-  const imageBase64 = payload.imageBase64;
-  const hasImage = Boolean(imageBase64);
-  const hasViews = payload.views.length > 0;
-  // Sketch 模式允许图文同时输入；其他模式 Prompt 与图片互斥
-  const allowBoth = params.generateType === 'Sketch';
-
-  if (hasImage) {
-    // 有图时图片必定作为输入；非 Sketch 模式下忽略附带文字
-    req.ImageBase64 = imageBase64 ?? undefined;
-  } else if (hasViews) {
-    req.MultiViewImages = payload.views.map((view) => ({
-      ViewType: view.viewType,
-      ViewImageBase64: view.base64,
-    }));
-  }
-
-  if (prompt && (allowBoth || !hasImage)) {
-    req.Prompt = prompt;
-  }
-
-  if (params.generateType !== 'LowPoly') req.FaceCount = params.faceCount;
-  if (params.generateType !== 'Geometry') req.EnablePBR = params.enablePbr;
-  if (params.generateType === 'LowPoly') req.PolygonType = params.polygonType;
-  if (params.resultFormat) req.ResultFormat = params.resultFormat as SubmitJobRequest['ResultFormat'];
-
-  return req;
 }

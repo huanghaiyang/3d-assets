@@ -1,7 +1,8 @@
 import { buildApp } from './app.js';
 import { config } from './config.js';
 import { createLogger } from './lib/logger.js';
-import { resolveApiKey } from './services/settings.js';
+import { listProviders } from './providers/registry.js';
+import { activeProvider, maskApiKey, providerCredential } from './services/settings.js';
 
 const log = createLogger('server');
 
@@ -12,14 +13,16 @@ async function main(): Promise<void> {
 
   await app.listen({ host: config.host, port: config.port });
 
-  const key = resolveApiKey(workspace);
-  log.info(`混元生3D 工作台已启动: http://${config.host}:${config.port}`);
-  log.info(`接口域名: ${config.baseUrl}`);
-  log.info(
-    key
-      ? `API Key 已就绪 (${key.slice(0, 6)}****${key.slice(-4)})，最大并发 ${config.maxConcurrency}`
-      : '尚未配置 API Key —— 请在界面右上角“设置”中填写，或写入 .env 的 HUNYUAN3D_API_KEY',
-  );
+  const active = activeProvider(workspace);
+  log.info(`3D 生成工作台已启动: http://${config.host}:${config.port}`);
+  for (const provider of listProviders()) {
+    const { apiKey, baseUrl, source } = providerCredential(workspace, provider.info.id);
+    const keyText = apiKey
+      ? `API Key 已就绪 (${maskApiKey(apiKey)}${source === 'env' ? ' 来自 .env' : ''})`
+      : `尚未配置 API Key（.env 变量 ${provider.info.envKeyName}）`;
+    log.info(`${provider.info.label}${provider.info.id === active ? '（当前默认）' : ''}: ${keyText} · ${baseUrl}`);
+  }
+  log.info(`最大并发 ${config.maxConcurrency}，轮询间隔 ${config.pollIntervalMs}ms`);
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {

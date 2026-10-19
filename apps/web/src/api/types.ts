@@ -1,5 +1,7 @@
 /** 与 apps/api 的接口类型保持一致（前端只依赖这些形状） */
 
+export type ProviderId = 'hunyuan3d' | 'tripo3d' | 'meshy';
+
 export type JobPhase =
   | 'queued'
   | 'submitting'
@@ -10,16 +12,54 @@ export type JobPhase =
   | 'canceled';
 
 export type InputMode = 'text' | 'image' | 'multiview' | 'upload';
-/** generated：混元接口生成；uploaded：用户上传的本地模型 */
+/** generated：生成引擎产出；uploaded：用户上传的本地模型 */
 export type JobOrigin = 'generated' | 'uploaded';
-export type ModelVersion = '3.0' | '3.1';
 export type GenerateType = 'Normal' | 'LowPoly' | 'Geometry' | 'Sketch';
 export type PolygonType = 'triangle' | 'quadrilateral';
 export type ResultFormat = 'OBJ' | 'GLB' | 'STL' | 'FBX' | 'USDZ';
 export type ViewType = 'left' | 'right' | 'back' | 'top' | 'bottom' | 'left_front' | 'right_front';
 
+/** 引擎能力：驱动表单裁剪与提交校验 */
+export interface ProviderCapabilities {
+  modes: Exclude<InputMode, 'upload'>[];
+  generateTypes: GenerateType[];
+  pbr: boolean;
+  faceCount: boolean;
+  /** 引擎自己的面数区间（省略时用工作台通用区间） */
+  faceCountRange?: { min: number; max: number };
+  multiview: boolean;
+  formats: ResultFormat[];
+}
+
+export interface ProviderModel {
+  value: string;
+  label: string;
+  hint?: string;
+}
+
+export interface ProviderSummary {
+  id: ProviderId;
+  label: string;
+  vendor: string;
+  docsUrl: string;
+  keyHint: string;
+  keyPrefix: string | null;
+  envKeyName: string;
+  envBaseUrlName: string;
+  defaultBaseUrl: string;
+  baseUrl: string;
+  capabilities: ProviderCapabilities;
+  models: ProviderModel[];
+  defaults: GenerationParams;
+  apiKeyConfigured: boolean;
+  apiKeyMasked: string | null;
+  apiKeySource: 'settings' | 'env' | 'none';
+}
+
 export interface GenerationParams {
-  model: ModelVersion;
+  provider: ProviderId;
+  /** 引擎的模型/版本标识；'' 表示用引擎默认模型 */
+  model: string;
   generateType: GenerateType;
   faceCount: number;
   enablePbr: boolean;
@@ -76,13 +116,15 @@ export interface Job {
   createdAt: string;
   updatedAt: string;
   name: string;
-  /** generated：混元接口生成；uploaded：本地导入 */
+  /** generated：生成引擎产出；uploaded：本地导入 */
   origin: JobOrigin;
   phase: JobPhase;
   params: GenerationParams;
   input: InputSummary;
   remoteJobId: string | null;
   remoteStatus: string | null;
+  /** 多步引擎（如 Meshy preview → refine）的进展信息 */
+  providerMeta: Record<string, string | number | boolean | null>;
   requestId: string | null;
   error: string | null;
   errorCode: string | null;
@@ -97,10 +139,10 @@ export interface Job {
 }
 
 export interface SettingsSummary {
-  apiKeyConfigured: boolean;
-  apiKeyMasked: string | null;
-  apiKeySource: 'settings' | 'env' | 'none';
-  baseUrl: string;
+  activeProvider: ProviderId;
+  /** 当前引擎的完整摘要（表单用它渲染参数） */
+  active: ProviderSummary;
+  providers: ProviderSummary[];
   defaults: GenerationParams;
   limits: {
     faceCount: { min: number; max: number; default: number };
@@ -110,7 +152,7 @@ export interface SettingsSummary {
     pollIntervalMs: number;
   };
   enums: {
-    modelVersions: ModelVersion[];
+    providers: ProviderId[];
     generateTypes: GenerateType[];
     polygonTypes: PolygonType[];
     resultFormats: ResultFormat[];

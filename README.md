@@ -1,8 +1,10 @@
-# 混元 3D 工作台（Hunyuan3D Workbench）
+# 3D 生成工作台（Hunyuan3D Workbench）
 
 一个模仿 Tripo3D 工作台的 Web 应用：**只保留工作区里真正会用到的功能** —— 文生3D / 图生3D / 多视角生成、生成参数、任务队列、3D 预览、素材库与导出。
 
-后端对接 **腾讯混元生3D（专业版）OpenAI 兼容接口** `https://api.ai3d.cloud.tencent.com`。
+后端**默认对接腾讯混元生3D（专业版）OpenAI 兼容接口** `https://api.ai3d.cloud.tencent.com`，
+生成引擎做成可插拔的 provider：内置 **hunyuan3d（默认）/ tripo3d / meshy**，
+可在生成面板或设置里切换，也能按同一套契约继续接入其它第三方引擎。
 
 ![工作台界面](./docs/screenshot-workbench.png)
 
@@ -12,13 +14,13 @@
 
 | 区域 | 能力 |
 | --- | --- |
-| 左侧「生成模型」 | 文生3D（提示词）、图生3D（拖拽 / 点击 / Ctrl+V 粘贴参考图）、多视角（7 个视角槽位，3.1 专属视角自动标注） |
-| 生成设置 | 模型版本 3.0 / 3.1、生成类型 Normal / LowPoly / Geometry / Sketch、面数（对数滑块 + 预设 + 精确输入）、PBR 材质、多边形类型（三角面 / 四边形混合）、输出格式（默认 OBJ+GLB / 仅 GLB / 仅 OBJ / STL / FBX / USDZ） |
+| 左侧「生成模型」 | 文生3D（提示词）、图生3D（拖拽 / 点击 / Ctrl+V 粘贴参考图）、多视角（7 个视角槽位，3.1 专属视角自动标注）；输入模式与参数按所选生成引擎的能力自动裁剪 |
+| 生成设置 | **生成引擎（混元生3D / Tripo3D / Meshy，默认混元）**、引擎内的模型版本、生成类型 Normal / LowPoly / Geometry / Sketch（按引擎支持范围显示）、面数（对数滑块 + 预设 + 精确输入，按引擎区间收窄）、PBR 材质、多边形类型、输出格式（按引擎支持范围） |
 | 中间视口 | three.js 实时预览（GLB / GLTF / OBJ+MTL / STL / FBX）、线框叠加、网格地面、自动旋转、重置视角、全屏、三角面 / 顶点 / 网格 / 积分统计、生成进度（阶段 + 耗时） |
 | 右侧栏 | **「素材库 / 节点」两个页签**：素材库见下一行；**节点**页签展示当前模型的对象层级树，**点击节点即高亮**（琥珀色包围盒 + 淡暖色自发光，`Ctrl/⌘` 多选），支持按名字/类型搜索与折叠 |
 | 右侧「素材库」 | 上传 / 批量上传本地模型（按钮选择，或直接把文件拖进面板）、全部 / 进行中 / 已完成 / 失败筛选、名称与提示词搜索、缩略图、重命名、重试、取消、删除、下载主文件 / 全部文件、复用参数新建 |
 | 底部任务条 | 当前任务阶段、耗时、JobId、积分消耗、取消 / 重试（区分「续查」与「重新生成」）、导出菜单（按格式与贴图 / 材质单独下载） |
-| 设置弹窗 | 界面内填写 API Key（优先于 `.env`）、测试连接、清除、接口地址与并发/轮询参数展示 |
+| 设置弹窗 | 按生成引擎分别填写 API Key（优先于 `.env`）、测试连接、清除、自定义接口域名（代理 / 私有化部署）、切换默认引擎、运行参数展示 |
 | **动画预览页** | 顶栏「动画预览」进入：**多文件夹**（可添加/移除，服务端持久记录）、分页浏览、**只加载当前页封面**、模糊搜索、点击即在 3D 视口播放、**骨骼渲染 + 骨骼树多选高亮（可在模型上直接点选骨骼）**、**姿态模式（G/R/S 模态变换）**、**场景节点树（点击节点高亮）**、播放/暂停/进度/倍速、原地播放、左右镜像、地面网格、片段切换、文件与骨骼统计 |
 
 ### 动画预览（只读）
@@ -82,12 +84,18 @@
 ```
 3d-desing/
 ├── apps/
-│   ├── api/                     # Fastify 服务 + 混元接口客户端 + 任务调度
+│   ├── api/                     # Fastify 服务 + 生成引擎适配 + 任务调度
 │   │   └── src/
 │   │       ├── config.ts        # 环境变量与运行参数
 │   │       ├── app.ts           # 应用装配（路由 / 静态资源 / 错误处理）
 │   │       ├── index.ts         # 启动入口
-│   │       ├── hunyuan/         # 混元生3D 接口封装（提交 / 查询 / 下载）
+│   │       ├── providers/       # 生成引擎：契约 / 注册表 / http 工具 / 各引擎适配器
+│   │       │   ├── types.ts     # GenerationProvider 契约（submit / query / download / verify）
+│   │       │   ├── registry.ts  # 引擎注册表（默认 hunyuan3d）
+│   │       │   ├── hunyuan3d.ts # 腾讯云混元生3D（默认引擎）
+│   │       │   ├── tripo3d.ts   # Tripo3D 开放 API v2
+│   │       │   └── meshy.ts     # Meshy v2（preview → refine 两步）
+│   │       ├── hunyuan/         # 混元接口的线上协议与客户端
 │   │       ├── services/        # 调度器、素材转存、任务输入、设置
 │   │       ├── routes/          # /api/* 与 /files/*
 │   │       └── store/           # 工作区状态（state.json）
@@ -118,7 +126,8 @@ npm install
 # 2. 配置 API Key（可跳过，改为启动后在界面右上角「设置」里填写）
 copy .env.example .env        # Windows
 # cp .env.example .env        # macOS / Linux
-# 编辑 .env，填入 HUNYUAN3D_API_KEY=sk-xxxxxxxx
+# 编辑 .env：默认引擎填 HUNYUAN3D_API_KEY=sk-xxxxxxxx；
+# 要用 Tripo3D / Meshy 时再补 TRIPO3D_API_KEY=tsk_xxx / MESHY_API_KEY=msy_xxx
 
 # 3. 开发模式（前端 5173 + 后端 8787，已配置代理）
 npm run dev                   # 打开 http://127.0.0.1:5173
@@ -136,7 +145,8 @@ npm start                     # 打开 http://127.0.0.1:8787
 | `npm run build` | 构建前端静态资源 + 编译后端 TypeScript |
 | `npm start` | 启动生产服务（同时托管 `apps/web/dist`） |
 | `npm run typecheck` | 前后端类型检查（`tsc` + `vue-tsc`） |
-| `npm run smoke -- --prompt "一只小猫" --faces 3000 --yes` | 直连混元接口跑一次完整生成（**会消耗积分**） |
+| `npm run test:providers -w @h3d/api` | 生成引擎自测（mock 网络，覆盖三引擎的提交/轮询/多步/下载/转存，**不联网不扣积分**） |
+| `npm run smoke -- --prompt "一只小猫" --faces 3000 --yes` | 直连当前引擎跑一次完整生成（**会消耗积分**；`--provider tripo3d` 可切引擎） |
 
 > 如果 `npm install` 在受限环境（例如带文件沙箱的容器）里因 esbuild 的安装脚本失败，可改用
 > `npm install --ignore-scripts`：esbuild 的平台二进制由可选依赖提供，不跑安装脚本也能正常工作。
@@ -145,8 +155,13 @@ npm start                     # 打开 http://127.0.0.1:8787
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `HUNYUAN3D_API_KEY` | 空 | 控制台创建的 `sk-` 开头密钥；界面里填写的 Key 优先级更高 |
-| `HUNYUAN3D_BASE_URL` | `https://api.ai3d.cloud.tencent.com` | 接口域名 |
+| `HUNYUAN3D_API_KEY` | 空 | 混元生3D 的 `sk-` 密钥（默认引擎）；界面里填写的 Key 优先级更高 |
+| `HUNYUAN3D_BASE_URL` | `https://api.ai3d.cloud.tencent.com` | 混元接口域名 |
+| `TRIPO3D_API_KEY` | 空 | Tripo3D 的 `tsk_` 密钥 |
+| `TRIPO3D_BASE_URL` | `https://api.tripo3d.ai/v2/openapi` | Tripo 接口域名 |
+| `MESHY_API_KEY` | 空 | Meshy 的 `msy_` 密钥 |
+| `MESHY_BASE_URL` | `https://api.meshy.ai/openapi/v2` | Meshy 接口域名 |
+| `GENERATION_PROVIDER` | `hunyuan3d` | 服务端默认引擎（`hunyuan3d` / `tripo3d` / `meshy`） |
 | `HOST` / `PORT` | `127.0.0.1` / `8787` | 本地服务监听地址 |
 | `WEB_HOST` | `127.0.0.1` | Vite 开发/预览服务器监听地址（在 `apps/web` 侧读取，需用命令行环境变量设置） |
 | `POLL_INTERVAL_MS` | `5000` | 远端任务轮询间隔 |
@@ -230,20 +245,57 @@ Content-Type:  application/json
 - **图片输入**：前端在浏览器内校验格式 / 最小边长（≥128）、等比压缩到长边 1600、控制体积 ≤6MB，
   再以 base64 提交（`apps/web/src/utils/image.ts`）。
 
+### 生成引擎（可插拔 provider）
+
+默认引擎是**混元生3D**；`apps/api/src/providers/` 把「提交 → 轮询 → 下载 → 校验」抽象成统一契约
+（`GenerationProvider`），第三方引擎只需实现同一套方法即可接入，worker / 路由 / 前端都不用改。
+
+| 能力 | `hunyuan3d`（默认） | `tripo3d` | `meshy` |
+| --- | --- | --- | --- |
+| 输入模式 | 文生 / 图生 / 多视角（7 视角） | 文生 / 图生 / 多视角（2~4 张按多视角提交，1 张退化为单图） | 文生 / 图生 |
+| 生成类型 | Normal / LowPoly / Geometry / Sketch | Normal / LowPoly / Geometry | Normal / LowPoly / Geometry |
+| 面数区间 | 3,000 ~ 1,500,000 | 3,000 ~ 20,000（超出自动收窄） | 3,000 ~ 300,000 |
+| PBR | ✅ | ✅ | ❌（贴图在 refine 阶段产出） |
+| 输出格式 | OBJ / GLB / STL / FBX / USDZ | GLB | GLB / FBX / OBJ / USDZ |
+| 多步流程 | 无 | 无 | 文生3D `preview → refine`（阶段信息存 `job.providerMeta`，重启可续跑） |
+
+- **任务绑定引擎**：每个任务的 `params.provider` 决定用哪个引擎；「复用参数」会跟着切到那个引擎。
+- **Key / 域名按引擎独立**：界面设置优先于 `.env`；支持自定义接口域名（代理 / 私有化部署）。
+- **能力驱动表单**：`/api/providers` 下发 `capabilities`，前端自动隐藏不支持的模式/参数，服务端再校验一次
+  （例如 Meshy 拒绝多视角与 Sketch、Tripo 拒绝 OBJ、面数超出引擎区间会被收窄）。
+- **错误统一**：各引擎的鉴权/限流/参数错误统一映射为 `ProviderError`（`AuthFailure.*`、`RateLimited`、
+  `NetworkError`、`InvalidParameter.*`），任务卡片的失败原因与界面提示一致。
+
+新增一个第三方引擎（3 步）：
+
+1. 在 `apps/api/src/providers/` 下实现 `GenerationProvider`：`info`（能力/模型/默认参数/Key 说明）、
+   `submit`、`query`、`download`、`verify`，需要时再加 `normalizeParams` 做参数裁剪；
+2. 把引擎 id 加进 `store/types.ts` 的 `PROVIDER_IDS` 与 `providers/registry.ts` 的 `REGISTRY`；
+3. 想用 `.env` 配 Key 时，在 `info` 里声明 `envKeyName` / `envBaseUrlName`（`config.ts` 会自动读取）。
+
+前端无需改动：引擎选项、能力裁剪、Key 设置面板全部由 `/api/providers` 与 `/api/settings` 驱动。
+自测脚本 `npm run test:providers -w @h3d/api` 用 mock `fetch` 覆盖三个引擎（含 Meshy 两阶段、Tripo 先上传再提交），
+不联网、不消耗积分。
+
 ### HTTP 接口一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/state` | 前端唯一轮询入口：任务列表 + 队列 + 设置摘要 |
-| POST | `/api/jobs` | 创建生成任务 |
+| GET | `/api/providers` | 生成引擎清单（能力、模型、默认参数、Key 状态、接口域名） |
+| POST | `/api/jobs` | 创建生成任务（`params.provider` 指定引擎，缺省用服务端默认引擎） |
 | GET | `/api/jobs/:id` | 任务详情 |
-| PATCH | `/api/jobs/:id` | 重命名；未提交的任务可改参数 |
+| PATCH | `/api/jobs/:id` | 重命名；未提交的任务可改参数（含切换引擎） |
 | POST | `/api/jobs/:id/retry` | 重试（自动选择续查 / 重新提交） |
 | POST | `/api/jobs/:id/cancel` | 取消 |
 | DELETE | `/api/jobs/:id` | 删除任务与本地素材文件 |
 | POST | `/api/jobs/:id/thumbnail` | 回填浏览器渲染的缩略图 |
 | GET | `/api/jobs/:id/preview` | 输入参考图预览 |
-| GET | `/api/settings` · PUT/DELETE `/api/settings/api-key` · POST `/api/settings/verify` | 设置与鉴权自检 |
+| GET | `/api/settings` | 设置摘要（按引擎的 Key 状态、能力、限制、枚举） |
+| PUT/DELETE | `/api/settings/api-key?provider=` | 保存 / 清除某个引擎的 API Key |
+| PUT | `/api/settings/base-url?provider=` | 设置某个引擎的自定义接口域名（空串恢复默认） |
+| PUT | `/api/settings/active-provider` | 切换服务端默认引擎 |
+| POST | `/api/settings/verify?provider=` | 某个引擎的 Key / 连通性自检 |
 | GET | `/api/library/upload-info` | 允许上传的扩展名与单文件上限 |
 | PUT | `/api/library/staging/:batchId?filename=xxx` | 上传单个文件（`application/octet-stream` 原始字节流，服务端流式落盘） |
 | POST | `/api/library/commit` | 把一个批次转成素材库条目（支持批量，按规则分组） |
@@ -300,16 +352,24 @@ Content-Type:  application/json
 | 场景节点树 | Mixamo FBX 解析出 `(Group) → Beta_Joints / Beta_Surface` 三个对象；点击 `Beta_Surface` 只高亮该网格（包围盒 + 淡暖色自发光），`Ctrl` 加选 `Beta_Joints` 得 2 个节点；「含骨骼节点」打开后 132 行、父节点标注 `129 骨骼`；搜索 `surface` 得 2 行（根 + 命中项）并高亮命中；换模型后自动重建并重新展开；0 控制台错误 |
 | 工作台节点树 | 右侧栏出现「素材库 14 / 节点」两个页签；选中 GLB 素材后解析出 11 个节点（`(Group) → AuxScene → FastTree → Bark_Trunk / Bark_Roots / Bark_Branch_L1-4 / Bark_Fruit / Leaves`）；点击节点高亮、单击替换、`Ctrl` 加选得 2 个；切回素材库 14 张卡片正常；换素材后节点树与选择都重置；动画页节点树回归正常；0 控制台错误 |
 | 只读验证 | 读取全部 18 个 FBX 前后：SHA256 全部一致、目录内无新增文件（非 fbx 项 0）、API 并发读取期间其它进程独占读取 40/40 次成功 |
+| 生成引擎抽象 | `npm run test:providers -w @h3d/api` 48 项断言全通过（mock 网络，不联网不扣积分）：三引擎注册与默认引擎、混元提交体字段（PascalCase、图片走 `ImageBase64`）、Tripo 先 `upload` 换 `file_token` 再 `image_to_model`、面数收窄到 20000、`texture`/`pbr` 映射、优先 `pbr_model`、Meshy `preview → refine` 两步与白模不 refine、图生3D 传 data URI、结果格式映射、下载后转存、能力校验（Meshy 拒绝 Sketch / 多视角、Tripo 拒绝 OBJ、混元 3.1 拒绝 LowPoly） |
+| 多引擎 UI | 无头 Chrome 核对：顶栏「3D 生成工作台 / Hunyuan3D（默认）· Tripo3D · Meshy」、生成设置出现「生成引擎 混元生3D / Tripo3D / Meshy」+「当前引擎面数范围 3,000 ~ 1,500,000」、Key 状态、参数表单正常；0 条控制台错误 |
+| 引擎切换接口 | `PUT /api/settings/active-provider` 切到 tripo3d 后 `GET /api/settings.activeProvider` 生效并写回 `state.json`；Key 前缀校验（Tripo 只收 `tsk_`）与能力拒绝（Meshy+multiview / Meshy+Sketch / Tripo+OBJ）均返回明确 400 |
 | 类型与构建 | `tsc` 后端 + `vue-tsc` 前端类型检查 0 错误；`vite build` 产物约 803 KB（gzip 226 KB） |
 
 > 说明：验证过程共消耗账号积分 55 分（30 + 25），生成的素材保留在 `data/` 目录中，启动后即可在素材库看到。
+>
+> Tripo3D / Meshy 适配器按两家公开 API 文档实现，字段映射已由上面的 mock 自测锁定；本地没有这两家的 Key，
+> 因此**尚未做真实端到端生成验证**。接入真实 Key 后建议先在「设置」里点「测试连接」，再跑一次
+> `npm run smoke -- --provider tripo3d --yes`（会消耗积分）确认计费与产物符合预期。
 
 ---
 
 ## 7. 注意事项
 
 - `.env` 中的 API Key 为明文存放且已被 `.gitignore` 忽略；不要把该文件提交到版本库。
-- 前端也可在「设置」里填写 Key：该值写入 `data/settings.json`，优先级高于 `.env`，可随时清除。
+- 前端也可在「设置」里按引擎分别填写 Key：该值写入 `data/state.json`，优先级高于 `.env`，可随时清除。
+- 每个引擎的并发限制不同（混元默认 3），本地队列上限仍按 3 控制；切换引擎不会改变队列机制。
 - 接口默认并发为 3，超出会失败，因此本地队列上限固定为 3。
 - 删除素材会一并删除 `data/storage/<jobId>/` 中的转存文件，请先导出再删除。
 - 浏览器无法预览 USDZ，选择该格式时界面会提示下载后用本地软件查看。
@@ -322,7 +382,7 @@ Content-Type:  application/json
 
 | 内容 | 处理 |
 | --- | --- |
-| `.env`（`HUNYUAN3D_API_KEY` 等真实密钥） | `.gitignore` 排除，只提交 `.env.example` 模板 |
+| `.env`（`HUNYUAN3D_API_KEY` / `TRIPO3D_API_KEY` / `MESHY_API_KEY` 等真实密钥） | `.gitignore` 排除，只提交 `.env.example` 模板 |
 | `data/`：`state.json`（含界面填写的 API Key 与素材元数据）、`payloads/`（上传的输入图 base64）、`storage/`（转存与上传的模型）、`uploads/`（上传暂存） | `.gitignore` 排除 |
 | `node_modules/` `dist/` `.npm-cache/` `.tmp*/` | `.gitignore` 排除 |
 | `*.pem` `*.key` `*.p12` `*.pfx` | `.gitignore` 排除 |
@@ -345,4 +405,6 @@ Content-Type:  application/json
 参考文档：[HY-3D 调用指南](https://cloud.tencent.com/document/product/1823/137181) ·
 [OpenAI 兼容接口调用示例](https://cloud.tencent.com/document/product/1804/126189) ·
 [提交混元生3D专业版任务](https://cloud.tencent.com/document/product/1804/123447) ·
-[查询混元生3D专业版任务](https://cloud.tencent.com/document/product/1804/123448)
+[查询混元生3D专业版任务](https://cloud.tencent.com/document/product/1804/123448) ·
+[Tripo3D 开放 API](https://platform.tripo3d.ai/docs) ·
+[Meshy API 文档](https://docs.meshy.ai/en/api/text-to-3d)

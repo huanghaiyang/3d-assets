@@ -325,7 +325,9 @@ function statusText(status: string): string {
             <template v-else>
               <span>{{ durationOf(job) }}</span>
               <span v-if="job.asset">{{ job.asset.files.length }} 个文件</span>
-              <span v-else class="faint">{{ job.params.model }}</span>
+              <span v-else class="faint">
+                {{ store.providerLabel(job.params.provider) }} · {{ job.params.model || '默认' }}
+              </span>
             </template>
           </p>
         </div>

@@ -2,13 +2,17 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createLogger } from '../lib/logger.js';
 import { dataDir, stateFile } from '../lib/paths.js';
-import type { AppSettings, Job, PersistedState } from './types.js';
+import { DEFAULT_PROVIDER_ID, PROVIDER_IDS, type AppSettings, type Job, type PersistedState } from './types.js';
 
 const log = createLogger('store');
 const STATE_VERSION = 1;
 
+function emptySettings(): AppSettings {
+  return { activeProvider: DEFAULT_PROVIDER_ID, providers: {} };
+}
+
 function emptyState(): PersistedState {
-  return { version: STATE_VERSION, jobs: [], settings: { apiKey: null }, animationDirs: [] };
+  return { version: STATE_VERSION, jobs: [], settings: emptySettings(), animationDirs: [] };
 }
 
 /**
@@ -98,7 +102,7 @@ function normalize(raw: Partial<PersistedState>): PersistedState {
   const state = emptyState();
   if (typeof raw === 'object' && raw !== null) {
     if (raw.settings && typeof raw.settings === 'object') {
-      state.settings.apiKey = typeof raw.settings.apiKey === 'string' ? raw.settings.apiKey : null;
+      state.settings = normalizeSettings(raw.settings as Partial<AppSettings> & { apiKey?: string | null });
     }
     if (Array.isArray(raw.jobs)) {
       state.jobs = raw.jobs.filter(isJobLike).map((job) => ({
@@ -108,6 +112,13 @@ function normalize(raw: Partial<PersistedState>): PersistedState {
         cancelRequested: Boolean(job.cancelRequested),
         remoteFailed: Boolean(job.remoteFailed),
         asset: job.asset ?? null,
+        // 旧任务没有 provider / providerMeta 字段
+        params: {
+          ...job.params,
+          provider: PROVIDER_IDS.includes(job.params.provider) ? job.params.provider : DEFAULT_PROVIDER_ID,
+          resultFormat: job.params.resultFormat ?? 'GLB',
+        },
+        providerMeta: job.providerMeta && typeof job.providerMeta === 'object' ? job.providerMeta : {},
       }));
     }
     if (Array.isArray(raw.animationDirs)) {
@@ -118,6 +129,28 @@ function normalize(raw: Partial<PersistedState>): PersistedState {
     // 服务重启后，正在轮询/下载的任务由 worker 接手
   }
   return state;
+}
+
+/** 设置迁移：旧版本的单一混元 Key → providers.hunyuan3d.apiKey */
+function normalizeSettings(raw: Partial<AppSettings> & { apiKey?: string | null }): AppSettings {
+  const settings = emptySettings();
+  const rawProviders = (raw.providers ?? {}) as Record<string, { apiKey?: unknown; baseUrl?: unknown }>;
+  for (const id of PROVIDER_IDS) {
+    const entry = rawProviders[id];
+    if (!entry || typeof entry !== 'object') continue;
+    settings.providers[id] = {
+      apiKey: typeof entry.apiKey === 'string' && entry.apiKey.trim() ? entry.apiKey.trim() : null,
+      baseUrl: typeof entry.baseUrl === 'string' && entry.baseUrl.trim() ? entry.baseUrl.trim() : null,
+    };
+  }
+  if (typeof raw.activeProvider === 'string' && (PROVIDER_IDS as readonly string[]).includes(raw.activeProvider)) {
+    settings.activeProvider = raw.activeProvider as AppSettings['activeProvider'];
+  }
+  const legacyKey = typeof raw.apiKey === 'string' ? raw.apiKey.trim() : '';
+  if (legacyKey && !settings.providers[DEFAULT_PROVIDER_ID]?.apiKey) {
+    settings.providers[DEFAULT_PROVIDER_ID] = { apiKey: legacyKey, baseUrl: null };
+  }
+  return settings;
 }
 
 function isJobLike(value: unknown): value is Job {

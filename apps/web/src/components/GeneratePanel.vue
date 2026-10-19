@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watchEffect } from 'vue';
 import Icon from './ui/Icon.vue';
 import ImageDropzone from './ImageDropzone.vue';
 import MultiViewInput from './MultiViewInput.vue';
@@ -12,19 +12,38 @@ import type { PreparedImage } from '@/utils/image';
 const store = useWorkspaceStore();
 const showSettings = ref(true);
 
-const modeOptions = [
-  { value: 'text', label: '文生3D' },
-  { value: 'image', label: '图生3D' },
-  { value: 'multiview', label: '多视角' },
-];
+const MODE_LABELS: Record<Exclude<InputMode, 'upload'>, string> = {
+  text: '文生3D',
+  image: '图生3D',
+  multiview: '多视角',
+};
+
+/** 只显示当前引擎支持的输入模式 */
+const modeOptions = computed(() =>
+  store.providerCapabilities.modes.map((mode) => ({ value: mode, label: MODE_LABELS[mode] })),
+);
+
+watchEffect(() => {
+  const supported = store.providerCapabilities.modes as InputMode[];
+  if (store.mode !== 'upload' && !supported.includes(store.mode)) {
+    store.setMode(supported.includes('text') ? 'text' : (supported[0] ?? 'text'));
+  }
+});
 
 const promptMax = computed(() => store.settings?.limits.promptMaxChars ?? 1024);
 const promptOver = computed(() => store.prompt.length > promptMax.value);
 
 const viewTypes = computed<ViewType[]>(() => store.settings?.enums.viewTypes ?? ['left', 'right', 'back']);
-const version31Only = computed<ViewType[]>(() => store.settings?.enums.viewTypes31Only ?? []);
+/** 混元 3.1 专属视角提示，其它引擎没有这个限制 */
+const version31Only = computed<ViewType[]>(() => {
+  if (store.params.provider !== 'hunyuan3d') return [];
+  return store.settings?.enums.viewTypes31Only ?? [];
+});
 
 const canSubmit = computed(() => store.canSubmit && !promptOver.value);
+
+/** Sketch 只有混元支持 */
+const supportsSketch = computed(() => store.providerCapabilities.generateTypes.includes('Sketch'));
 
 const EXAMPLES = [
   '一只低多边形的白色陶瓷小猫摆件',
@@ -96,7 +115,7 @@ function useExample(example: string): void {
             @update:model-value="store.setImage"
             @error="onImageError"
           />
-          <template v-if="store.params.generateType === 'Sketch'">
+          <template v-if="supportsSketch && store.params.generateType === 'Sketch'">
             <div class="row" style="margin-top: 2px">
               <span class="field-label" style="margin: 0">补充描述（Sketch 模式可与图片同时使用）</span>
               <span class="mono faint">{{ store.prompt.length }}/{{ promptMax }}</span>
@@ -104,7 +123,7 @@ function useExample(example: string): void {
             <input v-model="store.prompt" class="text-input" placeholder="例如：做成卡通风格，表面光滑" />
           </template>
           <p v-else class="mode-tip">
-            当前为 {{ store.params.generateType }} 模式，仅使用参考图；若要图文同时输入，请把「生成类型」切换为 Sketch。
+            当前为 {{ store.params.generateType }} 模式，仅使用参考图{{ supportsSketch ? '；若要图文同时输入，请把「生成类型」切换为 Sketch' : '' }}。
           </p>
         </template>
 
@@ -117,8 +136,7 @@ function useExample(example: string): void {
             @update:model-value="onViewsUpdate"
             @error="onImageError"
           />
-        </template>
-      </section>
+        </template>      </section>
 
       <!-- 生成设置 -->
       <section class="block">
@@ -133,7 +151,8 @@ function useExample(example: string): void {
           <GenerationSettings />
         </div>
         <p v-else class="summary">
-          {{ store.params.model }} · {{ store.params.generateType }} ·
+          {{ store.activeProviderInfo?.label ?? '' }} · {{ store.params.model || '默认模型' }} ·
+          {{ store.params.generateType }} ·
           {{ store.params.generateType === 'LowPoly' ? store.params.polygonType : store.params.faceCount.toLocaleString('en-US') + ' 面' }}
           <template v-if="store.params.enablePbr"> · PBR</template>
         </p>
@@ -141,9 +160,9 @@ function useExample(example: string): void {
     </div>
 
     <footer class="panel-foot">
-      <p v-if="!store.settings?.apiKeyConfigured" class="warn-line">
+      <p v-if="!store.activeProviderInfo?.apiKeyConfigured" class="warn-line">
         <Icon name="alert" :size="12" />
-        尚未配置 API Key，点击右上角「设置」填写
+        尚未配置 {{ store.activeProviderInfo?.label ?? '当前引擎' }} 的 API Key，点击右上角「设置」填写
       </p>
       <button class="generate-btn" type="button" :disabled="!canSubmit" @click="store.submit()">
         <Icon :name="store.submitting ? 'refresh' : 'sparkle'" :size="15" :class="{ spin: store.submitting }" />

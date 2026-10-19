@@ -8,10 +8,12 @@ const emit = defineEmits<{ 'open-settings': []; 'change-page': [value: 'workbenc
 
 const store = useWorkspaceStore();
 
-const keyChipClass = computed(() => (store.settings?.apiKeyConfigured ? 'chip-success' : 'chip-warn'));
+const active = computed(() => store.activeProviderInfo);
+const keyChipClass = computed(() => (active.value?.apiKeyConfigured ? 'chip-success' : 'chip-warn'));
 const keyLabel = computed(() => {
-  if (!store.settings?.apiKeyConfigured) return '未配置 API Key';
-  return store.settings.apiKeyMasked ?? '已配置';
+  if (!active.value) return '未连接到本地服务';
+  if (!active.value.apiKeyConfigured) return `${active.value.label} 未配置 Key`;
+  return `${active.value.label} ${active.value.apiKeyMasked ?? '已配置'}`;
 });
 </script>
 
@@ -20,8 +22,8 @@ const keyLabel = computed(() => {
     <div class="brand">
       <span class="logo"><Icon name="cube" :size="16" /></span>
       <div class="brand-text">
-        <span class="brand-name">混元 3D 工作台</span>
-        <span class="brand-sub">Tencent Hunyuan3D · 文生3D / 图生3D</span>
+        <span class="brand-name">3D 生成工作台</span>
+        <span class="brand-sub">Hunyuan3D（默认）· Tripo3D · Meshy</span>
       </div>
     </div>
 

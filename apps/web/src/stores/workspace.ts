@@ -7,8 +7,10 @@ import type {
   GenerationParams,
   InputMode,
   Job,
-  ModelVersion,
   PolygonType,
+  ProviderCapabilities,
+  ProviderId,
+  ProviderSummary,
   QueueSummary,
   ResultFormat,
   SettingsSummary,
@@ -66,7 +68,18 @@ interface Draft {
   params: GenerationParams;
 }
 
+/** 设置接口不可用时的兜底引擎能力（按混元的能力渲染表单） */
+const FALLBACK_CAPABILITIES: ProviderCapabilities = {
+  modes: ['text', 'image', 'multiview'],
+  generateTypes: ['Normal', 'LowPoly', 'Geometry', 'Sketch'],
+  pbr: true,
+  faceCount: true,
+  multiview: true,
+  formats: ['OBJ', 'GLB', 'STL', 'FBX', 'USDZ'],
+};
+
 const FALLBACK_PARAMS: GenerationParams = {
+  provider: 'hunyuan3d',
   model: '3.0',
   generateType: 'Normal',
   faceCount: 100_000,
@@ -111,6 +124,91 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const views = ref<Partial<Record<ViewType, PreparedImage>>>({});
   const params = ref<GenerationParams>({ ...draft.params });
   const submitting = ref(false);
+
+  /** 设置只应用一次；之后的引擎切换由用户显式触发 */
+  let providerApplied = false;
+
+  // ===== 生成引擎（provider）=====
+  const providers = computed<ProviderSummary[]>(() => settings.value?.providers ?? []);
+  /** 表单当前使用的引擎（params.provider 是唯一来源，切换时会同步给服务端作为默认引擎） */
+  const activeProviderInfo = computed<ProviderSummary | null>(() => {
+    const list = providers.value;
+    return list.find((item) => item.id === params.value.provider) ?? list.find((item) => item.id === settings.value?.activeProvider) ?? null;
+  });
+  const providerCapabilities = computed<ProviderCapabilities>(
+    () => activeProviderInfo.value?.capabilities ?? FALLBACK_CAPABILITIES,
+  );
+  const providerModels = computed(() => activeProviderInfo.value?.models ?? [{ value: '3.0', label: '3.0' }]);
+
+  /** 按引擎能力把参数裁剪到合法值（切换引擎 / 引擎模型变化时调用） */
+  function applyProviderDefaults(info: ProviderSummary): void {
+    const caps = info.capabilities;
+    const defaults = info.defaults;
+    const min = settings.value?.limits.faceCount.min ?? 3_000;
+    const max = settings.value?.limits.faceCount.max ?? 1_500_000;
+    const generateType = caps.generateTypes.includes(params.value.generateType)
+      ? params.value.generateType
+      : defaults.generateType;
+    const faceCount = Math.min(max, Math.max(min, params.value.faceCount || defaults.faceCount));
+    const resultFormat =
+      params.value.resultFormat && caps.formats.includes(params.value.resultFormat)
+        ? params.value.resultFormat
+        : defaults.resultFormat;
+    params.value = {
+      ...defaults,
+      provider: info.id,
+      model: defaults.model,
+      generateType,
+      faceCount,
+      enablePbr: caps.pbr ? defaults.enablePbr : false,
+      resultFormat,
+    };
+    if (!caps.modes.includes(mode.value as Exclude<InputMode, 'upload'>)) {
+      mode.value = caps.modes.includes('text') ? 'text' : (caps.modes[0] ?? 'text');
+    }
+  }
+
+  /** 切换生成引擎：更新表单参数，并把选择持久化为服务端默认引擎 */
+  async function setProvider(id: ProviderId): Promise<void> {
+    if (params.value.provider === id) return;
+    const info = providers.value.find((item) => item.id === id);
+    if (!info) return;
+    applyProviderDefaults(info);
+    try {
+      settings.value = await api.setActiveProvider(id);
+    } catch (err) {
+      toast('error', err instanceof Error ? err.message : '切换生成引擎失败');
+    }
+  }
+
+  /** 生成引擎的展示名（素材库用） */
+  function providerLabel(id: ProviderId): string {
+    return providers.value.find((item) => item.id === id)?.label ?? id;
+  }
+
+  /** 按当前引擎能力纠正参数（模型、生成类型、输出格式） */
+  function sanitizeParams(info: ProviderSummary): void {
+    const caps = info.capabilities;
+    const defaults = info.defaults;
+    const range = caps.faceCountRange;
+    const min = Math.max(settings.value?.limits.faceCount.min ?? 3_000, range?.min ?? 0);
+    const max = Math.min(settings.value?.limits.faceCount.max ?? 1_500_000, range?.max ?? Number.POSITIVE_INFINITY);
+    const next: GenerationParams = { ...params.value, provider: info.id };
+
+    if (!caps.generateTypes.includes(next.generateType)) next.generateType = defaults.generateType;
+    if (info.models.length > 0 && !info.models.some((model) => model.value === next.model)) {
+      next.model = defaults.model;
+    }
+    if (next.resultFormat && !caps.formats.includes(next.resultFormat)) next.resultFormat = defaults.resultFormat;
+    if (!caps.pbr) next.enablePbr = false;
+    if (next.generateType === 'Geometry') next.enablePbr = false;
+    // 混元 3.1 不支持智能拓扑 / 草图（服务端也会再校验一次）
+    if (info.id === 'hunyuan3d' && next.model === '3.1' && (next.generateType === 'LowPoly' || next.generateType === 'Sketch')) {
+      next.generateType = 'Normal';
+    }
+    next.faceCount = Math.min(max, Math.max(min, Math.round(next.faceCount)));
+    params.value = next;
+  }
 
   // 视口状态
   const wireframe = ref(false);
@@ -167,7 +265,10 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const viewCount = computed(() => Object.keys(views.value).length);
 
   const canSubmit = computed(() => {
-    if (submitting.value || !settings.value?.apiKeyConfigured) return false;
+    if (submitting.value) return false;
+    if (!activeProviderInfo.value?.apiKeyConfigured) return false;
+    const supportedModes = providerCapabilities.value.modes;
+    if (mode.value !== 'upload' && !supportedModes.includes(mode.value)) return false;
     if (mode.value === 'text') return prompt.value.trim().length > 0;
     if (mode.value === 'image') return Boolean(image.value);
     return viewCount.value > 0;
@@ -178,8 +279,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     jobs.value.filter((job) => job.asset && !job.asset.thumbnailUrl && isPreviewable(job.asset)),
   );
 
-  function toast(kind: Toast['kind'], text: string): void {
-    const id = ++toastSeq;
+  function toast(kind: Toast['kind'], text: string): void {    const id = ++toastSeq;
     toasts.value.push({ id, kind, text });
     window.setTimeout(() => {
       toasts.value = toasts.value.filter((item) => item.id !== id);
@@ -198,6 +298,18 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       queue.value = state.queue;
       totalJobs.value = state.totalJobs;
       offline.value = false;
+
+      // 首次拿到设置时确定当前引擎：草稿里的引擎有效就沿用，否则用服务端默认引擎
+      if (!providerApplied) {
+        providerApplied = true;
+        const chosen =
+          state.api.providers.find((item) => item.id === params.value.provider) ?? state.api.active;
+        if (chosen) {
+          const keep = draft.params.provider === chosen.id ? draft.params : null;
+          params.value = { ...chosen.defaults, ...(keep ?? {}), provider: chosen.id };
+          sanitizeParams(chosen);
+        }
+      }
 
       // 自动把刚完成的任务切到视口
       if (followJobId) {
@@ -261,14 +373,10 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   function setParams(patch: Partial<GenerationParams>): void {
     params.value = { ...params.value, ...patch };
-    // 3.1 不支持 LowPoly / Sketch
-    if (params.value.model === '3.1' && (params.value.generateType === 'LowPoly' || params.value.generateType === 'Sketch')) {
-      params.value.generateType = 'Normal';
-    }
-    if (params.value.generateType === 'Geometry') params.value.enablePbr = false;
+    if (activeProviderInfo.value) sanitizeParams(activeProviderInfo.value);
   }
 
-  function setModel(model: ModelVersion): void {
+  function setModel(model: string): void {
     setParams({ model });
   }
 
@@ -305,10 +413,19 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       toast('info', '上传的素材没有生成参数可复用');
       return;
     }
+    const info = providers.value.find((item) => item.id === job.params.provider);
+    if (!info) {
+      toast('error', '该素材使用的生成引擎已不可用');
+      return;
+    }
     mode.value = job.input.mode === 'upload' ? 'text' : job.input.mode;
+    if (!info.capabilities.modes.includes(mode.value as Exclude<InputMode, 'upload'>)) {
+      mode.value = info.capabilities.modes.includes('text') ? 'text' : (info.capabilities.modes[0] ?? 'text');
+    }
     prompt.value = job.input.prompt;
     params.value = { ...job.params };
-    toast('info', `已载入「${job.name}」的生成参数`);
+    sanitizeParams(info);
+    toast('info', `已载入「${job.name}」的生成参数（${info.label}）`);
   }
 
   // ===== 素材上传 =====
@@ -461,7 +578,11 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   async function submit(): Promise<void> {
     if (!canSubmit.value) {
-      toast('error', settings.value?.apiKeyConfigured ? '请先补充生成所需的输入' : '请先在设置中配置 API Key');
+      const label = activeProviderInfo.value?.label ?? '当前引擎';
+      toast(
+        'error',
+        activeProviderInfo.value?.apiKeyConfigured ? '请先补充生成所需的输入' : `请先在「设置」中配置${label}的 API Key`,
+      );
       return;
     }
     submitting.value = true;
@@ -541,18 +662,23 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     }
   }
 
-  async function saveApiKey(key: string): Promise<void> {
-    settings.value = await api.saveApiKey(key);
+  async function saveApiKey(key: string, provider?: ProviderId): Promise<void> {
+    settings.value = await api.saveApiKey(provider ?? params.value.provider, key);
     toast('success', 'API Key 已保存');
   }
 
-  async function clearApiKey(): Promise<void> {
-    settings.value = await api.clearApiKey();
+  async function clearApiKey(provider?: ProviderId): Promise<void> {
+    settings.value = await api.clearApiKey(provider ?? params.value.provider);
     toast('info', '已清除界面中保存的 API Key');
   }
 
-  async function verifyApiKey(): Promise<{ ok: boolean; message: string }> {
-    const result = await api.verifyApiKey();
+  async function saveBaseUrl(baseUrl: string, provider?: ProviderId): Promise<void> {
+    settings.value = await api.saveBaseUrl(provider ?? params.value.provider, baseUrl);
+    toast('success', '接口域名已保存');
+  }
+
+  async function verifyApiKey(provider?: ProviderId): Promise<{ ok: boolean; message: string }> {
+    const result = await api.verifyApiKey(provider ?? params.value.provider);
     toast(result.ok ? 'success' : 'error', result.message);
     return result;
   }
@@ -614,6 +740,11 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     viewCount,
     canSubmit,
     thumbnailsMissing,
+    providers,
+    activeProviderInfo,
+    providerCapabilities,
+    providerModels,
+    providerLabel,
     // actions
     setNodeTree,
     selectNode,
@@ -628,6 +759,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     setGenerateType,
     setPolygonType,
     setResultFormat,
+    setProvider,
     setImage,
     setView,
     clearViews,
@@ -642,6 +774,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     rename,
     saveApiKey,
     clearApiKey,
+    saveBaseUrl,
     verifyApiKey,
     uploadThumbnail,
     toast,

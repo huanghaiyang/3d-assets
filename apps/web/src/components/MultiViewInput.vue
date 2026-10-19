@@ -7,9 +7,10 @@ import type { ViewType } from '@/api/types';
 const props = defineProps<{
   modelValue: Partial<Record<ViewType, PreparedImage>>;
   viewTypes: ViewType[];
-  /** 3.1 才支持的视角，在界面上标注 */
+  /** 仅特定模型版本才支持的视角（混元 3.1），在界面上标注 */
   version31Only: ViewType[];
-  model: '3.0' | '3.1';
+  /** 当前引擎的模型标识（字符串，'3.1' 时解锁额外视角） */
+  model: string;
 }>();
 
 const emit = defineEmits<{

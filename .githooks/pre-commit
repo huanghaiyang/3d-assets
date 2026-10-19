@@ -29,16 +29,16 @@ if [ -n "$blocked" ]; then
 fi
 
 # ---------- 2) 内容扫描：疑似真实 API Key ----------
-# 真实密钥形如 sk-<48 位>；占位符 sk-xxxxxxxxxxxxxxxx 只有 16 位，不会误报
+# 真实密钥形如 sk-<48 位> / tsk_<...> / msy_<...>；占位符（sk-xxxx…16 位）不会误报
 hits=$(git diff --cached -U0 --diff-filter=ACM \
   | grep -E '^\+' \
   | grep -v -E '^\+\+\+' \
-  | grep -Eo 'sk-[A-Za-z0-9]{24,}' \
+  | grep -Eo '(sk-|tsk_|msy_)[A-Za-z0-9]{20,}' \
   | sort -u || true)
 
 if [ -n "$hits" ]; then
   echo "疑似真实 API Key（已打码）："
-  echo "$hits" | sed -E 's/^(sk-.{6}).*(.{4})$/\1****\2/' | sed 's/^/  - /'
+  echo "$hits" | sed -E 's/^(.{6}).*(.{4})$/\1****\2/' | sed 's/^/  - /'
   fail "检测到疑似密钥内容"
 fi
 

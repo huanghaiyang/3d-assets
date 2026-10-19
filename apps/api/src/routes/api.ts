@@ -1,35 +1,37 @@
 import type { FastifyInstance } from 'fastify';
 import { config } from '../config.js';
-import {
-  FACE_COUNT_DEFAULT,
-  FACE_COUNT_MAX,
-  FACE_COUNT_MIN,
-  GENERATE_TYPES,
-  IMAGE_BASE64_MAX_BYTES,
-  MODEL_VERSIONS,
-  POLYGON_TYPES,
-  PROMPT_MAX_CHARS,
-  RESULT_FORMATS,
-  VIEW_TYPES,
-  VIEW_TYPES_31_ONLY,
-} from '../hunyuan/types.js';
+import { getProvider, listProviders, providerDefaults } from '../providers/registry.js';
+import type { GenerationProvider } from '../providers/types.js';
+import { VIEW_TYPES_31_ONLY } from '../hunyuan/types.js';
 import { newId } from '../lib/ids.js';
 import { createLogger } from '../lib/logger.js';
 import type { GenerationWorker } from '../services/worker.js';
 import { deletePayload, savePayload, savePreview, loadPreview } from '../services/payload.js';
 import { removeAssetFiles, saveThumbnailDataUrl, deriveName } from '../services/assets.js';
-import { apiKeySource, maskApiKey, resolveApiKey, verifyApiKey } from '../services/settings.js';
-import type { Job, PersistedState } from '../store/types.js';
-import { isActivePhase } from '../store/types.js';
-import type { Workspace } from '../store/workspace.js';
+import {
+  activeProvider,
+  maskApiKey,
+  providerCredential,
+  verifyProviderKey,
+} from '../services/settings.js';
 import {
   DEFAULT_PARAMS,
-  parseCreateJobBody,
-  parseParams,
-  toInputSummary,
-  toPayload,
-  ValidationError,
-} from './validate.js';
+  FACE_COUNT_DEFAULT,
+  FACE_COUNT_MAX,
+  FACE_COUNT_MIN,
+  GENERATE_TYPES,
+  IMAGE_BASE64_MAX_BYTES,
+  POLYGON_TYPES,
+  PROMPT_MAX_CHARS,
+  PROVIDER_IDS,
+  RESULT_FORMATS,
+  VIEW_TYPES,
+  type Job,
+  type PersistedState,
+} from '../store/types.js';
+import { isActivePhase } from '../store/types.js';
+import type { Workspace } from '../store/workspace.js';
+import { parseCreateJobBody, parseParams, toInputSummary, toPayload, ValidationError } from './validate.js';
 
 const log = createLogger('api');
 
@@ -42,6 +44,15 @@ const MAX_LISTED_JOBS = 300;
 
 export async function registerApiRoutes(app: FastifyInstance, deps: ApiDeps): Promise<void> {
   const { workspace, worker } = deps;
+
+  /** 从 query/body 解析目标引擎；未指定时用当前默认引擎 */
+  const resolveRequestProvider = (request: { query?: unknown; body?: unknown }): GenerationProvider | null => {
+    const query = (request.query ?? {}) as { provider?: unknown };
+    const body = (request.body ?? {}) as { provider?: unknown };
+    const raw = typeof query.provider === 'string' ? query.provider : typeof body.provider === 'string' ? body.provider : null;
+    if (raw === null) return getProvider(activeProvider(workspace));
+    return getProviderOptional(raw);
+  };
 
   /** 前端唯一轮询入口：一次拿到任务列表 + 设置摘要 + 队列状态 */
   app.get('/api/state', async (request) => {
@@ -64,32 +75,76 @@ export async function registerApiRoutes(app: FastifyInstance, deps: ApiDeps): Pr
     };
   });
 
+  /** 可选生成引擎清单（含能力、模型、Key 状态） */
+  app.get('/api/providers', async () => ({ providers: listProviders().map((provider) => providerSummary(workspace, provider)) }));
+
   app.get('/api/settings', async () => settingsSummary(workspace));
 
   app.put('/api/settings/api-key', async (request, reply) => {
+    const provider = resolveRequestProvider(request);
+    if (!provider) return reply.code(400).send({ error: '未知的生成引擎' });
     const body = (request.body ?? {}) as { apiKey?: unknown };
     if (typeof body.apiKey !== 'string' || body.apiKey.trim().length < 8) {
       return reply.code(400).send({ error: '请填写有效的 API Key' });
     }
     const key = body.apiKey.trim();
-    if (!key.startsWith('sk-')) {
-      return reply.code(400).send({ error: '混元生3D 的 API Key 以 sk- 开头，请检查是否复制完整' });
+    const prefix = provider.info.keyPrefix;
+    if (prefix && !key.startsWith(prefix)) {
+      return reply.code(400).send({ error: `${provider.info.label} 的 API Key 以 ${prefix} 开头，请检查是否复制完整` });
     }
     await workspace.mutate((state) => {
-      state.settings.apiKey = key;
+      const current = state.settings.providers[provider.info.id] ?? { apiKey: null, baseUrl: null };
+      state.settings.providers[provider.info.id] = { ...current, apiKey: key };
+      // 只保存凭据；默认引擎由「切换引擎 / 设为默认引擎」显式修改
     });
-    log.info('API Key 已更新（来自界面设置）');
+    log.info(`${provider.info.label} API Key 已更新（来自界面设置）`);
     return settingsSummary(workspace);
   });
 
-  app.delete('/api/settings/api-key', async () => {
+  app.delete('/api/settings/api-key', async (request) => {
+    const provider = resolveRequestProvider(request);
+    if (provider) {
+      await workspace.mutate((state) => {
+        const current = state.settings.providers[provider.info.id];
+        if (current) state.settings.providers[provider.info.id] = { ...current, apiKey: null };
+      });
+    }
+    return settingsSummary(workspace);
+  });
+
+  /** 自定义接口域名（代理 / 私有化部署）；空字符串表示恢复默认 */
+  app.put('/api/settings/base-url', async (request, reply) => {
+    const provider = resolveRequestProvider(request);
+    if (!provider) return reply.code(400).send({ error: '未知的生成引擎' });
+    const body = (request.body ?? {}) as { baseUrl?: unknown };
+    const raw = typeof body.baseUrl === 'string' ? body.baseUrl.trim() : '';
+    if (raw && !/^https?:\/\//i.test(raw)) {
+      return reply.code(400).send({ error: '接口域名需以 http:// 或 https:// 开头' });
+    }
     await workspace.mutate((state) => {
-      state.settings.apiKey = null;
+      const current = state.settings.providers[provider.info.id] ?? { apiKey: null, baseUrl: null };
+      state.settings.providers[provider.info.id] = { ...current, baseUrl: raw || null };
     });
     return settingsSummary(workspace);
   });
 
-  app.post('/api/settings/verify', async () => verifyApiKey(workspace));
+  /** 切换界面默认引擎 */
+  app.put('/api/settings/active-provider', async (request, reply) => {
+    const body = (request.body ?? {}) as { provider?: unknown };
+    if (typeof body.provider !== 'string') return reply.code(400).send({ error: '缺少 provider' });
+    const provider = getProviderOptional(body.provider);
+    if (!provider) return reply.code(400).send({ error: `未知的生成引擎：${body.provider}` });
+    await workspace.mutate((state) => {
+      state.settings.activeProvider = provider.info.id;
+    });
+    return settingsSummary(workspace);
+  });
+
+  app.post('/api/settings/verify', async (request) => {
+    const provider = resolveRequestProvider(request);
+    if (!provider) return { ok: false, message: '未知的生成引擎' };
+    return verifyProviderKey(workspace, provider.info.id);
+  });
 
   app.post('/api/jobs', async (request, reply) => {
     let parsed;
@@ -113,6 +168,7 @@ export async function registerApiRoutes(app: FastifyInstance, deps: ApiDeps): Pr
       input: toInputSummary(parsed, id),
       remoteJobId: null,
       remoteStatus: null,
+      providerMeta: {},
       requestId: null,
       error: null,
       errorCode: null,
@@ -132,7 +188,7 @@ export async function registerApiRoutes(app: FastifyInstance, deps: ApiDeps): Pr
       state.jobs.unshift(job);
     });
 
-    log.info(`新任务 ${id} [${parsed.mode}/${parsed.params.generateType}] 已入队`);
+    log.info(`新任务 ${id} [${parsed.params.provider}/${parsed.mode}/${parsed.params.generateType}] 已入队`);
     void worker.tick();
     return reply.code(201).send(job);
   });
@@ -171,14 +227,17 @@ export async function registerApiRoutes(app: FastifyInstance, deps: ApiDeps): Pr
       nextName = name.slice(0, 80);
     }
 
-    // 仅允许在未开始/失败状态下修改生成参数
+    // 仅允许在未开始/失败状态下修改生成参数（含切换生成引擎）
     let nextParams: Job['params'] | undefined;
     if (body.params && typeof body.params === 'object') {
       if (isActivePhase(job.phase) || job.phase === 'done') {
         return reply.code(409).send({ error: '任务已提交，参数不可修改；请复制参数新建任务' });
       }
+      const rawParams = body.params as Record<string, unknown>;
+      const provider = getProviderOptional(String(rawParams.provider ?? job.params.provider));
+      if (!provider) return reply.code(400).send({ error: '未知的生成引擎' });
       try {
-        nextParams = parseParams(body.params as Record<string, unknown>);
+        nextParams = parseParams(rawParams, provider);
       } catch (err) {
         if (err instanceof ValidationError) return reply.code(400).send({ error: err.message });
         throw err;
@@ -247,22 +306,59 @@ export async function registerApiRoutes(app: FastifyInstance, deps: ApiDeps): Pr
       .send(preview.buffer);
   });
 
-  app.get('/api/health', async () => ({
-    ok: true,
-    baseUrl: config.baseUrl,
-    apiKeyConfigured: Boolean(resolveApiKey(workspace)),
-    maxConcurrency: config.maxConcurrency,
-  }));
+  app.get('/api/health', async () => {
+    const providers = listProviders().map((provider) => ({
+      id: provider.info.id,
+      label: provider.info.label,
+      apiKeyConfigured: Boolean(providerCredential(workspace, provider.info.id).apiKey),
+    }));
+    const active = activeProvider(workspace);
+    const activeInfo = getProvider(active);
+    return {
+      ok: true,
+      provider: active,
+      baseUrl: providerCredential(workspace, active).baseUrl,
+      apiKeyConfigured: Boolean(providerCredential(workspace, active).apiKey),
+      label: activeInfo.info.label,
+      providers,
+      maxConcurrency: config.maxConcurrency,
+    };
+  });
+}
+
+// ===== 汇总 =====
+
+function providerSummary(workspace: Workspace, provider: GenerationProvider) {
+  const { apiKey, baseUrl, source } = providerCredential(workspace, provider.info.id);
+  return {
+    id: provider.info.id,
+    label: provider.info.label,
+    vendor: provider.info.vendor,
+    docsUrl: provider.info.docsUrl,
+    keyHint: provider.info.keyHint,
+    keyPrefix: provider.info.keyPrefix,
+    envKeyName: provider.info.envKeyName,
+    envBaseUrlName: provider.info.envBaseUrlName,
+    defaultBaseUrl: provider.info.defaultBaseUrl,
+    baseUrl,
+    capabilities: provider.info.capabilities,
+    models: provider.info.models,
+    defaults: provider.info.defaults,
+    apiKeyConfigured: Boolean(apiKey),
+    apiKeyMasked: maskApiKey(apiKey),
+    apiKeySource: source,
+  };
 }
 
 function settingsSummary(workspace: Workspace) {
-  const key = resolveApiKey(workspace);
+  const active = activeProvider(workspace);
+  const providers = listProviders().map((provider) => providerSummary(workspace, provider));
+  const activeSummary = providers.find((item) => item.id === active) ?? providers[0]!;
   return {
-    apiKeyConfigured: Boolean(key),
-    apiKeyMasked: maskApiKey(key),
-    apiKeySource: apiKeySource(workspace),
-    baseUrl: config.baseUrl,
-    defaults: DEFAULT_PARAMS,
+    activeProvider: active,
+    /** 当前引擎的摘要（前端表单直接用它） */
+    active: activeSummary,
+    providers,
     limits: {
       faceCount: { min: FACE_COUNT_MIN, max: FACE_COUNT_MAX, default: FACE_COUNT_DEFAULT },
       promptMaxChars: PROMPT_MAX_CHARS,
@@ -270,8 +366,9 @@ function settingsSummary(workspace: Workspace) {
       maxConcurrency: config.maxConcurrency,
       pollIntervalMs: config.pollIntervalMs,
     },
+    defaults: providerDefaults(active) ?? DEFAULT_PARAMS,
     enums: {
-      modelVersions: MODEL_VERSIONS,
+      providers: PROVIDER_IDS,
       generateTypes: GENERATE_TYPES,
       polygonTypes: POLYGON_TYPES,
       resultFormats: RESULT_FORMATS,
@@ -279,4 +376,14 @@ function settingsSummary(workspace: Workspace) {
       viewTypes31Only: VIEW_TYPES_31_ONLY,
     },
   };
+}
+
+// ===== 请求里解析引擎 =====
+
+function getProviderOptional(id: string | null | undefined): GenerationProvider | null {
+  try {
+    return getProvider(id);
+  } catch {
+    return null;
+  }
 }

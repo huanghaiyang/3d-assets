@@ -2,7 +2,7 @@
   "name": "hunyuan3d-workbench",
   "private": true,
   "version": "1.0.0",
-  "description": "Tripo3D 风格的混元生3D 工作台（Node.js + TypeScript + Vue 3）",
+  "description": "多引擎 3D 生成工作台（默认混元生3D，可切 Tripo3D / Meshy；Node.js + TypeScript + Vue 3）",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -18,6 +18,7 @@
     "start": "node apps/api/dist/index.js",
     "typecheck": "npm run typecheck -w @h3d/api && npm run typecheck -w @h3d/web",
     "test": "npm run test:fuzzy -w @h3d/web",
+    "test:providers": "npm run test:providers -w @h3d/api",
     "check:secrets": "node scripts/check-secrets.mjs",
     "prepare": "git config core.hooksPath .githooks || echo \"[prepare] 跳过 git hooks 配置\"",
     "smoke": "npm run smoke -w @h3d/api"

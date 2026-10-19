@@ -21,9 +21,11 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 /** 允许入库的模板文件 */
 const ALLOWED = new Set(['.env.example']);
 
-/** 真实密钥形如 sk-<48 位>；占位符 sk-xxxxxxxxxxxxxxxx 只有 16 位，不会误报 */
+/** 真实密钥形如 sk-<48 位> / tsk_<...> / msy_<...>；占位符 sk-xxxxxxxxxxxxxxxx 只有 16 位，不会误报 */
 const SECRET_PATTERNS = [
   { name: 'Hunyuan/OpenAI 风格 API Key', re: /sk-[A-Za-z0-9]{24,}/ },
+  { name: 'Tripo3D API Key', re: /tsk_[A-Za-z0-9]{20,}/ },
+  { name: 'Meshy API Key', re: /msy_[A-Za-z0-9]{20,}/ },
   { name: '腾讯云 SecretId', re: /AKID[A-Za-z0-9]{20,}/ },
   { name: '私钥块', re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
 ];

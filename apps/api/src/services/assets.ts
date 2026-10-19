@@ -4,9 +4,8 @@ import AdmZip from 'adm-zip';
 import { createLogger } from '../lib/logger.js';
 import { extensionOf, safeFileName } from '../lib/ids.js';
 import { storageDir } from '../lib/paths.js';
-import type { Hunyuan3DClient } from '../hunyuan/client.js';
-import type { File3D } from '../hunyuan/types.js';
 import type { Asset, AssetFile, AssetFileEntry, FileRole, GenerationParams, InputMode } from '../store/types.js';
+import type { Downloader, ProviderFile } from '../providers/types.js';
 
 const log = createLogger('assets');
 
@@ -52,13 +51,14 @@ export function sanitizeEntryPath(entryName: string): string {
 }
 
 export interface MaterializeOptions {
-  client: Hunyuan3DClient;
+  /** 下载远端结果文件（由当前生成引擎实现，可能是带鉴权的请求） */
+  download: Downloader;
   jobId: string;
   name: string;
   prompt: string;
   mode: InputMode;
   params: GenerationParams;
-  files: File3D[];
+  files: ProviderFile[];
   creditConsumed: number | null;
   creditDetails: string | null;
 }
@@ -68,7 +68,7 @@ export interface MaterializeOptions {
  * OBJ 等格式通常以 zip 打包返回，这里自动解包并识别主模型/材质/贴图。
  */
 export async function materializeAsset(options: MaterializeOptions): Promise<Asset> {
-  const { client, jobId } = options;
+  const { download, jobId } = options;
   const assetDir = path.join(storageDir, jobId);
   await fs.rm(assetDir, { recursive: true, force: true });
   await fs.mkdir(assetDir, { recursive: true });
@@ -79,11 +79,11 @@ export async function materializeAsset(options: MaterializeOptions): Promise<Ass
   let previewRemoteUrl: string | null = null;
 
   for (const remote of options.files) {
-    if (!remote.Url) continue;
-    const type = (remote.Type ?? extensionOf(remote.Url) ?? 'FILE').toUpperCase();
+    if (!remote.url) continue;
+    const type = (remote.type || extensionOf(remote.url) || 'FILE').toUpperCase();
     const typeSlug = safeFileName(type.toLowerCase(), 'model');
     try {
-      const { buffer } = await client.download(remote.Url);
+      const { buffer } = await download(remote.url);
       bytes += buffer.length;
 
       if (isZip(buffer)) {
@@ -109,7 +109,7 @@ export async function materializeAsset(options: MaterializeOptions): Promise<Ass
         const material = entries.find((entry) => entry.role === 'material') ?? null;
         stored.push({
           type,
-          sourceUrl: remote.Url,
+          sourceUrl: remote.url,
           storedName: typeSlug,
           size: buffer.length,
           wasZip: true,
@@ -119,7 +119,7 @@ export async function materializeAsset(options: MaterializeOptions): Promise<Ass
           materialUrl: material?.url ?? null,
         });
       } else {
-        const ext = extensionOf(remote.Url) || 'bin';
+        const ext = extensionOf(remote.url) || 'bin';
         const name = `${typeSlug}.${ext}`;
         await fs.writeFile(path.join(assetDir, name), buffer);
         const entry: AssetFileEntry = {
@@ -130,7 +130,7 @@ export async function materializeAsset(options: MaterializeOptions): Promise<Ass
         };
         stored.push({
           type,
-          sourceUrl: remote.Url,
+          sourceUrl: remote.url,
           storedName: name,
           size: buffer.length,
           wasZip: false,
@@ -141,17 +141,18 @@ export async function materializeAsset(options: MaterializeOptions): Promise<Ass
         });
       }
     } catch (err) {
-      log.warn(`下载结果文件失败 ${remote.Url}: ${(err as Error).message}`);
+      log.warn(`下载结果文件失败 ${remote.url}: ${(err as Error).message}`);
     }
   }
 
   // 缩略图：优先使用接口返回的预览图
   for (const remote of options.files) {
-    if (!remote.PreviewImageUrl) continue;
-    previewRemoteUrl = remote.PreviewImageUrl;
+    const previewUrl = remote.previewImageUrl;
+    if (!previewUrl) continue;
+    previewRemoteUrl = previewUrl;
     try {
-      const { buffer, contentType } = await client.download(remote.PreviewImageUrl);
-      const ext = IMAGE_CONTENT_TYPES[contentType.split(';')[0]?.trim() ?? ''] ?? (extensionOf(remote.PreviewImageUrl) || 'png');
+      const { buffer, contentType } = await download(previewUrl);
+      const ext = IMAGE_CONTENT_TYPES[contentType.split(';')[0]?.trim() ?? ''] ?? (extensionOf(previewUrl) || 'png');
       const name = `thumb.${ext}`;
       await fs.writeFile(path.join(assetDir, name), buffer);
       bytes += buffer.length;

@@ -2,6 +2,8 @@ import type {
   CommitUploadResponse,
   CreateJobBody,
   Job,
+  ProviderId,
+  ProviderSummary,
   SettingsSummary,
   StateResponse,
   UploadInfo,
@@ -50,13 +52,37 @@ function safeParse(text: string): unknown {
   }
 }
 
+function providerQuery(provider?: ProviderId | null): string {
+  return provider ? `?provider=${encodeURIComponent(provider)}` : '';
+}
+
 export const api = {
   state: (limit = 300) => request<StateResponse>(`/api/state?limit=${limit}`),
   settings: () => request<SettingsSummary>('/api/settings'),
-  saveApiKey: (apiKey: string) =>
-    request<SettingsSummary>('/api/settings/api-key', { method: 'PUT', body: JSON.stringify({ apiKey }) }),
-  clearApiKey: () => request<SettingsSummary>('/api/settings/api-key', { method: 'DELETE' }),
-  verifyApiKey: () => request<VerifyResponse>('/api/settings/verify', { method: 'POST', body: '{}' }),
+  providers: () => request<{ providers: ProviderSummary[] }>('/api/providers'),
+
+  saveApiKey: (provider: ProviderId, apiKey: string) =>
+    request<SettingsSummary>(`/api/settings/api-key${providerQuery(provider)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ apiKey, provider }),
+    }),
+  clearApiKey: (provider: ProviderId) =>
+    request<SettingsSummary>(`/api/settings/api-key${providerQuery(provider)}`, { method: 'DELETE' }),
+  saveBaseUrl: (provider: ProviderId, baseUrl: string) =>
+    request<SettingsSummary>(`/api/settings/base-url${providerQuery(provider)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ baseUrl, provider }),
+    }),
+  setActiveProvider: (provider: ProviderId) =>
+    request<SettingsSummary>('/api/settings/active-provider', {
+      method: 'PUT',
+      body: JSON.stringify({ provider }),
+    }),
+  verifyApiKey: (provider?: ProviderId | null) =>
+    request<VerifyResponse>(`/api/settings/verify${providerQuery(provider)}`, {
+      method: 'POST',
+      body: JSON.stringify(provider ? { provider } : {}),
+    }),
 
   createJob: (body: CreateJobBody) => request<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(body) }),
   retryJob: (id: string) =>

@@ -298,6 +298,7 @@ async function buildAsset(
     },
     remoteJobId: null,
     remoteStatus: null,
+    providerMeta: {},
     requestId: null,
     error: null,
     errorCode: null,

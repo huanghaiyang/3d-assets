@@ -10,7 +10,6 @@ import { registerFileRoutes } from './routes/files.js';
 import { registerLibraryRoutes } from './routes/library.js';
 import { sweepStorage } from './services/assets.js';
 import { GenerationWorker } from './services/worker.js';
-import { resolveApiKey } from './services/settings.js';
 import { Workspace } from './store/workspace.js';
 
 const log = createLogger('app');
@@ -29,10 +28,8 @@ export async function buildApp(): Promise<AppContext> {
   if (swept > 0) log.info(`已清理 ${swept} 个残留素材目录`);
 
   const worker = new GenerationWorker(workspace, {
-    baseUrl: config.baseUrl,
     pollIntervalMs: config.pollIntervalMs,
     maxConcurrency: config.maxConcurrency,
-    resolveApiKey: () => resolveApiKey(workspace),
   });
 
   const app = Fastify({

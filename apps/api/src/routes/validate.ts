@@ -1,22 +1,24 @@
+import { getProvider } from '../providers/registry.js';
+import { ProviderError, type GenerationProvider } from '../providers/types.js';
 import type { JobPayload } from '../services/payload.js';
-import type { GenerationParams, InputMode, InputSummary } from '../store/types.js';
-import { DEFAULT_PARAMS as DEFAULT_GENERATION_PARAMS } from '../store/types.js';
 import {
+  DEFAULT_PARAMS as DEFAULT_GENERATION_PARAMS,
   FACE_COUNT_MAX,
   FACE_COUNT_MIN,
   GENERATE_TYPES,
   IMAGE_BASE64_MAX_BYTES,
-  MODEL_VERSIONS,
   POLYGON_TYPES,
   PROMPT_MAX_CHARS,
   RESULT_FORMATS,
   VIEW_TYPES,
   type GenerateType,
-  type ModelVersion,
+  type GenerationParams,
+  type InputMode,
+  type InputSummary,
   type PolygonType,
   type ResultFormat,
   type ViewType,
-} from '../hunyuan/types.js';
+} from '../store/types.js';
 
 export class ValidationError extends Error {
   constructor(message: string) {
@@ -58,6 +60,17 @@ function pickEnum<T extends string>(value: unknown, allowed: readonly T[], fallb
   return text as T;
 }
 
+/** 从请求体里解析出目标引擎（params.provider 或顶层 provider） */
+export function resolveProviderFromBody(body: unknown): GenerationProvider {
+  const raw = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>;
+  const rawParams = (typeof raw.params === 'object' && raw.params !== null ? raw.params : {}) as Record<
+    string,
+    unknown
+  >;
+  const id = rawParams.provider ?? raw.provider;
+  return getProvider(typeof id === 'string' ? id : undefined);
+}
+
 export interface CreateJobBody {
   mode: InputMode;
   prompt: string;
@@ -66,29 +79,42 @@ export interface CreateJobBody {
   previewDataUrl: string | null;
   views: { viewType: ViewType; base64: string; name: string }[];
   params: GenerationParams;
+  provider: GenerationProvider;
 }
 
 export const DEFAULT_PARAMS: GenerationParams = DEFAULT_GENERATION_PARAMS;
 
 /** 解析并校验生成参数（供创建任务与修改未提交任务共用） */
-export function parseParams(rawParams: Record<string, unknown>): GenerationParams {
-  const model = pickEnum<ModelVersion>(rawParams.model, MODEL_VERSIONS, DEFAULT_PARAMS.model, '模型版本');
-  const generateType = pickEnum<GenerateType>(
-    rawParams.generateType,
-    GENERATE_TYPES,
-    DEFAULT_PARAMS.generateType,
-    '生成类型',
-  );
-  const polygonType = pickEnum<PolygonType>(rawParams.polygonType, POLYGON_TYPES, DEFAULT_PARAMS.polygonType, '多边形类型');
+export function parseParams(rawParams: Record<string, unknown>, provider: GenerationProvider): GenerationParams {
+  const caps = provider.info.capabilities;
+  const defaults = provider.info.defaults;
 
-  let resultFormat: ResultFormat | null = DEFAULT_PARAMS.resultFormat;
+  const modelRaw = rawParams.model;
+  let model = defaults.model;
+  if (modelRaw !== undefined && modelRaw !== null) {
+    model = asString(modelRaw, '模型版本').trim().slice(0, 64);
+    if (!model) model = defaults.model;
+  }
+
+  const supportedTypes = caps.generateTypes.length > 0 ? caps.generateTypes : GENERATE_TYPES;
+  const generateType = pickEnum<GenerateType>(rawParams.generateType, supportedTypes, defaults.generateType, '生成类型');
+
+  const polygonType = pickEnum<PolygonType>(rawParams.polygonType, POLYGON_TYPES, defaults.polygonType, '多边形类型');
+
+  const supportedFormats: readonly ResultFormat[] = caps.formats.length > 0 ? caps.formats : RESULT_FORMATS;
+  let resultFormat: ResultFormat | null = defaults.resultFormat;
   if (rawParams.resultFormat === null || rawParams.resultFormat === 'default' || rawParams.resultFormat === '') {
     resultFormat = null;
   } else if (rawParams.resultFormat !== undefined) {
-    resultFormat = pickEnum<ResultFormat>(rawParams.resultFormat, RESULT_FORMATS, 'GLB', '输出格式');
+    resultFormat = pickEnum<ResultFormat>(rawParams.resultFormat, supportedFormats, 'GLB', '输出格式');
+    if (!supportedFormats.includes(resultFormat)) {
+      throw new ValidationError(
+        `${provider.info.label}只支持 ${supportedFormats.join(' / ')} 输出，当前选择 ${resultFormat}`,
+      );
+    }
   }
 
-  let faceCount = DEFAULT_PARAMS.faceCount;
+  let faceCount = defaults.faceCount;
   if (rawParams.faceCount !== undefined && rawParams.faceCount !== null) {
     const parsed = Number(rawParams.faceCount);
     if (!Number.isFinite(parsed)) throw new ValidationError('面数必须是数字');
@@ -98,38 +124,60 @@ export function parseParams(rawParams: Record<string, unknown>): GenerationParam
     faceCount = Math.round(parsed);
   }
 
-  let enablePbr = DEFAULT_PARAMS.enablePbr;
+  let enablePbr = defaults.enablePbr;
   if (rawParams.enablePbr !== undefined) {
     if (typeof rawParams.enablePbr !== 'boolean') throw new ValidationError('enablePbr 必须是布尔值');
     enablePbr = rawParams.enablePbr;
   }
 
-  // 跨字段约束（与接口校验一致，提前在本地拦截）
-  if (model === '3.1' && (generateType === 'LowPoly' || generateType === 'Sketch')) {
-    throw new ValidationError('模型版本 3.1 不支持 LowPoly（智能拓扑）与 Sketch（草图）模式，请改用 3.0 或切换生成类型。');
-  }
-  if (generateType === 'Geometry' && enablePbr) {
-    enablePbr = false; // 白模模式 PBR 不生效，静默纠正而不是报错
-  }
-
-  return {
+  let params: GenerationParams = {
+    provider: provider.info.id,
     model,
     generateType,
-    faceCount: generateType === 'LowPoly' ? DEFAULT_PARAMS.faceCount : faceCount,
+    faceCount,
     enablePbr,
     polygonType,
     resultFormat,
   };
+
+  // 引擎专属的裁剪与跨字段校验（例如混元 3.1 不支持低模/草图、Tripo 面数上限）
+  if (provider.normalizeParams) {
+    try {
+      params = provider.normalizeParams(params);
+    } catch (err) {
+      if (err instanceof ProviderError) throw new ValidationError(err.message);
+      throw err;
+    }
+  }
+  return params;
 }
 
 /** 解析并校验创建任务的请求体 */
 export function parseCreateJobBody(body: unknown): CreateJobBody {
   if (typeof body !== 'object' || body === null) throw new ValidationError('请求体必须是 JSON 对象');
   const raw = body as Record<string, unknown>;
+  const provider = resolveProviderFromBody(raw);
+  const caps = provider.info.capabilities;
 
-  const mode = pickEnum<InputMode>(raw.mode, ['text', 'image', 'multiview'], 'text', 'mode');
+  const mode = pickEnum<Exclude<InputMode, 'upload'>>(
+    raw.mode,
+    caps.modes,
+    caps.modes.includes('text') ? 'text' : caps.modes[0]!,
+    '输入模式',
+  );
+  if (!caps.modes.includes(mode)) {
+    throw new ValidationError(`${provider.info.label}不支持「${mode}」输入模式，请切换引擎或输入方式`);
+  }
+
   const rawParams = (typeof raw.params === 'object' && raw.params !== null ? raw.params : {}) as Record<string, unknown>;
-  const params = parseParams(rawParams);
+  const params = parseParams(rawParams, provider);
+
+  if (mode === 'text' && !caps.modes.includes('text')) {
+    throw new ValidationError(`${provider.info.label}不支持文生3D`);
+  }
+  if (mode === 'multiview' && !caps.multiview) {
+    throw new ValidationError(`${provider.info.label}不支持多视角输入，请改用单张参考图`);
+  }
 
   const prompt = typeof raw.prompt === 'string' ? raw.prompt.trim() : '';
   if (prompt.length > PROMPT_MAX_CHARS) {
@@ -173,7 +221,7 @@ export function parseCreateJobBody(body: unknown): CreateJobBody {
       ? raw.previewDataUrl.slice(0, 400_000)
       : null;
 
-  return { mode, prompt, imageBase64, imageName, previewDataUrl, views, params };
+  return { mode, prompt, imageBase64, imageName, previewDataUrl, views, params, provider };
 }
 
 export function toPayload(body: CreateJobBody): JobPayload {
