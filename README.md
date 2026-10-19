@@ -121,7 +121,7 @@ copy .env.example .env        # Windows
 # 编辑 .env，填入 HUNYUAN3D_API_KEY=sk-xxxxxxxx
 
 # 3. 开发模式（前端 5173 + 后端 8787，已配置代理）
-npm run dev
+npm run dev                   # 打开 http://127.0.0.1:5173
 
 # 4. 生产模式：构建后由后端统一托管前端
 npm run build
@@ -148,9 +148,15 @@ npm start                     # 打开 http://127.0.0.1:8787
 | `HUNYUAN3D_API_KEY` | 空 | 控制台创建的 `sk-` 开头密钥；界面里填写的 Key 优先级更高 |
 | `HUNYUAN3D_BASE_URL` | `https://api.ai3d.cloud.tencent.com` | 接口域名 |
 | `HOST` / `PORT` | `127.0.0.1` / `8787` | 本地服务监听地址 |
+| `WEB_HOST` | `127.0.0.1` | Vite 开发/预览服务器监听地址（在 `apps/web` 侧读取，需用命令行环境变量设置） |
 | `POLL_INTERVAL_MS` | `5000` | 远端任务轮询间隔 |
 | `MAX_CONCURRENCY` | `3` | 本地并发上限（接口默认提供 3 个并发，代码里强制作不超过 3） |
 | `ANIMATION_DIR` | `../CozyVale/assets/mixamo` | 动画预览默认打开的 FBX 文件夹（只读） |
+
+> 开发服务器固定监听 IPv4 回环 `127.0.0.1`：Node 18+ 在 Windows 上把 `localhost` 解析为 `::1`，
+> Vite 默认只绑 `[::1]`，导致 `http://127.0.0.1:5173` 连接被拒。现在 `http://127.0.0.1:5173`
+> 与 `http://localhost:5173` 都可用；需要给局域网/容器访问时用 `WEB_HOST=0.0.0.0 npm run dev`
+> （注意这会把端口暴露到所有网卡）。
 
 ---
 
