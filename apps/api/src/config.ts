@@ -39,7 +39,7 @@ const providerEnv: Record<string, ProviderEnvConfig> = Object.fromEntries(
 
 export const config = {
   host: process.env.HOST ?? '127.0.0.1',
-  port: int(process.env.PORT, 8787),
+  port: int(process.env.PORT, 8788),
   /** 默认生成引擎（可用 .env 的 GENERATION_PROVIDER 覆盖） */
   defaultProvider: ((): ProviderId => {
     const value = text(process.env.GENERATION_PROVIDER);

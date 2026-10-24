@@ -4,6 +4,7 @@ import Icon from '../ui/Icon.vue';
 import AnimationGrid from './AnimationGrid.vue';
 import AnimationViewport from './AnimationViewport.vue';
 import AnimationInfo from './AnimationInfo.vue';
+import AnimationDataDialog from './AnimationDataDialog.vue';
 import FolderPicker from './FolderPicker.vue';
 import { useAnimationStore } from '@/stores/animation';
 
@@ -91,6 +92,8 @@ function labelOf(dir: string): string {
     </div>
 
     <FolderPicker :open="pickerOpen" :start-dir="store.dirs[0] ?? ''" @close="pickerOpen = false" @pick="onPick" />
+
+    <AnimationDataDialog :open="store.dataDialogOpen" @close="store.closeAnimationData()" />
 
     <div class="toasts">
       <TransitionGroup name="toast">

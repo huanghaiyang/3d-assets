@@ -6,6 +6,7 @@ import { TransformControls } from 'three/examples/jsm/controls/TransformControls
 
 import {
   SkeletonOverlay,
+  cleanBoneLabel,
   filterShadowBones,
   type BoneDisplayMode,
   type BoneNode,
@@ -33,6 +34,91 @@ export interface ModelStats {
 export interface LoadResult {
   clips: ClipInfo[];
   stats: ModelStats;
+}
+
+/** 导出的动画数据来源（只记录识别信息，不含绝对路径） */
+export interface AnimationDataSource {
+  name: string;
+  /** 相对所属文件夹的路径 */
+  relative?: string;
+  size?: number;
+  mtime?: number;
+}
+
+/** 关节（骨骼）层级与绑定姿态；只描述动画所需的变换，不含网格/蒙皮 */
+export interface AnimationJointData {
+  name: string;
+  label: string;
+  parent: string | null;
+  depth: number;
+  rest: {
+    position: [number, number, number];
+    rotation: [number, number, number, number];
+    scale: [number, number, number];
+  };
+}
+
+/** 单条动画轨迹：一个关节的一个属性（position / quaternion / scale …） */
+export interface AnimationTrackData {
+  name: string;
+  /** 轨迹对应的关节名；无法匹配骨骼时为 null */
+  joint: string | null;
+  property: string;
+  valueType: string;
+  valueSize: number;
+  keyframes: number;
+  timeRange: [number, number];
+  /** 等间隔采样间隔（秒）；关键帧不足或间隔不均匀时为 null */
+  interval: number | null;
+  interpolation: string;
+  /** 关键帧时间（秒），includeKeyframes=false 时省略 */
+  times?: number[];
+  /** 关键帧数值，includeKeyframes=false 时省略 */
+  values?: number[];
+}
+
+export interface AnimationClipData {
+  name: string;
+  duration: number;
+  /** 从关键帧间隔推断的采样帧率 */
+  fps: number | null;
+  /** 采样间隔（秒），用于计算时间线 */
+  interval: number | null;
+  keyframes: number;
+  tracks: AnimationTrackData[];
+}
+
+/** 模型动画数据：关节 + 轨迹 + 时间线，明确不含蒙皮网格数据 */
+export interface AnimationData {
+  format: 'fbx-animation-data';
+  version: 1;
+  generatedAt: string;
+  source: AnimationDataSource;
+  skeleton: {
+    jointCount: number;
+    joints: AnimationJointData[];
+  };
+  timeline: {
+    clipCount: number;
+    /** 所有片段时长之和（秒） */
+    totalDuration: number;
+    /** 最长片段时长（秒） */
+    longestDuration: number;
+    /** 全模型动画采样帧率（由关键帧间隔推断） */
+    fps: number | null;
+    /** 采样间隔（秒） */
+    interval: number | null;
+  };
+  clips: AnimationClipData[];
+  /** 明确声明没有导出的模型数据类别 */
+  excluded: string[];
+}
+
+export interface AnimationDataOptions {
+  /** 是否写出每个关键帧的时间与数值（默认 true） */
+  includeKeyframes?: boolean;
+  /** 数值保留的小数位（默认 6） */
+  precision?: number;
 }
 
 export interface PlaybackState {
@@ -790,6 +876,127 @@ export class FbxPlayer {
     return this.clips.map((clip) => ({ name: clip.name, duration: clip.duration, tracks: clip.tracks.length }));
   }
 
+  /**
+   * 提取动画数据：关节层级（含绑定姿态）、每个片段的轨迹与时间线。
+   *
+   * 只读取已解析的 AnimationClip 与骨骼，不读取也不导出任何网格几何、
+   * 蒙皮权重、材质或贴图数据。返回纯数据对象，可直接序列化为 JSON。
+   */
+  extractAnimationData(source: AnimationDataSource, options: AnimationDataOptions = {}): AnimationData | null {
+    if (!this.skeleton) return null;
+
+    const includeKeyframes = options.includeKeyframes ?? true;
+    const precision = Math.min(9, Math.max(0, Math.round(options.precision ?? 6)));
+    const round = (value: number): number => roundNumber(value, precision);
+
+    const bones = this.skeleton.flatBones;
+    const boneById = new Map(bones.map((bone) => [bone.id, bone]));
+    // 轨道名里用的是 sanitizeNodeName 之后的名字，两种都登记以便匹配
+    const boneByName = new Map<string, FlatBone>();
+    for (const bone of bones) {
+      boneByName.set(bone.name, bone);
+      const sanitized = THREE.PropertyBinding.sanitizeNodeName(bone.name);
+      if (!boneByName.has(sanitized)) boneByName.set(sanitized, bone);
+    }
+
+    const joints: AnimationJointData[] = bones.map((bone) => {
+      const rest = this.restPose.get(bone.id);
+      const current = this.bonesById.get(bone.id);
+      const position = rest?.p ?? current?.position;
+      const rotation = rest?.q ?? current?.quaternion;
+      const scale = rest?.s ?? current?.scale;
+      return {
+        name: bone.name,
+        label: bone.label,
+        parent: bone.parentId ? (boneById.get(bone.parentId)?.name ?? null) : null,
+        depth: bone.depth,
+        rest: {
+          position: [
+            round(position?.x ?? 0),
+            round(position?.y ?? 0),
+            round(position?.z ?? 0),
+          ],
+          rotation: [
+            round(rotation?.x ?? 0),
+            round(rotation?.y ?? 0),
+            round(rotation?.z ?? 0),
+            round(rotation?.w ?? 1),
+          ],
+          scale: [round(scale?.x ?? 1), round(scale?.y ?? 1), round(scale?.z ?? 1)],
+        },
+      };
+    });
+
+    const clips: AnimationClipData[] = this.clips.map((clip) => {
+      let interval: number | null = null;
+      const intervals: number[] = [];
+      let keyframes = 0;
+
+      const tracks: AnimationTrackData[] = clip.tracks.map((track) => {
+        const times = track.times;
+        const count = times.length;
+        keyframes += count;
+
+        const dot = track.name.lastIndexOf('.');
+        const nodeName = dot > 0 ? track.name.slice(0, dot) : track.name;
+        const property = dot > 0 ? track.name.slice(dot + 1) : '';
+        const joint = boneByName.get(nodeName) ?? boneByName.get(cleanBoneLabel(nodeName)) ?? null;
+
+        const trackInterval = trackSampleInterval(times);
+        if (trackInterval !== null) intervals.push(trackInterval);
+
+        const data: AnimationTrackData = {
+          name: track.name,
+          joint: joint?.name ?? null,
+          property,
+          valueType: track.ValueTypeName ?? '',
+          valueSize: track.getValueSize(),
+          keyframes: count,
+          timeRange: count > 0 ? [round(times[0]!), round(times[count - 1]!)] : [0, 0],
+          interval: trackInterval === null ? null : round(trackInterval),
+          interpolation: interpolationName(track.getInterpolation()),
+        };
+        if (includeKeyframes) {
+          data.times = toNumberArray(times, precision);
+          data.values = toNumberArray(track.values, precision);
+        }
+        return data;
+      });
+
+      interval = median(intervals);
+      return {
+        name: clip.name,
+        duration: round(clip.duration),
+        fps: interval === null ? null : roundNumber(1 / interval, 3),
+        interval,
+        keyframes,
+        tracks,
+      };
+    });
+
+    const clipIntervals = clips
+      .map((clip) => clip.interval)
+      .filter((value): value is number => value !== null);
+    const interval = median(clipIntervals);
+
+    return {
+      format: 'fbx-animation-data',
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      source,
+      skeleton: { jointCount: joints.length, joints },
+      timeline: {
+        clipCount: clips.length,
+        totalDuration: round(clips.reduce((sum, clip) => sum + clip.duration, 0)),
+        longestDuration: clips.reduce((max, clip) => Math.max(max, clip.duration), 0),
+        fps: interval === null ? null : roundNumber(1 / interval, 3),
+        interval,
+      },
+      clips,
+      excluded: ['mesh', 'skin', 'material', 'texture'],
+    };
+  }
+
   // ===== 骨骼 =====
 
   get boneTree(): BoneNode[] {
@@ -1200,6 +1407,48 @@ function stripRootMotion(clip: THREE.AnimationClip): THREE.AnimationClip {
     }
   }
   return copy;
+}
+
+function roundNumber(value: number, precision: number): number {
+  if (!Number.isFinite(value)) return 0;
+  const factor = 10 ** precision;
+  const rounded = Math.round(value * factor) / factor;
+  return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+function toNumberArray(values: ArrayLike<number>, precision: number): number[] {
+  const out = new Array<number>(values.length);
+  for (let index = 0; index < values.length; index += 1) out[index] = roundNumber(values[index]!, precision);
+  return out;
+}
+
+function median(values: readonly number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)]!;
+}
+
+/**
+ * 关键帧的采样间隔：只有间隔基本均匀时才返回（允许 1% 误差）。
+ * 非均匀轨迹（例如手工改过个别关键帧）返回 null，避免给出错误帧率。
+ */
+function trackSampleInterval(times: ArrayLike<number>): number | null {
+  if (times.length < 2) return null;
+  const diffs: number[] = [];
+  for (let index = 1; index < times.length; index += 1) {
+    const diff = times[index]! - times[index - 1]!;
+    if (diff > 1e-6) diffs.push(diff);
+  }
+  const base = median(diffs);
+  if (base === null) return null;
+  const tolerance = base * 0.01 + 1e-9;
+  return diffs.every((diff) => Math.abs(diff - base) <= tolerance) ? base : null;
+}
+
+function interpolationName(mode: number): string {
+  if (mode === THREE.InterpolateDiscrete) return 'step';
+  if (mode === THREE.InterpolateSmooth) return 'smooth';
+  return 'linear';
 }
 
 function disposeObject(root: THREE.Object3D): void {

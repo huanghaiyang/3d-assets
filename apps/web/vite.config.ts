@@ -2,7 +2,7 @@ import { fileURLToPath, URL } from 'node:url';
 import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
 
-const API_TARGET = process.env.API_TARGET ?? 'http://127.0.0.1:8787';
+const API_TARGET = process.env.API_TARGET ?? 'http://127.0.0.1:8788';
 
 // 开发服务器监听地址。默认固定为 IPv4 回环 127.0.0.1：
 // Node 18+ 在 Windows 上把 `localhost` 解析成 ::1，Vite 默认只监听 [::1]，

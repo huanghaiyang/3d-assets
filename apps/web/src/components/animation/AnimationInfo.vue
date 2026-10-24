@@ -104,6 +104,20 @@ function clipDuration(seconds: number): string {
         </section>
 
         <section class="block">
+          <span class="field-label">动画数据</span>
+          <p class="data-hint">只提取关节层级、轨迹与时间线，不含网格蒙皮数据。</p>
+          <button
+            class="btn data-btn"
+            type="button"
+            :disabled="!file || store.viewLoading"
+            @click="store.openAnimationData()"
+          >
+            <Icon name="text" :size="13" />
+            提取动画数据
+          </button>
+        </section>
+
+        <section class="block">
           <span class="field-label">播放选项</span>
           <label class="row">
             <span>原地播放<small>去掉髋部水平位移，便于观察循环动作</small></span>
@@ -302,6 +316,17 @@ function clipDuration(seconds: number): string {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 11.5px;
+}
+
+.data-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.data-btn {
+  align-self: flex-start;
 }
 
 .row {

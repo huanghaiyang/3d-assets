@@ -1,8 +1,9 @@
-import { computed, ref, watch } from 'vue';
+import { computed, ref, shallowRef, watch } from 'vue';
 import { defineStore } from 'pinia';
 import { animationApi, type AnimationFile, type AnimationInfoResponse } from '@/api/animation';
 import {
   FbxPlayer,
+  type AnimationData,
   type BoneTransformState,
   type ClipInfo,
   type ModelStats,
@@ -57,6 +58,12 @@ export const useAnimationStore = defineStore('animation', () => {
   const viewLoading = ref(false);
   const viewError = ref<string | null>(null);
   const toasts = ref<AnimationToast[]>([]);
+
+  // 动画数据提取与 JSON 预览
+  const dataDialogOpen = ref(false);
+  const dataExtracting = ref(false);
+  const dataError = ref<string | null>(null);
+  const extractedData = shallowRef<AnimationData | null>(null);
 
   // 骨骼
   const showSkeleton = ref(false);
@@ -305,6 +312,7 @@ export const useAnimationStore = defineStore('animation', () => {
 
   async function select(file: AnimationFile): Promise<void> {
     if (!player) return;
+    closeAnimationData();
     selectedPath.value = file.path;
     viewLoading.value = true;
     viewError.value = null;
@@ -392,6 +400,48 @@ export const useAnimationStore = defineStore('animation', () => {
 
   function resetView(): void {
     player?.resetView();
+  }
+
+  // ===== 动画数据提取（关节 + 轨迹 + 时间线，不含蒙皮数据） =====
+
+  /**
+   * 提取当前模型的动画数据并打开 JSON 预览。
+   * 只读取已解析的 AnimationClip 与骨骼，不包含网格几何、蒙皮权重、材质或贴图。
+   */
+  function openAnimationData(): void {
+    const file = selectedFile.value;
+    if (!player || !file) {
+      toast('error', '请先选择一个动画');
+      return;
+    }
+    dataDialogOpen.value = true;
+    dataExtracting.value = true;
+    dataError.value = null;
+    extractedData.value = null;
+    // 提取是同步的；放到下一帧执行，让弹窗的加载状态先渲染出来
+    window.setTimeout(() => {
+      try {
+        extractedData.value =
+          player?.extractAnimationData({
+            name: file.name,
+            relative: file.relative,
+            size: file.size,
+            mtime: file.mtime,
+          }) ?? null;
+        if (!extractedData.value) dataError.value = '模型尚未加载完成，请稍后重试';
+      } catch (err) {
+        dataError.value = (err as Error).message;
+      } finally {
+        dataExtracting.value = false;
+      }
+    }, 16);
+  }
+
+  function closeAnimationData(): void {
+    dataDialogOpen.value = false;
+    dataExtracting.value = false;
+    dataError.value = null;
+    extractedData.value = null;
   }
 
   // ===== 骨骼 =====
@@ -664,6 +714,12 @@ export const useAnimationStore = defineStore('animation', () => {
     viewLoading,
     viewError,
     toasts,
+    dataDialogOpen,
+    dataExtracting,
+    dataError,
+    extractedData,
+    openAnimationData,
+    closeAnimationData,
     showSkeleton,
     boneDisplayMode,
     boneTree,

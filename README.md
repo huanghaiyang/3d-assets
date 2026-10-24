@@ -131,12 +131,12 @@ copy .env.example .env        # Windows
 # 编辑 .env：默认引擎填 HUNYUAN3D_API_KEY=sk-xxxxxxxx；
 # 要用 Tripo3D / Meshy 时再补 TRIPO3D_API_KEY=tsk_xxx / MESHY_API_KEY=msy_xxx
 
-# 3. 开发模式（前端 5173 + 后端 8787，已配置代理）
+# 3. 开发模式（前端 5173 + 后端 8788，已配置代理）
 npm run dev                   # 打开 http://127.0.0.1:5173
 
 # 4. 生产模式：构建后由后端统一托管前端
 npm run build
-npm start                     # 打开 http://127.0.0.1:8787
+npm start                     # 打开 http://127.0.0.1:8788
 ```
 
 常用脚本：
@@ -167,7 +167,7 @@ npm start                     # 打开 http://127.0.0.1:8787
 | `MESHY_API_KEY` | 空 | Meshy 的 `msy_` 密钥 |
 | `MESHY_BASE_URL` | `https://api.meshy.ai/openapi/v2` | Meshy 接口域名 |
 | `GENERATION_PROVIDER` | `hunyuan3d` | 服务端默认引擎（`hunyuan3d` / `tripo3d` / `meshy`） |
-| `HOST` / `PORT` | `127.0.0.1` / `8787` | 本地服务监听地址 |
+| `HOST` / `PORT` | `127.0.0.1` / `8788` | 本地服务监听地址 |
 | `WEB_HOST` | `127.0.0.1` | Vite 开发/预览服务器监听地址（在 `apps/web` 侧读取，需用命令行环境变量设置） |
 | `POLL_INTERVAL_MS` | `5000` | 远端任务轮询间隔 |
 | `MAX_CONCURRENCY` | `3` | 本地并发上限（接口默认提供 3 个并发，代码里强制作不超过 3） |
