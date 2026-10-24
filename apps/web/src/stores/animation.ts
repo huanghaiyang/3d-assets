@@ -711,6 +711,32 @@ export const useAnimationStore = defineStore('animation', () => {
     }
   }
 
+  /** 把外部拿到的动画数据（已解析为对象）直接绑定到当前新建动画（供 kimodo 导入使用） */
+  async function applyImportedData(data: unknown, name = 'kimodo 动画'): Promise<void> {
+    if (!player || !newAnimationMode.value) {
+      toast('error', '请先新建动画');
+      return;
+    }
+    if (!isAnimationData(data)) {
+      throw new Error('不是有效的动画数据（需包含 format=fbx-animation-data、version=1 与 clips）');
+    }
+    const clips = player.applyAnimationData(data);
+    const trackCount = data.clips.reduce((sum, clip) => sum + clip.tracks.length, 0);
+    const summary = { name, clipCount: clips.length, trackCount };
+    const activeId = activeNewAnimationId.value;
+    if (activeId) {
+      updateProject(activeId, { data, imported: summary, dirty: true, hasData: true });
+    }
+    selectedClips.value = clips;
+    activeClipIndex.value = 0;
+    currentTime.value = 0;
+    duration.value = clips[0]?.duration ?? 0;
+    playing.value = true;
+    importedAnimation.value = summary;
+    player.resetView();
+    toast('success', `已绑定 kimodo 动画：${clips.length} 个片段、${trackCount} 条轨迹`);
+  }
+
   /** 把当前新建动画保存到服务端（写入项目自己的数据目录，不碰 FBX 源文件夹） */
   async function saveNewAnimation(): Promise<void> {
     const project = activeNewAnimation.value;
@@ -1068,6 +1094,7 @@ export const useAnimationStore = defineStore('animation', () => {
     exitNewAnimation,
     deleteNewAnimation,
     importAnimationJson,
+    applyImportedData,
     saveNewAnimation,
     loadProjects,
     showSkeleton,

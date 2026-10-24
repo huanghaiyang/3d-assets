@@ -6,6 +6,7 @@ import AnimationViewport from './AnimationViewport.vue';
 import AnimationInfo from './AnimationInfo.vue';
 import AnimationDataDialog from './AnimationDataDialog.vue';
 import FolderPicker from './FolderPicker.vue';
+import KimodoPanel from './KimodoPanel.vue';
 import { useAnimationStore } from '@/stores/animation';
 
 const store = useAnimationStore();
@@ -93,6 +94,8 @@ function labelOf(dir: string): string {
         </span>
         <span class="chip">{{ store.files.length }} 个 FBX</span>
       </div>
+
+      <KimodoPanel />
 
       <div class="columns">
         <AnimationGrid />
