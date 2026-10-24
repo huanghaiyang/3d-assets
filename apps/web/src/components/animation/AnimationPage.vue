@@ -54,6 +54,16 @@ function labelOf(dir: string): string {
           <Icon name="refresh" :size="13" :class="{ spin: store.loading }" />
           重新扫描
         </button>
+        <button
+          class="btn"
+          type="button"
+          :disabled="store.viewLoading"
+          title="以动画库中的模型新建动画：去掉自带动画，只保留模型与绑定姿态，可导入动画 JSON 并保存"
+          @click="store.createNewAnimation()"
+        >
+          <Icon name="plus" :size="13" />
+          新建动画
+        </button>
 
         <div class="chips">
           <span

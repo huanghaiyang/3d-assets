@@ -14,9 +14,10 @@ onMounted(() => {
   // 底部是播放控制条（约 76px 高），轴向指示器抬到它上方，避免被盖住
   player = new FbxPlayer(hostRef.value, { axisIndicatorBottom: 100 });
   store.attachPlayer(player);
-  // 自动加载已记录的文件夹（reload 内部会选中并预览第一个动画）
+  // 自动加载已记录的文件夹与已保存的新建动画（reload 内部会选中并预览第一个动画）
   void (async () => {
     await store.loadInfo();
+    await store.loadProjects();
     await store.reload();
   })();
 });
@@ -241,7 +242,21 @@ watch(
     <!-- 顶部标题 -->
     <div class="overlay overlay-title">
       <span class="now-playing">
-        {{ store.selectedFile?.relative ?? '未选择动画' }}
+        {{
+          store.newAnimationMode
+            ? `新建动画 · ${store.activeNewAnimation?.name ?? '白模'}`
+            : (store.selectedFile?.relative ?? '未选择动画')
+        }}
+      </span>
+      <span v-if="store.newAnimationMode" class="chip">
+        {{ store.importedAnimation ? `${store.importedAnimation.clipCount} 个导入片段` : '已去掉动画 · 绑定姿态' }}
+      </span>
+      <span
+        v-if="store.newAnimationMode && store.activeNewAnimation"
+        class="chip"
+        :class="store.activeNewAnimation.dirty ? 'chip-warn' : 'chip-success'"
+      >
+        {{ store.activeNewAnimation.dirty ? '未保存' : '已保存' }}
       </span>
       <span v-if="store.selectedStats" class="chip">
         {{ store.selectedStats.bones }} 骨骼 · {{ store.selectedStats.triangles.toLocaleString('en-US') }} 三角面
@@ -355,8 +370,12 @@ watch(
         <button
           class="btn btn-icon"
           type="button"
-          :disabled="!store.selectedPath || store.poseMode"
-          :title="store.poseMode ? '姿态模式下动画已暂停（播放会覆盖手动摆的姿势）' : '播放/暂停'"
+          :disabled="!store.selectedPath || store.poseMode || store.duration <= 0"
+          :title="
+            store.duration <= 0
+              ? '当前没有动画数据，请导入动画 JSON'
+              : (store.poseMode ? '姿态模式下动画已暂停（播放会覆盖手动摆的姿势）' : '播放/暂停')
+          "
           @click="store.togglePlay()"
         >
           <Icon :name="store.playing ? 'pause' : 'play'" :size="15" />

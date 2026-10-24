@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import { config } from '../config.js';
+import { joinData } from '../lib/paths.js';
 import { createLogger } from '../lib/logger.js';
 import { animationCover, COVER_CACHE_VERSION } from '../services/covers.js';
 
@@ -362,4 +363,209 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
       return reply.code(500).send({ error: `读取失败：${(err as Error).message}` });
     }
   });
+
+  // ===== 新建动画：保存 / 读取 / 删除 =====
+  //
+  // 新建动画由前端用内置白模创建，导入的动画 JSON 与项目名保存到项目自己的
+  // data/anim-projects 目录（gitignore），不会写入任何 FBX 源文件夹。
+
+  /** 项目列表：只返回摘要，动画数据按 id 单独取，避免一次传输几百 MB */
+  app.get('/api/anim/projects', async () => {
+    const entries = await fs.readdir(projectsDir, { withFileTypes: true }).catch(() => []);
+    const projects: ProjectSummary[] = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      const id = entry.name.slice(0, -'.json'.length);
+      const record = await readProject(id);
+      if (record) projects.push(summaryOf(record));
+    }
+    projects.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return { projects };
+  });
+
+  app.get('/api/anim/projects/:id', async (request, reply) => {
+    const id = projectId((request.params as { id?: string }).id);
+    if (!id) return reply.code(400).send({ error: '无效的项目 id' });
+    const record = await readProject(id);
+    if (!record) return reply.code(404).send({ error: '项目不存在' });
+    return { ...summaryOf(record), data: record.data };
+  });
+
+  app.put('/api/anim/projects/:id', async (request, reply) => {
+    const id = projectId((request.params as { id?: string }).id);
+    if (!id) return reply.code(400).send({ error: '无效的项目 id' });
+
+    const body = (request.body ?? {}) as {
+      name?: unknown;
+      basePath?: unknown;
+      baseName?: unknown;
+      data?: unknown;
+      imported?: unknown;
+    };
+    const data = body.data ?? null;
+    if (data !== null) {
+      const candidate = data as { format?: unknown; clips?: unknown };
+      if (candidate.format !== 'fbx-animation-data' || !Array.isArray(candidate.clips)) {
+        return reply.code(400).send({ error: '动画数据格式不正确（需要 fbx-animation-data）' });
+      }
+    }
+
+    const existing = await readProject(id);
+    const now = new Date().toISOString();
+    const clips = clipsOf(data);
+    const trackCount = countTracks(clips);
+    const name =
+      typeof body.name === 'string' && body.name.trim()
+        ? body.name.trim().slice(0, 80)
+        : (existing?.name ?? '新建动画');
+
+    const record: SavedProject = {
+      id,
+      name,
+      basePath:
+        typeof body.basePath === 'string' && body.basePath.trim()
+          ? body.basePath
+          : (existing?.basePath ?? ''),
+      baseName:
+        typeof body.baseName === 'string' && body.baseName.trim()
+          ? body.baseName
+          : (existing?.baseName ?? ''),
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      imported: importedOf(body.imported) ?? existing?.imported ?? null,
+      clipCount: clips.length,
+      trackCount,
+      hasData: data !== null,
+      data,
+    };
+
+    try {
+      await fs.mkdir(projectsDir, { recursive: true });
+      await fs.writeFile(projectPath(id), JSON.stringify(record), 'utf8');
+    } catch (err) {
+      return reply.code(500).send({ error: `保存失败：${(err as Error).message}` });
+    }
+    log.info(`新建动画已保存：${record.name}（${record.clipCount} 个片段）`);
+    return summaryOf(record);
+  });
+
+  app.delete('/api/anim/projects/:id', async (request, reply) => {
+    const id = projectId((request.params as { id?: string }).id);
+    if (!id) return reply.code(400).send({ error: '无效的项目 id' });
+    const removed = await fs.rm(projectPath(id), { force: true }).then(
+      () => true,
+      () => false,
+    );
+    return { ok: removed };
+  });
+}
+
+// ===== 新建动画项目的磁盘格式 =====
+
+const projectsDir = joinData('anim-projects');
+
+interface ProjectImportedSummary {
+  name: string;
+  clipCount: number;
+  trackCount: number;
+}
+
+interface SavedProject {
+  id: string;
+  name: string;
+  basePath: string;
+  baseName: string;
+  createdAt: string;
+  updatedAt: string;
+  imported: ProjectImportedSummary | null;
+  clipCount: number;
+  trackCount: number;
+  hasData: boolean;
+  data: unknown;
+}
+
+type ProjectSummary = Omit<SavedProject, 'data'>;
+
+/** 只允许字母数字下划线短横线，避免拼出目录穿越路径 */
+function projectId(raw: string | undefined): string | null {
+  const id = (raw ?? '').trim();
+  return /^[A-Za-z0-9_-]{1,80}$/.test(id) ? id : null;
+}
+
+function projectPath(id: string): string {
+  return path.join(projectsDir, `${id}.json`);
+}
+
+function importedOf(raw: unknown): ProjectImportedSummary | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as { name?: unknown; clipCount?: unknown; trackCount?: unknown };
+  if (typeof value.name !== 'string' || !value.name.trim()) return null;
+  return {
+    name: value.name,
+    clipCount: Number.isFinite(value.clipCount) ? Number(value.clipCount) : 0,
+    trackCount: Number.isFinite(value.trackCount) ? Number(value.trackCount) : 0,
+  };
+}
+
+function normalizeRecord(raw: unknown, id: string): SavedProject | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Partial<SavedProject>;
+  const now = new Date().toISOString();
+  const data = value.data ?? null;
+  const clips = clipsOf(data);
+  return {
+    id,
+    name: typeof value.name === 'string' && value.name.trim() ? value.name : '新建动画',
+    basePath: typeof value.basePath === 'string' ? value.basePath : '',
+    baseName: typeof value.baseName === 'string' ? value.baseName : '',
+    createdAt: typeof value.createdAt === 'string' ? value.createdAt : now,
+    updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : now,
+    imported: importedOf(value.imported),
+    clipCount: clips.length,
+    trackCount: countTracks(clips),
+    hasData: data !== null,
+    data,
+  };
+}
+
+/** 从动画数据里取出片段数组（格式不对时返回空数组） */
+function clipsOf(data: unknown): unknown[] {
+  if (!data || typeof data !== 'object') return [];
+  const clips = (data as { clips?: unknown }).clips;
+  return Array.isArray(clips) ? clips : [];
+}
+
+/** 统计片段里的轨迹总数 */
+function countTracks(clips: unknown[]): number {
+  let total = 0;
+  for (const clip of clips) {
+    const tracks = (clip as { tracks?: unknown }).tracks;
+    if (Array.isArray(tracks)) total += tracks.length;
+  }
+  return total;
+}
+
+async function readProject(id: string): Promise<SavedProject | null> {
+  const text = await fs.readFile(projectPath(id), 'utf8').catch(() => null);
+  if (text === null) return null;
+  try {
+    return normalizeRecord(JSON.parse(text), id);
+  } catch {
+    return null;
+  }
+}
+
+function summaryOf(record: SavedProject): ProjectSummary {
+  return {
+    id: record.id,
+    name: record.name,
+    basePath: record.basePath,
+    baseName: record.baseName,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    imported: record.imported,
+    clipCount: record.clipCount,
+    trackCount: record.trackCount,
+    hasData: record.hasData,
+  };
 }

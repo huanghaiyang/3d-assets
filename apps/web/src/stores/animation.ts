@@ -29,6 +29,25 @@ export interface AnimationToast {
   text: string;
 }
 
+/** 新建动画：使用动画库里选中的 Mixamo 模型（去掉动画），动画数据来自导入的 JSON，可保存 */
+export interface NewAnimationProject {
+  id: string;
+  name: string;
+  /** 基础模型：来自动画库的 FBX，只保留模型本身与绑定姿态 */
+  basePath: string;
+  baseName: string;
+  data: AnimationData | null;
+  imported: { name: string; clipCount: number; trackCount: number } | null;
+  /** 已经保存到服务端 */
+  saved: boolean;
+  /** 保存后又有改动（需要再次保存） */
+  dirty: boolean;
+  createdAt: string;
+  updatedAt: string | null;
+  /** 服务端存有动画数据，但本地还没取回来 */
+  hasData: boolean;
+}
+
 export const useAnimationStore = defineStore('animation', () => {
   const info = ref<AnimationInfoResponse | null>(null);
   const dirs = ref<string[]>([]);
@@ -64,6 +83,20 @@ export const useAnimationStore = defineStore('animation', () => {
   const dataExtracting = ref(false);
   const dataError = ref<string | null>(null);
   const extractedData = shallowRef<AnimationData | null>(null);
+
+  // 新建动画：内置白模（T 字姿态），可导入 JSON 绑定动画并保存
+  const newAnimations = shallowRef<NewAnimationProject[]>([]);
+  const activeNewAnimationId = ref<string | null>(null);
+  const newAnimationMode = computed(() => activeNewAnimationId.value !== null);
+  const activeNewAnimation = computed(
+    () => newAnimations.value.find((item) => item.id === activeNewAnimationId.value) ?? null,
+  );
+  const importingAnimation = ref(false);
+  const savingAnimation = ref(false);
+  const projectsLoading = ref(false);
+  const importedAnimation = ref<{ name: string; clipCount: number; trackCount: number } | null>(null);
+  /** 进入新建动画之前选中的 FBX，退出编辑时回到它 */
+  const previousFile = ref<AnimationFile | null>(null);
 
   // 骨骼
   const showSkeleton = ref(false);
@@ -312,7 +345,11 @@ export const useAnimationStore = defineStore('animation', () => {
 
   async function select(file: AnimationFile): Promise<void> {
     if (!player) return;
+    if (poseMode.value) setPoseMode(false);
     closeAnimationData();
+    activeNewAnimationId.value = null;
+    importedAnimation.value = null;
+    previousFile.value = file;
     selectedPath.value = file.path;
     viewLoading.value = true;
     viewError.value = null;
@@ -442,6 +479,304 @@ export const useAnimationStore = defineStore('animation', () => {
     dataExtracting.value = false;
     dataError.value = null;
     extractedData.value = null;
+  }
+
+  // ===== 新建动画（内置白模 + 导入/保存动画 JSON） =====
+
+  function isAnimationData(value: unknown): value is AnimationData {
+    if (!value || typeof value !== 'object') return false;
+    const data = value as Partial<AnimationData>;
+    return (
+      data.format === 'fbx-animation-data' &&
+      data.version === 1 &&
+      Array.isArray(data.clips) &&
+      data.clips.length > 0 &&
+      data.clips.every((clip) => !!clip && Array.isArray(clip.tracks)) &&
+      !!data.skeleton &&
+      Array.isArray(data.skeleton.joints)
+    );
+  }
+
+  /** 项目名按序号递增，避开已保存项目用掉的名字 */
+  function nextProjectName(): string {
+    const used = new Set(newAnimations.value.map((item) => item.name));
+    let index = 1;
+    while (used.has(`新建动画 ${index}`)) index += 1;
+    return `新建动画 ${index}`;
+  }
+
+  function updateProject(id: string, patch: Partial<NewAnimationProject>): void {
+    newAnimations.value = newAnimations.value.map((item) =>
+      item.id === id ? { ...item, ...patch } : item,
+    );
+  }
+
+  /** 按路径找到基础模型（模型可能已从动画库移除） */
+  function resolveBase(project: NewAnimationProject): AnimationFile | null {
+    return files.value.find((file) => file.path === project.basePath) ?? null;
+  }
+
+  /**
+   * 新建动画：以动画库里的 Mixamo 模型为基础，加载后清空动画片段并回到绑定姿态，
+   * 得到"不带动画的模型"。优先用当前选中的模型，否则取列表里的第一个。
+   */
+  async function createNewAnimation(): Promise<void> {
+    if (!player) {
+      toast('error', '视图尚未准备好，请稍候');
+      return;
+    }
+    if (viewLoading.value) {
+      toast('info', '模型正在加载，请稍候');
+      return;
+    }
+    const base = selectedFile.value ?? files.value[0] ?? null;
+    if (!base) {
+      toast('error', '动画库里还没有可用的 FBX 模型');
+      return;
+    }
+    if (!newAnimationMode.value) previousFile.value = selectedFile.value;
+
+    const project: NewAnimationProject = {
+      id: `new-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      name: nextProjectName(),
+      basePath: base.path,
+      baseName: base.relative,
+      data: null,
+      imported: null,
+      saved: false,
+      dirty: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: null,
+      hasData: false,
+    };
+    newAnimations.value = [...newAnimations.value, project];
+    await activateProject(project);
+    toast('info', `已新建「${project.name}」：模型「${base.name}」已去掉动画，导入 JSON 即可绑定`);
+  }
+
+  /** 选中一个新建动画：加载基础模型并恢复已导入的动画 */
+  async function selectNewAnimation(id: string): Promise<void> {
+    const project = newAnimations.value.find((item) => item.id === id);
+    if (!project || !player) return;
+    if (!newAnimationMode.value) previousFile.value = selectedFile.value;
+    await loadProjectData(project);
+    const fresh = newAnimations.value.find((item) => item.id === id) ?? project;
+    await activateProject(fresh);
+  }
+
+  /** 已保存的项目按需取回动画数据（列表接口只带摘要） */
+  async function loadProjectData(project: NewAnimationProject): Promise<void> {
+    if (!project.saved || project.data !== null || !project.hasData) return;
+    try {
+      const detail = await animationApi.project(project.id);
+      const data = isAnimationData(detail.data) ? detail.data : null;
+      updateProject(project.id, { data, hasData: data !== null });
+    } catch (err) {
+      toast('error', `读取已保存的动画失败：${(err as Error).message}`);
+    }
+  }
+
+  /** 加载基础模型、清掉自带动画，再应用项目里的动画数据 */
+  async function activateProject(project: NewAnimationProject): Promise<void> {
+    if (!player) return;
+    const base = resolveBase(project);
+    if (!base) {
+      toast('error', `基础模型「${project.baseName}」不在当前动画库里，无法打开`);
+      return;
+    }
+    if (poseMode.value) setPoseMode(false);
+    closeAnimationData();
+
+    // 同一个模型已经加载过就直接复用，避免重复解析 FBX
+    const sameModel =
+      selectedPath.value === base.path && !viewLoading.value && !viewError.value;
+    if (!sameModel) {
+      await select(base);
+      if (!player) return;
+    }
+
+    player.clearAnimationClips();
+    player.resetToRestPose();
+    selectedClips.value = [];
+    activeClipIndex.value = 0;
+    playing.value = false;
+    currentTime.value = 0;
+    duration.value = 0;
+    activeNewAnimationId.value = project.id;
+    importedAnimation.value = project.imported;
+
+    if (project.data) {
+      try {
+        const clips = player.applyAnimationData(project.data);
+        selectedClips.value = clips;
+        duration.value = clips[0]?.duration ?? 0;
+        playing.value = true;
+        player.resetView();
+        return;
+      } catch (err) {
+        toast('error', `恢复动画数据失败：${(err as Error).message}`);
+      }
+    }
+    player.resetView();
+  }
+
+  /** 退出编辑但保留新建动画；回到之前选中的 FBX（没有就清空视图） */
+  function exitNewAnimation(): void {
+    if (!newAnimationMode.value) return;
+    if (poseMode.value) setPoseMode(false);
+    closeAnimationData();
+    activeNewAnimationId.value = null;
+    importedAnimation.value = null;
+    const target = previousFile.value ?? files.value[0] ?? null;
+    if (target) {
+      void select(target);
+      return;
+    }
+    player?.clear();
+    selectedPath.value = null;
+    resetSelection();
+    syncBones();
+    syncNodes();
+  }
+
+  /** 删除新建动画；已保存的项目同时从服务端删除。原有 FBX 动画没有删除入口 */
+  function deleteNewAnimation(id: string): void {
+    const project = newAnimations.value.find((item) => item.id === id);
+    if (!project) return;
+    const wasActive = activeNewAnimationId.value === id;
+    newAnimations.value = newAnimations.value.filter((item) => item.id !== id);
+    if (project.saved) {
+      void animationApi.deleteProject(id).catch((err) => {
+        toast('error', `删除已保存的动画失败：${(err as Error).message}`);
+      });
+    }
+    if (!wasActive) return;
+
+    activeNewAnimationId.value = null;
+    importedAnimation.value = null;
+    const next = newAnimations.value[newAnimations.value.length - 1];
+    if (next) {
+      void selectNewAnimation(next.id);
+      return;
+    }
+    const target = previousFile.value ?? files.value[0] ?? null;
+    if (target) {
+      void select(target);
+      return;
+    }
+    player?.clear();
+    selectedPath.value = null;
+    resetSelection();
+    syncBones();
+    syncNodes();
+  }
+
+  /** 读取并绑定导出的动画 JSON（关节轨迹 + 关键帧） */
+  async function importAnimationJson(file: File): Promise<void> {
+    if (!player || !newAnimationMode.value) {
+      toast('error', '请先新建动画');
+      return;
+    }
+    importingAnimation.value = true;
+    try {
+      const text = await file.text();
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        throw new Error('JSON 解析失败，请检查文件内容');
+      }
+      if (!isAnimationData(parsed)) {
+        throw new Error('不是有效的动画数据（需包含 format=fbx-animation-data、version=1 与 clips）');
+      }
+      const clips = player.applyAnimationData(parsed);
+      const trackCount = parsed.clips.reduce((sum, clip) => sum + clip.tracks.length, 0);
+      const summary = { name: file.name, clipCount: clips.length, trackCount };
+      const activeId = activeNewAnimationId.value;
+      if (activeId) {
+        updateProject(activeId, { data: parsed, imported: summary, dirty: true, hasData: true });
+      }
+      selectedClips.value = clips;
+      activeClipIndex.value = 0;
+      currentTime.value = 0;
+      duration.value = clips[0]?.duration ?? 0;
+      playing.value = true;
+      importedAnimation.value = summary;
+      player.resetView();
+      toast('success', `已绑定动画：${clips.length} 个片段、${trackCount} 条轨迹（记得保存）`);
+    } catch (err) {
+      toast('error', `导入失败：${(err as Error).message}`);
+    } finally {
+      importingAnimation.value = false;
+    }
+  }
+
+  /** 把当前新建动画保存到服务端（写入项目自己的数据目录，不碰 FBX 源文件夹） */
+  async function saveNewAnimation(): Promise<void> {
+    const project = activeNewAnimation.value;
+    if (!project) {
+      toast('error', '请先新建动画');
+      return;
+    }
+    if (!project.data) {
+      toast('error', '请先导入动画 JSON 再保存');
+      return;
+    }
+    savingAnimation.value = true;
+    try {
+      const saved = await animationApi.saveProject({
+        id: project.id,
+        name: project.name,
+        basePath: project.basePath,
+        baseName: project.baseName,
+        data: project.data,
+        imported: project.imported,
+      });
+      updateProject(project.id, {
+        saved: true,
+        dirty: false,
+        createdAt: saved.createdAt,
+        updatedAt: saved.updatedAt,
+        imported: saved.imported,
+        hasData: saved.hasData,
+      });
+      toast('success', `已保存「${saved.name}」`);
+    } catch (err) {
+      toast('error', `保存失败：${(err as Error).message}`);
+    } finally {
+      savingAnimation.value = false;
+    }
+  }
+
+  /** 读取服务端已保存的新建动画（只取摘要，选中时再拉动画数据） */
+  async function loadProjects(): Promise<void> {
+    projectsLoading.value = true;
+    try {
+      const result = await animationApi.projects();
+      const existing = new Set(newAnimations.value.map((item) => item.id));
+      const loaded = result.projects
+        .filter((item) => !existing.has(item.id))
+        .map(
+          (item): NewAnimationProject => ({
+            id: item.id,
+            name: item.name,
+            basePath: item.basePath,
+            baseName: item.baseName,
+            data: null,
+            imported: item.imported,
+            saved: true,
+            dirty: false,
+            createdAt: item.createdAt,
+            updatedAt: item.updatedAt,
+            hasData: item.hasData,
+          }),
+        );
+      newAnimations.value = [...newAnimations.value, ...loaded];
+    } catch (err) {
+      toast('error', `读取已保存的动画失败：${(err as Error).message}`);
+    } finally {
+      projectsLoading.value = false;
+    }
   }
 
   // ===== 骨骼 =====
@@ -720,6 +1055,21 @@ export const useAnimationStore = defineStore('animation', () => {
     extractedData,
     openAnimationData,
     closeAnimationData,
+    newAnimationMode,
+    newAnimations,
+    activeNewAnimationId,
+    activeNewAnimation,
+    importingAnimation,
+    savingAnimation,
+    projectsLoading,
+    importedAnimation,
+    createNewAnimation,
+    selectNewAnimation,
+    exitNewAnimation,
+    deleteNewAnimation,
+    importAnimationJson,
+    saveNewAnimation,
+    loadProjects,
     showSkeleton,
     boneDisplayMode,
     boneTree,

@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import Icon from '../ui/Icon.vue';
 import { useAnimationStore } from '@/stores/animation';
+import type { NewAnimationProject } from '@/stores/animation';
 import { highlightSegments } from '@/utils/fuzzy';
 import type { AnimationFile } from '@/api/animation';
 
@@ -20,7 +21,7 @@ function setupObserver(): void {
       for (const entry of entries) {
         if (!entry.isIntersecting) continue;
         const path = (entry.target as HTMLElement).dataset.path;
-        const file = files.value.find((item) => item.path === path);
+        const file = store.files.find((item) => item.path === path);
         if (file) store.requestThumbnail(file);
       }
     },
@@ -42,6 +43,19 @@ onBeforeUnmount(() => {
 
 function pick(file: AnimationFile): void {
   void store.select(file);
+}
+
+/** 只有新建动画允许删除；原有 FBX 卡片没有删除入口 */
+function removeProject(project: NewAnimationProject): void {
+  const hint = project.saved ? '该项目已保存到服务端，删除后无法恢复。' : '已导入的动画数据会一并清除。';
+  if (!window.confirm(`确定删除「${project.name}」？${hint}`)) return;
+  store.deleteNewAnimation(project.id);
+}
+
+/** 卡片角标：新建 / 未保存 / 已保存 */
+function projectStatus(project: NewAnimationProject): string {
+  if (project.dirty) return project.saved ? '未保存' : '新建';
+  return '已保存';
 }
 
 function isSelected(file: AnimationFile): boolean {
@@ -130,6 +144,46 @@ function onPageSize(event: Event): void {
     </div>
 
     <div ref="listRef" class="grid-wrap">
+      <section v-if="store.newAnimations.length > 0" class="new-section">
+        <div class="section-head">
+          <Icon name="plus" :size="11" />
+          <span>新建动画</span>
+          <span class="chip">{{ store.newAnimations.length }}</span>
+          <span class="section-hint">仅新建动画可删除</span>
+        </div>
+        <div class="grid">
+          <div
+            v-for="project in store.newAnimations"
+            :key="project.id"
+            class="anim-card new-card"
+            :class="{ active: store.activeNewAnimationId === project.id }"
+            :data-path="project.basePath"
+            :title="`模型 ${project.baseName}${project.imported ? ` · ${project.imported.name}` : ' · 无动画数据'}`"
+          >
+            <button class="card-select" type="button" @click="store.selectNewAnimation(project.id)">
+              <div class="thumb">
+                <img
+                  v-if="store.thumbnails[project.basePath]"
+                  :src="store.thumbnails[project.basePath]"
+                  :alt="project.name"
+                />
+                <div v-else class="thumb-placeholder">
+                  <Icon name="film" :size="18" />
+                </div>
+                <span class="new-badge" :class="{ dirty: project.dirty }">{{ projectStatus(project) }}</span>
+              </div>
+              <span class="name">{{ project.name }}</span>
+              <span class="name-sub" :title="project.baseName">
+                {{ project.baseName }} · {{ project.imported ? project.imported.name : '无动画数据' }}
+              </span>
+            </button>
+            <button class="card-delete" type="button" title="删除新建动画" @click.stop="removeProject(project)">
+              <Icon name="trash" :size="12" />
+            </button>
+          </div>
+        </div>
+      </section>
+
       <p v-if="store.loading" class="state">扫描文件夹中…</p>
       <p v-else-if="store.loadError" class="state error">{{ store.loadError }}</p>
       <p v-else-if="store.filteredFiles.length === 0" class="state">
@@ -342,6 +396,95 @@ function onPageSize(event: Event): void {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
   gap: 8px;
+}
+
+.new-section {
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px dashed var(--border);
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.section-hint {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text-faint);
+}
+
+.new-card {
+  position: relative;
+}
+
+.card-select {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.new-badge {
+  position: absolute;
+  left: 4px;
+  top: 4px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 9px;
+  background: rgba(124, 92, 255, 0.82);
+  color: #fff;
+}
+
+.new-badge.dirty {
+  background: rgba(217, 119, 6, 0.85);
+}
+
+.name-sub {
+  font-size: 9.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-delete {
+  position: absolute;
+  right: 4px;
+  top: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 4px;
+  background: rgba(12, 14, 20, 0.78);
+  color: #cbd5e1;
+  opacity: 0.7;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.new-card:hover .card-delete,
+.new-card.active .card-delete {
+  opacity: 1;
+}
+
+.card-delete:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .anim-card {

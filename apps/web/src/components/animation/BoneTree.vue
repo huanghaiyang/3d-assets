@@ -201,16 +201,26 @@ function collapseAll(): void {
       />
     </div>
 
-    <label class="pose-switch" :class="{ on: store.poseMode }">
+    <label
+      class="pose-switch"
+      :class="{ on: store.poseMode, disabled: !store.newAnimationMode }"
+      :title="
+        store.newAnimationMode
+          ? '编辑骨骼姿态（只影响当前新建动画）'
+          : '原有动画为只读，只有新建动画可以编辑姿态'
+      "
+    >
       <input
         type="checkbox"
         class="checkbox"
         :checked="store.poseMode"
+        :disabled="!store.newAnimationMode"
         @change="store.setPoseMode(($event.target as HTMLInputElement).checked)"
       />
       <Icon name="pose" :size="13" />
       <span>姿态模式</span>
       <span v-if="store.poseMode" class="pose-badge">G / R / S</span>
+      <span v-else-if="!store.newAnimationMode" class="pose-readonly">只读</span>
     </label>
 
     <div v-if="store.poseMode" class="pose-panel">
@@ -380,6 +390,17 @@ function collapseAll(): void {
   background: var(--accent-soft);
   color: var(--accent-hover);
   font-weight: 600;
+}
+
+.pose-switch.disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.pose-readonly {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-faint);
 }
 
 .pose-badge {

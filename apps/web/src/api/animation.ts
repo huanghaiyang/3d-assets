@@ -55,6 +55,33 @@ export interface AnimationDirsResponse {
   saved: string[];
 }
 
+/** 导入动画 JSON 后的摘要（随新建动画一起保存） */
+export interface AnimationImportSummary {
+  name: string;
+  clipCount: number;
+  trackCount: number;
+}
+
+/** 已保存的新建动画（列表项，不含动画数据本体） */
+export interface SavedAnimationProject {
+  id: string;
+  name: string;
+  /** 基础模型（动画库里的 Mixamo FBX 绝对路径） */
+  basePath: string;
+  baseName: string;
+  createdAt: string;
+  updatedAt: string;
+  imported: AnimationImportSummary | null;
+  clipCount: number;
+  trackCount: number;
+  hasData: boolean;
+}
+
+export interface SavedAnimationProjectDetail extends SavedAnimationProject {
+  /** 原始动画数据；由 store 侧校验格式后再使用 */
+  data: unknown;
+}
+
 /**
  * 封面缓存版本：后端渲染逻辑升级（例如修复 T-pose）时 +1，
  * 让所有已缓存在浏览器/中间的旧封面 URL 直接失效。
@@ -78,6 +105,29 @@ export const animationApi = {
 
   browse: (dir?: string) =>
     request<AnimationBrowseResponse>(`/api/anim/browse${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`),
+
+  // ===== 新建动画（内置白模 + 导入的动画 JSON） =====
+
+  projects: () => request<{ projects: SavedAnimationProject[] }>('/api/anim/projects'),
+
+  project: (id: string) =>
+    request<SavedAnimationProjectDetail>(`/api/anim/projects/${encodeURIComponent(id)}`),
+
+  saveProject: (project: {
+    id: string;
+    name: string;
+    basePath: string;
+    baseName: string;
+    data: unknown;
+    imported: AnimationImportSummary | null;
+  }) =>
+    request<SavedAnimationProject>(`/api/anim/projects/${encodeURIComponent(project.id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(project),
+    }),
+
+  deleteProject: (id: string) =>
+    request<{ ok: boolean }>(`/api/anim/projects/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   /** 只取流，不进 HTTP 缓存（服务端 no-store，客户端只在内存里留一份） */
   fileUrl: (filePath: string) => `/api/anim/file?path=${encodeURIComponent(filePath)}`,
