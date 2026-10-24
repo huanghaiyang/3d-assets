@@ -5,6 +5,7 @@ import BoneTree from './BoneTree.vue';
 import NodeTree from './NodeTree.vue';
 import { useAnimationStore } from '@/stores/animation';
 import { formatBytes } from '@/utils/image';
+import { confirmAction } from '@/composables/useConfirm';
 
 const store = useAnimationStore();
 const tab = ref<'info' | 'bones' | 'nodes'>('info');
@@ -27,13 +28,19 @@ function onJsonPicked(event: Event): void {
   if (picked) void store.importAnimationJson(picked);
 }
 
-function deleteActive(): void {
+async function deleteActive(): Promise<void> {
   const id = store.activeNewAnimationId;
   if (!id) return;
-  const hint = store.activeNewAnimation?.saved
+  const detail = store.activeNewAnimation?.saved
     ? '该项目已保存到服务端，删除后无法恢复。'
     : '已导入的动画数据会一并清除。';
-  if (!window.confirm(`确定删除当前新建动画？${hint}`)) return;
+  const ok = await confirmAction({
+    title: '删除新建动画',
+    message: '确定删除当前新建动画？',
+    detail,
+    confirmText: '删除',
+  });
+  if (!ok) return;
   store.deleteNewAnimation(id);
 }
 

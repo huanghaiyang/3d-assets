@@ -5,6 +5,7 @@ import { useAnimationStore } from '@/stores/animation';
 import type { NewAnimationProject } from '@/stores/animation';
 import { highlightSegments } from '@/utils/fuzzy';
 import type { AnimationFile } from '@/api/animation';
+import { confirmAction } from '@/composables/useConfirm';
 
 const store = useAnimationStore();
 const listRef = ref<HTMLDivElement | null>(null);
@@ -46,9 +47,15 @@ function pick(file: AnimationFile): void {
 }
 
 /** 只有新建动画允许删除；原有 FBX 卡片没有删除入口 */
-function removeProject(project: NewAnimationProject): void {
-  const hint = project.saved ? '该项目已保存到服务端，删除后无法恢复。' : '已导入的动画数据会一并清除。';
-  if (!window.confirm(`确定删除「${project.name}」？${hint}`)) return;
+async function removeProject(project: NewAnimationProject): Promise<void> {
+  const detail = project.saved ? '该项目已保存到服务端，删除后无法恢复。' : '已导入的动画数据会一并清除。';
+  const ok = await confirmAction({
+    title: '删除新建动画',
+    message: `确定删除「${project.name}」？`,
+    detail,
+    confirmText: '删除',
+  });
+  if (!ok) return;
   store.deleteNewAnimation(project.id);
 }
 

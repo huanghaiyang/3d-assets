@@ -4,6 +4,7 @@ import Icon from './ui/Icon.vue';
 import { downloadUrl } from '@/api/client';
 import { useWorkspaceStore, isActive } from '@/stores/workspace';
 import { useNow } from '@/composables/useNow';
+import { confirmAction } from '@/composables/useConfirm';
 import { formatDuration } from '@/utils/image';
 import type { Job } from '@/api/types';
 
@@ -149,7 +150,13 @@ function cancelRename(): void {
 }
 
 async function confirmRemove(job: Job): Promise<void> {
-  if (!window.confirm(`确定删除「${job.name}」？本地转存的模型文件会一并删除。`)) return;
+  const ok = await confirmAction({
+    title: '删除素材',
+    message: `确定删除「${job.name}」？`,
+    detail: '本地转存的模型文件会一并删除。',
+    confirmText: '删除',
+  });
+  if (!ok) return;
   await store.remove(job.id);
 }
 

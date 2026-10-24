@@ -7,6 +7,7 @@ import WorkbenchSidePanel from './components/WorkbenchSidePanel.vue';
 import TaskBar from './components/TaskBar.vue';
 import SettingsDialog from './components/SettingsDialog.vue';
 import ToastStack from './components/ToastStack.vue';
+import ConfirmDialog from './components/ConfirmDialog.vue';
 import { useWorkspaceStore } from './stores/workspace';
 
 // 动画预览页（FBX 播放器 + 骨骼/节点树）只在真正用时才加载，首屏包体因此小一半
@@ -48,6 +49,7 @@ onBeforeUnmount(() => store.stopPolling());
     <TaskBar v-if="page === 'workbench'" />
     <SettingsDialog :open="settingsOpen" @close="settingsOpen = false" />
     <ToastStack />
+    <ConfirmDialog />
   </div>
 </template>
 
