@@ -133,6 +133,11 @@ export async function readProject(id: string): Promise<SavedProject | null> {
   return readJson(projectPath(id), id);
 }
 
+/** 读取回收站里的项目（含动画数据，供只读预览） */
+export async function readTrashProject(id: string): Promise<SavedProject | null> {
+  return readJson(trashPath(id), id);
+}
+
 export async function listProjects(): Promise<ProjectSummary[]> {
   const entries = await fs.readdir(projectsDir, { withFileTypes: true }).catch(() => []);
   const projects: ProjectSummary[] = [];

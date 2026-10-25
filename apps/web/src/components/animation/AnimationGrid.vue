@@ -207,16 +207,6 @@ function onPageSize(event: Event): void {
           <Icon name="plus" :size="11" />
           <span>新建动画</span>
           <span class="chip">{{ store.newAnimations.length }}</span>
-          <button
-            class="trash-toggle"
-            :class="{ active: store.trashOpen }"
-            type="button"
-            title="打开回收站"
-            @click="store.toggleTrash()"
-          >
-            <Icon name="trash" :size="10" />
-            回收站<template v-if="store.trashProjects.length > 0"> {{ store.trashProjects.length }}</template>
-          </button>
         </div>
         <div class="grid">
           <div
@@ -263,6 +253,19 @@ function onPageSize(event: Event): void {
               </span>
             </template>
             <div class="card-actions">
+              <button
+                class="card-icon"
+                type="button"
+                :disabled="store.isRefreshingCover(project.basePath)"
+                title="重新生成封面（服务端重渲染基础模型）"
+                @click.stop="store.refreshCover(project.basePath)"
+              >
+                <Icon
+                  name="refresh"
+                  :size="12"
+                  :class="{ spin: store.isRefreshingCover(project.basePath) }"
+                />
+              </button>
               <button class="card-icon" type="button" title="重命名" @click.stop="startRename(project)">
                 <Icon name="edit" :size="12" />
               </button>
@@ -279,18 +282,35 @@ function onPageSize(event: Event): void {
           <Icon name="trash" :size="11" />
           <span>回收站</span>
           <span class="chip">{{ store.trashProjects.length }}</span>
-          <span class="section-hint">恢复后回到新建动画</span>
+          <span class="section-hint">可只读预览 · 恢复后回到新建动画</span>
         </div>
         <p v-if="store.trashLoading" class="state">读取回收站…</p>
         <p v-else-if="store.trashProjects.length === 0" class="state">回收站是空的</p>
         <div v-else class="trash-list">
-          <div v-for="item in store.trashProjects" :key="item.id" class="trash-item">
+          <div
+            v-for="item in store.trashProjects"
+            :key="item.id"
+            class="trash-item"
+            :class="{ previewing: store.trashPreviewId === item.id }"
+          >
             <div class="trash-main">
-              <span class="name" :title="item.name">{{ item.name }}</span>
+              <span class="name" :title="item.name">
+                {{ item.name }}
+                <span v-if="store.trashPreviewId === item.id" class="preview-badge">预览中</span>
+              </span>
               <span class="name-sub" :title="item.baseName">
                 {{ item.baseName }} · 删除于 {{ formatDeleted(item.deletedAt) }}
               </span>
             </div>
+            <button
+              class="btn btn-ghost btn-icon"
+              type="button"
+              title="在 3D 视口中只读预览（不恢复、不可编辑）"
+              :disabled="!item.hasData"
+              @click="store.previewTrashProject(item.id)"
+            >
+              <Icon name="play" :size="12" />
+            </button>
             <button
               class="btn btn-ghost btn-icon"
               type="button"
@@ -323,15 +343,18 @@ function onPageSize(event: Event): void {
       <p v-if="store.truncated" class="state warn">文件过多，仅显示前一部分</p>
 
       <div class="grid">
-        <button
+        <div
           v-for="file in files"
           :key="file.path"
           class="anim-card"
           :class="{ active: isSelected(file) }"
-          type="button"
+          role="button"
+          tabindex="0"
           :data-path="file.path"
           :title="`${file.sourceLabel} / ${file.relative}`"
           @click="pick(file)"
+          @keydown.enter.prevent="pick(file)"
+          @keydown.space.prevent="pick(file)"
         >
           <div class="thumb">
             <img v-if="thumbOf(file)" :src="thumbOf(file)" :alt="file.name" />
@@ -343,6 +366,16 @@ function onPageSize(event: Event): void {
               <Icon name="play" :size="9" />
               预览中
             </span>
+            <!-- 单张封面重渲染：悬浮显示，不影响整页批量刷新 -->
+            <button
+              class="cover-refresh"
+              type="button"
+              :disabled="store.isRefreshingCover(file.path)"
+              title="重新生成这张封面"
+              @click.stop="store.refreshCover(file.path)"
+            >
+              <Icon name="refresh" :size="11" :class="{ spin: store.isRefreshingCover(file.path) }" />
+            </button>
           </div>
           <span class="name" :title="file.relative">
             <span
@@ -352,7 +385,7 @@ function onPageSize(event: Event): void {
               >{{ segment.text }}</span
             >
           </span>
-        </button>
+        </div>
       </div>
     </div>
 
@@ -587,31 +620,6 @@ function onPageSize(event: Event): void {
   white-space: nowrap;
 }
 
-.trash-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  margin-left: auto;
-  padding: 1px 6px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: transparent;
-  color: var(--text-faint);
-  font-size: 10px;
-  font-weight: 400;
-}
-
-.trash-toggle:hover {
-  background: var(--bg-hover);
-  color: var(--text-dim);
-}
-
-.trash-toggle.active {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  color: var(--accent-hover);
-}
-
 .trash-section {
   border-bottom: none;
 }
@@ -630,6 +638,21 @@ function onPageSize(event: Event): void {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--bg-panel-2);
+}
+
+/* 正在预览的回收站项目：左侧强调色描边，和普通行区分 */
+.trash-item.previewing {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.preview-badge {
+  margin-left: 4px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9px;
 }
 
 .trash-main {
@@ -697,6 +720,7 @@ function onPageSize(event: Event): void {
 }
 
 .anim-card {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -706,7 +730,41 @@ function onPageSize(event: Event): void {
   border-radius: var(--radius);
   background: var(--bg-panel-2);
   text-align: left;
+  cursor: pointer;
   transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.anim-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 卡片右下角的单张封面重渲染按钮，只在悬浮/聚焦时出现 */
+.cover-refresh {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: rgba(16, 17, 24, 0.82);
+  color: var(--text-dim);
+  opacity: 0;
+  transition: opacity 0.15s ease, color 0.15s ease;
+}
+
+.anim-card:hover .cover-refresh,
+.anim-card:focus-within .cover-refresh {
+  opacity: 1;
+}
+
+.cover-refresh:hover {
+  color: var(--text);
+  border-color: var(--accent);
 }
 
 .anim-card:hover {

@@ -15,6 +15,7 @@ import {
   projectId,
   purgeProject,
   readProject,
+  readTrashProject,
   renameProject,
   restoreProject,
   summaryOf,
@@ -483,6 +484,15 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
   /** 回收站列表 */
   app.get('/api/anim/trash', async () => {
     return { projects: await listTrash() };
+  });
+
+  /** 回收站项目详情（含动画数据，只读预览用） */
+  app.get('/api/anim/trash/:id', async (request, reply) => {
+    const id = projectId((request.params as { id?: string }).id);
+    if (!id) return reply.code(400).send({ error: '无效的项目 id' });
+    const record = await readTrashProject(id);
+    if (!record) return reply.code(404).send({ error: '回收站里没有该项目' });
+    return { ...summaryOf(record), data: record.data };
   });
 
   /** 从回收站恢复 */

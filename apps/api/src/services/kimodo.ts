@@ -168,7 +168,13 @@ class KimodoService {
     };
   }
 
-  /** 提交一次生成，立即返回排队中的任务，实际生成在后台串行执行 */
+  /**
+   * 提交一次生成：只做参数规整与入队，真正的推理在后台串行执行。
+   *
+   * - 帧数限制在 8–300，步数至少 1，都是为了让单次任务不会占满 CPU 太久；
+   * - 种子必须为正整数，传 0 / 留空时服务端自己掷一个，保证结果可复现；
+   * - 任务先落盘再排队，服务重启后能立刻从 meta.json 恢复出「排队中」状态。
+   */
   submit(request: KimodoGenerateRequest): KimodoAnimation {
     const check = this.validate();
     if (!check.ok) throw new Error(`Kimodo 未正确配置：${check.missing.join('；')}`);
@@ -191,6 +197,14 @@ class KimodoService {
     return job;
   }
 
+  /**
+   * 执行一次生成（由队列串行调用）。
+   *
+   * 与生成器的交互只有一问一答：写入一行请求，读回一行 `OK` / `ERR\t原因`。
+   * 请求行按 TAB 分成 6 段：过渡帧、扩散步数、随机种子、输出目录、帧数、提示词文件。
+   * 生成期间没有任何进度回传，所以进度条用「帧数 × 步数 × 实测速率」估算，
+   * 每完成一个任务就用真实耗时反向校正 msPerUnit，下一次估算会更准。
+   */
   private async run(job: KimodoAnimation, transitionFrames: number): Promise<void> {
     this.pending = Math.max(0, this.pending - 1);
     this.busy = true;
@@ -249,6 +263,13 @@ class KimodoService {
 
   // ---------------------------------------------------------------- 子进程
 
+  /**
+   * 确保常驻生成器进程存在（首次生成时懒启动）。
+   *
+   * 启动参数固定为 `--server <动作模型 GGUF> <文本编码器 GGUF>`，之后所有任务复用
+   * 同一个进程，模型权重只加载一次。Windows 上 ggml 的 DLL 必须能从 PATH 找到，
+   * 所以这里会把可执行文件周边含 .dll 的目录拼到 PATH 前面。
+   */
   private ensureSession(): ChildProcessWithoutNullStreams {
     if (this.session) return this.session;
 
@@ -342,6 +363,12 @@ class KimodoService {
     return [...new Set(dirs)];
   }
 
+  /**
+   * 把 stdout 的字节流切成整行，交给等待者。
+   *
+   * 生成器可能一次吐出多行，也可能一行被拆成多个 chunk，因此必须缓冲到出现 `\n`
+   * 才算一条响应；没有等待者时先存进 pendingLines，避免响应丢失。
+   */
   private onStdout(chunk: Buffer): void {
     this.stdoutBuffer += chunk.toString();
     let index = this.stdoutBuffer.indexOf('\n');
@@ -355,6 +382,10 @@ class KimodoService {
     }
   }
 
+  /**
+   * 等待生成器回一行。超时返回 null（由调用方当成失败处理）；
+   * 子进程退出时会被 exit 回调以 null 唤醒，避免任务永远挂着。
+   */
   private nextLine(timeoutMs: number): Promise<string | null> {
     if (this.pendingLines.length > 0) return Promise.resolve(this.pendingLines.shift() ?? '');
     return new Promise((resolve) => {
@@ -530,7 +561,15 @@ class KimodoService {
     }
   }
 
-  /** 列出中间产物与关联的新建动画（提示词 → 任务 → 动作数据 → Mixamo JSON → 项目） */
+  /**
+   * 中间产物清单 + 关联关系。
+   *
+   * 产物顺序固定为「提示词 → 元数据 → Mixamo JSON → 根位移 → 关节旋转」，
+   * 与前端链路条一致；二进制 .f32 只给体积，不做文本预览。
+   *
+   * 关联关系没有单独建表：导入时项目里记录的 imported.name 就是 Mixamo 片段名，
+   * 所以用「Mixamo JSON 的 clips[0].name」或「提示词前 40 字」反查项目即可。
+   */
   async artifacts(
     id: string,
   ): Promise<{ task: KimodoAnimation; artifacts: KimodoArtifact[]; relations: KimodoRelation[] } | null> {
@@ -587,7 +626,13 @@ class KimodoService {
     }
   }
 
-  /** 读取可查看产物的文本内容（JSON 会格式化输出） */
+  /**
+   * 读取可查看产物的文本内容。
+   *
+   * 只放行 prompt/meta/mixamo 三种文本产物；单次最多读 2MB，超出部分截断并标记
+   * truncated（此时不再尝试 JSON 解析）；正常大小的 JSON 会重新缩进后再给前端，
+   * 让 vue-json-pretty 的树形展示有完整结构。
+   */
   readArtifact(id: string, key: string): KimodoArtifactContent | null {
     if (key !== 'prompt' && key !== 'meta' && key !== 'mixamo') return null;
     const dir = this.motionDir(id);
@@ -644,7 +689,14 @@ export type KimodoImportOutcome =
 
 /**
  * 把 SOMA 动作重定向成 Mixamo 动画 JSON（format=fbx-animation-data）。
- * HTTP 路由与 MCP 共用，避免两处各写一遍 Python 调用。
+ *
+ * 处理流程：
+ * 1. 校验任务 ID 与 root_positions.f32 / local_rotations_xyzw.f32 是否存在；
+ * 2. 用 tools/kimodo/to_mixamo.py（.env 里配置的 Python）做骨架重定向，
+ *    片段名默认取任务提示词，也可由调用方指定；
+ * 3. 转换结果写到 `<outputDir>/mixamo/<id>.json`，同时作为「中间产物」供前端查看。
+ *
+ * HTTP 路由与 MCP 共用这一份实现，避免两处各写一遍 Python 调用。
  */
 export async function importKimodoAnimation(
   id: string,

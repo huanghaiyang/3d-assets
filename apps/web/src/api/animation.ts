@@ -143,6 +143,10 @@ export const animationApi = {
 
   trash: () => request<{ projects: SavedAnimationProject[] }>('/api/anim/trash'),
 
+  /** 回收站项目详情（含动画数据），用于只读预览 */
+  trashProject: (id: string) =>
+    request<SavedAnimationProject & { data: unknown }>(`/api/anim/trash/${encodeURIComponent(id)}`),
+
   restoreProject: (id: string) =>
     request<{ ok: boolean; renamed: boolean; project: SavedAnimationProject }>(
       `/api/anim/projects/${encodeURIComponent(id)}/restore`,

@@ -65,6 +65,16 @@ function labelOf(dir: string): string {
           <Icon name="plus" :size="13" />
           新建动画
         </button>
+        <button
+          class="btn trash-btn"
+          :class="{ active: store.trashOpen }"
+          type="button"
+          title="打开回收站：可预览、恢复或彻底删除已移入回收站的新建动画"
+          @click="store.toggleTrash()"
+        >
+          <Icon name="trash" :size="13" />
+          回收站<template v-if="store.trashProjects.length > 0"> {{ store.trashProjects.length }}</template>
+        </button>
 
         <div class="chips">
           <span
@@ -151,6 +161,13 @@ function labelOf(dir: string): string {
   gap: 5px;
   overflow-x: auto;
   padding: 2px 0;
+}
+
+/* 工具栏上的回收站按钮：打开时高亮，便于看出当前视图 */
+.trash-btn.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
 }
 
 .chips::-webkit-scrollbar {

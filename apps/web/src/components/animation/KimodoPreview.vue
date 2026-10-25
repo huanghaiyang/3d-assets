@@ -206,6 +206,15 @@ function setupScene(): void {
   }, { passive: false });
 }
 
+/**
+ * 抽屉是用 v-show 控制显隐的：关闭状态下容器尺寸为 0×0，
+ * 打开时窗口本身不会触发 resize 事件，必须监听容器自身尺寸变化，
+ * 否则 canvas 会停留在初始的兜底尺寸（宽高比错误），骨架看起来偏出画面。
+ */
+let resizeObserver: ResizeObserver | null = null;
+/** 上一次观察到的容器宽度，用于判断「从隐藏变为可见」 */
+let lastWidth = 0;
+
 function resize(): void {
   if (!renderer || !camera || !container.value) return;
   const width = container.value.clientWidth;
@@ -262,12 +271,36 @@ onMounted(() => {
   setupScene();
   void load();
   window.addEventListener('resize', resize);
+  // 抽屉展开/收起、窗口宽度变化都会改变容器尺寸，这里统一按真实尺寸校正画面
+  if (container.value) {
+    resizeObserver = new ResizeObserver(() => {
+      const width = container.value?.clientWidth ?? 0;
+      const height = container.value?.clientHeight ?? 0;
+      if (!width || !height) {
+        // 抽屉收起：记成 0，下次展开时重新拟合相机
+        lastWidth = 0;
+        return;
+      }
+      const wasHidden = lastWidth === 0;
+      resize();
+      // 只在「由隐藏变为可见」时重新拟合相机（让人物居中）；
+      // 后续的普通缩放保留用户拖拽/滚轮调整过的视角与距离
+      if (wasHidden) {
+        fitCamera();
+        applyFrame(frame.value);
+      }
+      lastWidth = width;
+    });
+    resizeObserver.observe(container.value);
+  }
   rafId = requestAnimationFrame(loop);
 });
 
 onBeforeUnmount(() => {
   cancelAnimationFrame(rafId);
   window.removeEventListener('resize', resize);
+  resizeObserver?.disconnect();
+  resizeObserver = null;
   renderer?.dispose();
   renderer?.domElement.remove();
   renderer = null;

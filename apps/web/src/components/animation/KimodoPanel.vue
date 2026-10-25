@@ -27,6 +27,7 @@ const submitting = ref(false);
 const importingId = ref<string | null>(null);
 const notice = ref<{ kind: 'error' | 'info'; text: string } | null>(null);
 
+// 生成参数表单：帧数默认 60（约 2 秒 @30fps），种子 0 表示交给服务端随机掷
 const prompt = ref('a person walks forward and waves one hand');
 const frames = ref(60);
 const steps = ref(20);
@@ -120,6 +121,10 @@ function readAsDataUrl(file: File): Promise<string> {
   });
 }
 
+/**
+ * 选择参考图片：先在前端做类型/体积校验，再转成 data URL。
+ * 清空 input.value 是为了让用户能连续选择同一个文件（否则 change 不会再触发）。
+ */
 async function pickImage(event: Event): Promise<void> {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
@@ -191,6 +196,10 @@ const artifactJson = computed<Record<string, unknown> | unknown[] | null>(() => 
   }
 });
 
+/**
+ * 打开某条任务的产物弹窗：先取清单与关联关系，再默认选中第一个「存在且可读」的产物，
+ * 避免用户打开后看到一个空白内容区。
+ */
 async function openArtifacts(item: KimodoAnimation): Promise<void> {
   artifactOpen.value = true;
   artifactTaskId.value = item.id;
@@ -212,6 +221,7 @@ async function openArtifacts(item: KimodoAnimation): Promise<void> {
   }
 }
 
+/** 切换产物：按 key 重新拉文本内容（JSON 已由后端格式化） */
 async function pickArtifact(key: string): Promise<void> {
   const id = artifactTaskId.value;
   if (!id) return;
@@ -801,7 +811,9 @@ onBeforeUnmount(() => {
   top: 0;
   right: 0;
   bottom: 0;
-  width: min(1180px, 96vw);
+  /* 宽屏下占满大部分屏幕，窄屏保留一点遮罩边距 */
+  width: min(1720px, 92vw);
+  min-width: min(560px, 100vw);
   display: flex;
   flex-direction: column;
   border-left: 1px solid var(--border-strong);

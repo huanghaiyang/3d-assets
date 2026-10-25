@@ -107,6 +107,9 @@ export const useAnimationStore = defineStore('animation', () => {
   const trashLoading = ref(false);
   /** 左侧列表是否正在展示回收站 */
   const trashOpen = ref(false);
+  /** 正在 3D 视口里只读预览的回收站项目（不进入编辑，不影响 newAnimations） */
+  const trashPreviewId = ref<string | null>(null);
+  const previewingTrash = computed(() => trashPreviewId.value !== null);
   /** 进入新建动画之前选中的 FBX，退出编辑时回到它 */
   const previousFile = ref<AnimationFile | null>(null);
 
@@ -360,6 +363,7 @@ export const useAnimationStore = defineStore('animation', () => {
     if (poseMode.value) setPoseMode(false);
     closeAnimationData();
     activeNewAnimationId.value = null;
+    trashPreviewId.value = null;
     importedAnimation.value = null;
     previousFile.value = file;
     selectedPath.value = file.path;
@@ -614,6 +618,7 @@ export const useAnimationStore = defineStore('animation', () => {
     playing.value = false;
     currentTime.value = 0;
     duration.value = 0;
+    trashPreviewId.value = null;
     activeNewAnimationId.value = project.id;
     importedAnimation.value = project.imported;
 
@@ -877,6 +882,8 @@ export const useAnimationStore = defineStore('animation', () => {
       if (!newAnimations.value.some((item) => item.id === result.project.id)) {
         newAnimations.value = [...newAnimations.value, projectFromSaved(result.project)];
       }
+      // 恢复后它就回到可编辑列表，不再是「回收站预览」状态
+      if (trashPreviewId.value === id) trashPreviewId.value = null;
       toast(
         'success',
         result.renamed
@@ -893,10 +900,79 @@ export const useAnimationStore = defineStore('animation', () => {
     try {
       await animationApi.purgeProject(id);
       trashProjects.value = trashProjects.value.filter((item) => item.id !== id);
+      if (trashPreviewId.value === id) trashPreviewId.value = null;
       toast('success', '已彻底删除');
     } catch (err) {
       toast('error', `删除失败：${(err as Error).message}`);
     }
+  }
+
+  /**
+   * 只读预览回收站里的动画：
+   * 用它的基础模型载入视口、清空原动画后应用回收站里保存的动画数据。
+   * 不写入 newAnimations、不点亮 activeNewAnimationId，避免出现保存/删除等编辑入口。
+   */
+  async function previewTrashProject(id: string): Promise<void> {
+    const item = trashProjects.value.find((project) => project.id === id);
+    if (!item) return;
+    if (!player) {
+      toast('error', '3D 视图尚未准备好，请稍候再试');
+      return;
+    }
+    if (viewLoading.value) {
+      toast('info', '模型正在加载，请稍候');
+      return;
+    }
+    // 基础模型可能因为切换了文件夹而不在当前列表里，这里退化成用项目里记录的绝对路径
+    const base: AnimationFile =
+      resolveBase(item) ?? {
+        name: item.baseName || item.basePath,
+        relative: item.baseName || item.basePath,
+        path: item.basePath,
+        sourceDir: '',
+        sourceLabel: '',
+        size: 0,
+        mtime: 0,
+      };
+
+    // 列表接口只有摘要，动画数据按需从服务端取（回收站有独立详情接口）
+    let data = item.data;
+    if (!data) {
+      try {
+        const detail = await animationApi.trashProject(id);
+        data = isAnimationData(detail.data) ? detail.data : null;
+      } catch (err) {
+        toast('error', `读取回收站动画失败：${(err as Error).message}`);
+        return;
+      }
+    }
+
+    await select(base);
+    if (!player) return;
+    // select 内部已 toast 过错误；载入失败就不要再往空场景里套动画数据
+    if (viewError.value) return;
+    player.clearAnimationClips();
+    player.resetToRestPose();
+    selectedClips.value = [];
+    activeClipIndex.value = 0;
+    playing.value = false;
+    currentTime.value = 0;
+    duration.value = 0;
+    activeNewAnimationId.value = null;
+    trashPreviewId.value = id;
+    importedAnimation.value = item.imported;
+    if (data) {
+      try {
+        const clips = player.applyAnimationData(data);
+        selectedClips.value = clips;
+        duration.value = clips[0]?.duration ?? 0;
+        playing.value = true;
+      } catch (err) {
+        toast('error', `预览失败：${(err as Error).message}`);
+      }
+    }
+    player.resetView();
+    toast('info', `只读预览回收站中的「${item.name}」`);
   }
 
   /** 读取服务端已保存的新建动画（只取摘要，选中时再拉动画数据） */
@@ -1095,6 +1171,37 @@ export const useAnimationStore = defineStore('animation', () => {
 
   /** 正在强制重渲染当前页封面（按钮 loading 状态） */
   const refreshingCovers = ref(false);
+  /** 单张封面正在重渲染的模型路径（卡片上的 loading 状态） */
+  const refreshingCoverPaths = ref<string[]>([]);
+
+  function isRefreshingCover(path: string): boolean {
+    return refreshingCoverPaths.value.includes(path);
+  }
+
+  /**
+   * 重新生成单个模型的封面：让服务端强制重渲染并覆盖磁盘缓存，
+   * 再用带版本号的 URL 顶掉浏览器里的旧图。
+   * 同一基础模型的多张卡片（新建动画共用 basePath）会一起更新。
+   */
+  async function refreshCover(filePath: string): Promise<void> {
+    if (!filePath || isRefreshingCover(filePath)) return;
+    refreshingCoverPaths.value = [...refreshingCoverPaths.value, filePath];
+    const version = Date.now().toString(36);
+    try {
+      const url = animationApi.animationCoverUrl(filePath, THUMB_SIZE, THUMB_POSE, { refresh: true, version });
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      thumbnails.value = {
+        ...thumbnails.value,
+        [filePath]: animationApi.animationCoverUrl(filePath, THUMB_SIZE, THUMB_POSE, { version }),
+      };
+      toast('success', '封面已重新生成');
+    } catch (err) {
+      toast('error', `封面生成失败：${(err as Error).message}`);
+    } finally {
+      refreshingCoverPaths.value = refreshingCoverPaths.value.filter((item) => item !== filePath);
+    }
+  }
 
   function coverUrl(file: AnimationFile): string {
     return animationApi.animationCoverUrl(file.path, THUMB_SIZE, THUMB_POSE);
@@ -1214,6 +1321,9 @@ export const useAnimationStore = defineStore('animation', () => {
     trashProjects,
     trashLoading,
     trashOpen,
+    trashPreviewId,
+    previewingTrash,
+    previewTrashProject,
     loadTrash,
     toggleTrash,
     restoreFromTrash,
@@ -1285,6 +1395,8 @@ export const useAnimationStore = defineStore('animation', () => {
     generatePageThumbnails,
     refreshPageCovers,
     refreshingCovers,
+    refreshCover,
+    isRefreshingCover,
     resetThumbQueue,
     dispose,
     toast,

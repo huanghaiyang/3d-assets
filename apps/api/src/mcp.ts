@@ -315,6 +315,9 @@ const tools: ToolDefinition[] = [
       });
     },
   },
+  // ---------------------------------------------------------------- Kimodo 工具组
+  // 生成器是单进程串行推理，所以这里只负责「提交任务」或查询，不等待生成完成；
+  // 所有返回值都经过 publicStatus / publicJob / scrub，绝不暴露 .env 里的路径与密钥。
   {
     name: 'kimodo_status',
     description: 'Kimodo 生成器状态（不返回任何 .env 路径或密钥）',
@@ -366,6 +369,8 @@ const tools: ToolDefinition[] = [
     ),
     handler: async (args) => {
       const id = requireString(args, 'id');
+      // 真正做骨架重定向的是 Python 脚本；成功后才把结果写进指定项目，
+      // 写项目同样走写队列，避免与并发的重命名/删除互相覆盖。
       const outcome = await importKimodoAnimation(id, readString(args, 'clipName'));
       if (!outcome.ok) throw new Error(outcome.error);
 
