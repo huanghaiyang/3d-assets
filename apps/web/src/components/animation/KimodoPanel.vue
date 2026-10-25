@@ -67,6 +67,76 @@ watch(splitUsable, (usable) => {
 const decomposition = computed(() => enhanced.value?.decomposition ?? null);
 const objectText = computed(() => decomposition.value?.objects.join('、') ?? '');
 
+// ===== 动作拆解可编辑：改完步骤后按步骤重新生成英文，避免模型又按自己的理解改回去 =====
+/** 拆解步骤的编辑副本（最多 6 步） */
+const stepDraft = ref<string[]>([]);
+const refining = ref(false);
+watch(
+  () => enhanced.value?.decomposition?.steps,
+  (steps) => {
+    stepDraft.value = [...(steps ?? [])];
+  },
+  { immediate: true },
+);
+const stepsDirty = computed(() => {
+  const original = enhanced.value?.decomposition?.steps ?? [];
+  if (original.length !== stepDraft.value.length) return true;
+  return original.some((step, index) => step !== (stepDraft.value[index] ?? '').trim());
+});
+
+function addStep(): void {
+  if (stepDraft.value.length >= 6) return;
+  stepDraft.value.push('');
+}
+
+function removeStep(index: number): void {
+  if (stepDraft.value.length <= 1) return;
+  stepDraft.value.splice(index, 1);
+}
+
+function resetSteps(): void {
+  stepDraft.value = [...(enhanced.value?.decomposition?.steps ?? [])];
+}
+
+/** 把修改后的中文步骤交给模型重新生成英文提示词与分段 */
+async function refine(): Promise<void> {
+  const current = enhanced.value;
+  if (!current || refining.value || submitting.value) return;
+  const steps = stepDraft.value.map((step) => step.trim()).filter(Boolean);
+  if (steps.length === 0) {
+    notice.value = { kind: 'error', text: '拆解至少保留一个步骤' };
+    return;
+  }
+
+  refining.value = true;
+  notice.value = null;
+  try {
+    const result = await kimodoApi.refinePrompt({
+      steps,
+      objects: current.decomposition?.objects,
+      note: current.decomposition?.note,
+    });
+    enhanced.value = {
+      ...current,
+      prompt: result.prompt,
+      segments: result.segments,
+      decomposition: current.decomposition ? { ...current.decomposition, steps } : null,
+    };
+    prompt.value = result.prompt;
+    splitEnabled.value = result.segments.length >= 2;
+    notice.value = {
+      kind: 'info',
+      text: `已按修改后的 ${steps.length} 步动作重新生成英文提示词${
+        result.segments.length >= 2 ? `，并拆出 ${result.segments.length} 段` : ''
+      }。`,
+    };
+  } catch (err) {
+    notice.value = { kind: 'error', text: (err as Error).message };
+  } finally {
+    refining.value = false;
+  }
+}
+
 const configured = computed(() => status.value?.ready === true);
 const pendingCount = computed(
   () => animations.value.filter((item) => item.status === 'queued' || item.status === 'running').length,
@@ -347,6 +417,7 @@ function buildSegments(total: number, list: string[]): KimodoPromptSegment[] | n
 }
 
 async function generate(): Promise<void> {
+  if (refining.value) return;
   let text = prompt.value.trim();
   if (!text) {
     notice.value = { kind: 'error', text: '请先填写提示词' };
@@ -586,19 +657,79 @@ onBeforeUnmount(() => {
                   </span>
                 </div>
 
-                <!-- 动作拆解：物体动作会被改写成等价的身体动力学 -->
+                <!-- 动作拆解：可逐条修改，改完按步骤重新生成英文 -->
                 <div v-if="decomposition" class="decomp-card">
                   <div class="decomp-head">
                     <Icon name="sparkle" :size="12" />
                     <span>动作拆解</span>
-                    <span v-if="objectText" class="decomp-objects" :title="`模型没有物体接触，只能模拟身体动作：${objectText}`">
+                    <span v-if="stepsDirty" class="decomp-edited">已修改</span>
+                    <span
+                      v-if="objectText"
+                      class="decomp-objects"
+                      :title="`模型没有物体接触，只能模拟身体动作：${objectText}`"
+                    >
                       物体：{{ objectText }}
                     </span>
                   </div>
-                  <ol v-if="decomposition.steps.length > 0" class="decomp-steps">
-                    <li v-for="(step, index) in decomposition.steps" :key="index">{{ step }}</li>
-                  </ol>
+                  <div class="decomp-step-list">
+                    <div v-for="(step, index) in stepDraft" :key="index" class="decomp-step-row">
+                      <span class="decomp-index">{{ index + 1 }}</span>
+                      <input
+                        v-model="stepDraft[index]"
+                        class="decomp-input"
+                        type="text"
+                        maxlength="80"
+                        placeholder="描述这一步的身体动作"
+                        :aria-label="step || `步骤 ${index + 1}`"
+                      />
+                      <button
+                        v-if="stepDraft.length > 1"
+                        class="decomp-remove"
+                        type="button"
+                        title="删除该步骤"
+                        @click="removeStep(index)"
+                      >
+                        <Icon name="close" :size="10" />
+                      </button>
+                    </div>
+                    <button
+                      v-if="stepDraft.length < 6"
+                      class="decomp-add"
+                      type="button"
+                      title="在末尾增加一个动作步骤"
+                      @click="addStep"
+                    >
+                      <Icon name="plus" :size="10" />
+                      增加步骤
+                    </button>
+                  </div>
                   <p v-if="decomposition.note" class="decomp-note">{{ decomposition.note }}</p>
+                  <div class="decomp-actions">
+                    <button
+                      class="btn btn-ghost decomp-refine"
+                      type="button"
+                      :disabled="!stepsDirty || refining || submitting"
+                      :title="stepsDirty ? '按修改后的步骤重新生成英文提示词与分段' : '修改步骤后可用'"
+                      @click="refine"
+                    >
+                      <Icon
+                        :name="refining ? 'refresh' : 'sparkle'"
+                        :size="11"
+                        :class="{ spin: refining }"
+                      />
+                      {{ refining ? '重新生成中…' : '按拆解重新生成' }}
+                    </button>
+                    <button
+                      v-if="stepsDirty"
+                      class="btn btn-ghost decomp-reset"
+                      type="button"
+                      title="恢复为上次转译的拆解"
+                      @click="resetSteps"
+                    >
+                      还原
+                    </button>
+                    <span v-else class="hint">步骤可直接修改，改完点左侧按钮生效</span>
+                  </div>
                 </div>
 
                 <div class="row">
@@ -651,7 +782,12 @@ onBeforeUnmount(() => {
                   </label>
                 </div>
                 <div class="row">
-                  <button class="btn btn-primary" type="button" :disabled="submitting" @click="generate">
+                  <button
+                    class="btn btn-primary"
+                    type="button"
+                    :disabled="submitting || refining"
+                    @click="generate"
+                  >
                     <Icon :name="submitting ? 'refresh' : 'sparkle'" :size="13" :class="{ spin: submitting }" />
                     生成动画
                   </button>
@@ -1126,18 +1262,98 @@ onBeforeUnmount(() => {
   color: #fbbf24;
   cursor: help;
 }
-.decomp-steps {
-  margin: 0;
-  padding-left: 16px;
+.decomp-edited {
+  margin-left: 4px;
+  padding: 0 5px;
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 400;
+  color: #fbbf24;
+}
+.decomp-step-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  font-size: 11px;
-  color: var(--text-dim);
+  gap: 4px;
 }
-.decomp-steps li::marker {
-  color: var(--primary);
+.decomp-step-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.decomp-index {
+  flex: none;
+  width: 14px;
+  text-align: right;
   font-size: 10px;
+  color: var(--text-faint);
+}
+.decomp-input {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: var(--bg-input);
+  color: var(--text-dim);
+  font-size: 11px;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.decomp-input:hover {
+  border-color: var(--border-strong);
+}
+.decomp-input:focus {
+  outline: none;
+  border-color: var(--primary);
+  color: var(--text);
+}
+.decomp-remove {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-faint);
+  opacity: 0.7;
+}
+.decomp-remove:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+  opacity: 1;
+}
+.decomp-add {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 22px;
+  padding: 0 6px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+.decomp-add:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+.decomp-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.decomp-refine,
+.decomp-reset {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 10.5px;
 }
 .decomp-note {
   margin: 0;
@@ -1170,14 +1386,33 @@ onBeforeUnmount(() => {
 .candidate-field {
   margin-left: auto;
 }
+/* 候选数与帧数/步数输入框保持同一套尺寸、圆角与配色，右对齐箭头替换原生下拉框 */
 .candidate-field select {
-  height: 26px;
-  padding: 0 4px;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  background: var(--bg-input);
+  appearance: none;
+  width: 100%;
+  height: 28px;
+  padding: 0 24px 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background-color: var(--bg-elevated);
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M1 1l4 4 4-4' fill='none' stroke='%239b9ca6' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 10px 6px;
   color: var(--text);
-  font-size: 11.5px;
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background-color 0.15s ease;
+}
+.candidate-field select:hover {
+  border-color: var(--accent);
+  background-color: var(--bg-hover);
+}
+.candidate-field option {
+  background: var(--bg-panel-2);
+  color: var(--text);
 }
 
 /* 中间产物对话框 */

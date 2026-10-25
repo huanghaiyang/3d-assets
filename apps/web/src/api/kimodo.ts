@@ -138,6 +138,19 @@ export interface EnhancePromptResult {
   segments: string[];
 }
 
+export interface RefinePromptBody {
+  /** 修改后的中文动作链，按顺序 */
+  steps: string[];
+  objects?: string[];
+  note?: string;
+}
+
+export interface RefinePromptResult {
+  prompt: string;
+  segments: string[];
+  model: string;
+}
+
 export const kimodoApi = {
   status: () => request<KimodoStatus>('/api/kimodo/status'),
 
@@ -172,6 +185,13 @@ export const kimodoApi = {
   /** 提示词转译：中文描述 / 参考图片 → 英文动作提示词 */
   enhancePrompt: (body: { prompt: string; image?: string }) =>
     request<EnhancePromptResult>('/api/kimodo/enhance-prompt', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** 按修改后的动作拆解重新生成英文提示词与分段 */
+  refinePrompt: (body: RefinePromptBody) =>
+    request<RefinePromptResult>('/api/kimodo/refine-prompt', {
       method: 'POST',
       body: JSON.stringify(body),
     }),

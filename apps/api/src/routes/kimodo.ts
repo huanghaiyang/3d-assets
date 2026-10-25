@@ -4,7 +4,7 @@ import {
   kimodoService,
   type KimodoGenerateRequest,
 } from '../services/kimodo.js';
-import { enhancePrompt } from '../services/promptEnhance.js';
+import { enhancePrompt, refinePrompt } from '../services/promptEnhance.js';
 import { SOMA_SKELETON } from '../services/soma-skeleton.js';
 import { createLogger } from '../lib/logger.js';
 
@@ -30,6 +30,32 @@ export async function registerKimodoRoutes(app: FastifyInstance): Promise<void> 
       return await enhancePrompt({ prompt, image });
     } catch (err) {
       log.warn(`提示词转译失败：${(err as Error).message}`);
+      return reply.code(502).send({ error: (err as Error).message });
+    }
+  });
+
+  /**
+   * 按用户修改后的动作拆解重新生成英文提示词与分段。
+   * 与 enhance-prompt 分开：这里不再重新理解原始意图，步骤就是唯一事实来源。
+   */
+  app.post('/api/kimodo/refine-prompt', async (request, reply) => {
+    const body = (request.body ?? {}) as { steps?: unknown; objects?: unknown; note?: unknown };
+    const steps = Array.isArray(body.steps)
+      ? body.steps
+          .filter((step): step is string => typeof step === 'string')
+          .map((step) => step.trim())
+          .filter(Boolean)
+      : [];
+    if (steps.length === 0) return reply.code(400).send({ error: '请先填写至少一个动作步骤' });
+
+    const objects = Array.isArray(body.objects)
+      ? body.objects.filter((item): item is string => typeof item === 'string')
+      : [];
+    const note = typeof body.note === 'string' ? body.note : '';
+    try {
+      return await refinePrompt({ steps, objects, note });
+    } catch (err) {
+      log.warn(`按拆解重新生成失败：${(err as Error).message}`);
       return reply.code(502).send({ error: (err as Error).message });
     }
   });

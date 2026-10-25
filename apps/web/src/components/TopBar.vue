@@ -35,7 +35,7 @@ const keyLabel = computed(() => {
         @click="emit('change-page', 'workbench')"
       >
         <Icon name="cube" :size="13" />
-        工作台
+        建模
       </button>
       <button
         class="page-tab"
@@ -44,7 +44,7 @@ const keyLabel = computed(() => {
         @click="emit('change-page', 'animations')"
       >
         <Icon name="film" :size="13" />
-        动画预览
+        动画
       </button>
     </nav>
 

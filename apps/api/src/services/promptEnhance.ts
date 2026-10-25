@@ -25,7 +25,12 @@ const MOTION_RULES = [
   'Describe only body mechanics: which body parts move, in which direction, with what force and speed, and the start/end pose.',
   'If the request mentions an object, tool or furniture, never name it inside "prompt"; describe the body motion that would manipulate it instead, and list the object nouns only in "objects".',
   'Never downgrade a forceful action into a generic reach, grab or pick-up. Preserve the requested force, tempo and direction.',
-  'Distinguish similar actions: grab/pick up = hand closes slowly close to the body; push = lean forward, extend the arm, shift weight forward; flip/overturn = bend first, then an explosive two-handed upward swing with the torso extending and leaning back; throw = wind-up then a fast release; kick = lift one knee, then swing the lower leg fast.',
+  'Use only motion-capture vocabulary: walk, step, turn, bend, squat, stand up, lean, reach, raise, lower, swing, push, pull, lift, throw, punch, thrust, kick, jump, wave. Avoid object verbs such as grip, flip, overturn, open, close, hold or place.',
+  'Use absolute spatial directions (forward, upward, downward, to the left or right, behind the body) instead of relative ones (backward, inward), and always state the final hand position in absolute terms: say "arms extended forward at chest height", never "arms pushed backward".',
+  'Translate martial-arts idioms into literal body mechanics instead of keeping the metaphor: for example 回马枪 means turn the body around, step back, then thrust both arms forward at chest height.',
+  'Always state where the hands start and where they end (for example "from knee height up to shoulder height"), so the limb path cannot be read backwards.',
+  'For forceful actions keep the arms extended away from the torso with the elbows nearly straight. Hands tucked in near the chest or face, a bowed head or trembling shoulders read as crying, so never describe them unless the user asks for crying or sadness.',
+  'Distinguish similar actions: grab/pick up = hand closes slowly close to the body; push = lean forward, extend the arm, shift weight forward; thrust/punch = arms shoot straight forward from the chest with the elbows snapping straight; flip/overturn = bend first, then an explosive two-handed upward swing with the torso extending and leaning back; throw = wind-up then a fast release; kick = lift one knee, then swing the lower leg fast.',
   'Write in the style of motion-capture captions: present tense, "a person ...", one sentence, under 45 words, no camera, clothing, identity or rendering words.',
 ].join(' ');
 
@@ -42,7 +47,9 @@ const OUTPUT_SPEC = [
 /** 易混动作的 few-shot，用来压住「物体动作一律退化成拿取」的倾向 */
 const EXAMPLES = [
   'Examples:',
-  '用户：掀桌子 → {"prompt":"a person bends forward, swings both arms upward and forward with explosive force, straightens the torso and leans back, takes a step back, and ends with both hands above the head","steps":["身体前屈，双手伸到腰际前方","双臂爆发式向上前方猛挥","躯干挺直并后仰","退步收势"],"segments":["a person bends forward and reaches both hands to waist height","a person swings both arms upward with explosive force and leans back","a person steps back and settles with both hands above the head"],"objects":["桌子"],"note":"模型没有物体接触，已把掀桌改写为爆发式双臂上挥加后仰退步"}',
+  '用户：掀桌子 → {"prompt":"a person bends deeply forward, reaches both hands down in front of the knees, straightens up quickly while sweeping both arms forward and up to shoulder height, leans the torso back, and takes one step backward","steps":["身体前屈，双手下探到膝盖前方","快速直起身体，双臂向前上方横扫到肩高","躯干后仰并退后一步站稳"],"segments":["a person bends deeply forward and reaches both hands down in front of the knees","a person straightens up quickly, sweeping both arms forward and up to shoulder height and leaning back","a person takes one step backward and holds the final pose"],"objects":["桌子"],"note":"模型没有物体接触，已把掀桌改写为下探、爆发上挥加后仰退步"}',
+  '用户：回马枪 → {"prompt":"a person turns around quickly to face the opposite direction, steps back with one foot, then punches both arms straight forward at chest height and holds the pose","steps":["身体快速转身面向反方向","后撤一步稳住重心","双臂向正前方直刺到胸高","保持前刺姿态"],"segments":["a person turns around quickly to face the opposite direction","a person steps back with one foot and punches both arms straight forward at chest height","a person holds the forward punch pose"],"objects":[],"note":"无需改写，已把回马枪拆成转身、后撤、前刺"}',
+  '用户：哭泣 → {"prompt":"a person stands with the head bowed, raises both hands to cover the face, and shakes the shoulders up and down while staying in place","steps":["低头垂肩","双手抬到脸前遮住面部","肩膀上下抽动，原地不动"],"segments":["a person stands with the head bowed and raises both hands to the face","a person shakes the shoulders repeatedly while staying in place"],"objects":[],"note":"无需改写"}',
   '用户：拿杯子 → {"prompt":"a person reaches forward with one hand, closes the hand slowly, lifts it to chest height, and holds it steady","steps":["单手向前伸出","手指缓慢合拢","把手抬到胸前并停住"],"segments":["a person reaches forward with one hand and closes the hand","a person lifts the hand to chest height and holds it steady"],"objects":["杯子"],"note":"无需改写作物体接触，按单手拿取描述"}',
   '用户：用力推门 → {"prompt":"a person steps forward, leans the body weight into both hands, and pushes forward steadily with both arms extending","steps":["向前迈步","身体前倾，双手向前伸","双臂蹬直持续发力"],"segments":["a person steps forward and places both hands forward","a person leans in and pushes forward steadily"],"objects":["门"],"note":"模型没有物体接触，已改写为前倾双手持续发力的推门动作"}',
   '用户：一脚踹门 → {"prompt":"a person shifts weight onto one leg, lifts the other knee quickly, then kicks forward hard and fast while leaning back slightly","steps":["重心移到支撑腿","抬起另一侧膝盖","小腿快速向前蹬出","收腿站稳"],"segments":["a person shifts weight onto one leg and lifts the other knee","a person kicks forward hard and fast, then pulls the leg back"],"objects":["门"],"note":"模型没有物体接触，已改写为快速提膝前蹬的踹门动作"}',
@@ -75,6 +82,17 @@ const VISION_SYSTEM_PROMPT = [
   OUTPUT_SPEC,
 ].join(' ');
 
+/** 用户手动改过拆解后，按步骤重新生成英文提示词与分段 */
+const REFINE_SYSTEM_PROMPT = [
+  'You rewrite an edited Chinese body-motion breakdown into Kimodo motion prompts.',
+  'The numbered steps are the source of truth: keep their order, directions, force and tempo, and do not add, remove or reorder actions.',
+  'The target model renders one human body with no props and no scene: never name objects, describe body mechanics only.',
+  MOTION_RULES,
+  'Write in motion-capture caption style: present tense, "a person ...", one sentence under 45 words for "prompt".',
+  'Split the steps into 2 to 4 consecutive English sentences for "segments", one per phase; if there are only one or two steps, 1 or 2 segments are fine.',
+  'Return STRICT JSON only, no markdown and no prose: {"prompt":"<one English sentence>","segments":["<consecutive English sentences>"]}',
+].join(' ');
+
 export interface EnhancePromptInput {
   /** 用户描述（可为空，只靠图片） */
   prompt?: string;
@@ -100,6 +118,21 @@ export interface EnhancePromptResult {
   decomposition: PromptDecomposition | null;
   /** 2–4 段英文提示词，可交给后端分段生成 */
   segments: string[];
+}
+
+export interface RefinePromptInput {
+  /** 用户修改后的中文动作链（按顺序） */
+  steps: string[];
+  /** 原描述里的物体（仅用于提示模型不要写物体） */
+  objects?: string[];
+  /** 上次转译的说明，帮助模型保持上下文 */
+  note?: string;
+}
+
+export interface RefinePromptResult {
+  prompt: string;
+  segments: string[];
+  model: string;
 }
 
 /** 提示词模型是否可用（Key、接口地址、模型名缺一不可） */
@@ -311,4 +344,49 @@ export async function enhancePrompt(input: EnhancePromptInput): Promise<EnhanceP
     decomposition,
     segments: parsed?.segments ?? [],
   };
+}
+
+/**
+ * 按用户手动修改后的拆解重新生成英文提示词与分段。
+ *
+ * 这一步不再重新理解原始意图，只把步骤当作唯一事实来源做「中译英 + 分段」，
+ * 避免模型又按自己的理解把动作改回去。
+ */
+export async function refinePrompt(input: RefinePromptInput): Promise<RefinePromptResult> {
+  if (!promptEnhancerReady()) {
+    throw new Error(
+      '尚未配置提示词模型：请在 .env 设置 KIMODO_PROMPT_PROVIDER 与对应的 API Key（默认 DeepSeek 用 DEEPSEEK_API_KEY）',
+    );
+  }
+
+  const steps = input.steps
+    .map((step) => step.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  if (steps.length === 0) throw new Error('动作拆解不能为空');
+
+  const objects = (input.objects ?? []).map((item) => item.trim()).filter(Boolean);
+  const model = config.kimodo.promptModel;
+  const userText = [
+    `Objects mentioned by the user (cannot be simulated, never name them): ${objects.length ? objects.join('、') : 'none'}`,
+    input.note ? `Previous note: ${input.note}` : '',
+    'Motion steps in order:',
+    ...steps.map((step, index) => `${index + 1}. ${step}`),
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  let result = await complete(model, REFINE_SYSTEM_PROMPT, userText, config.kimodo.promptMaxTokens);
+  let parsed = parseModelOutput(result.content);
+  if (!parsed && !sanitizePlain(result.content) && result.finishReason === 'length') {
+    const retryTokens = Math.min(config.kimodo.promptMaxTokens * 2, 8000);
+    result = await complete(model, REFINE_SYSTEM_PROMPT, userText, retryTokens);
+    parsed = parseModelOutput(result.content);
+  }
+
+  const prompt = parsed?.prompt ?? sanitizePlain(result.content);
+  if (!prompt) throw new Error('提示词模型没有返回内容，请重试');
+
+  log.info(`按拆解重新生成（${model}）：${prompt.slice(0, 80)}`);
+  return { prompt, segments: parsed?.segments ?? [], model };
 }
