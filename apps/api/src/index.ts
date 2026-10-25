@@ -2,6 +2,7 @@ import { buildApp } from './app.js';
 import { config } from './config.js';
 import { createLogger } from './lib/logger.js';
 import { listProviders } from './providers/registry.js';
+import { kimodoService } from './services/kimodo.js';
 import { activeProvider, maskApiKey, providerCredential } from './services/settings.js';
 
 const log = createLogger('server');
@@ -29,6 +30,7 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     log.info(`收到 ${signal}，正在退出…`);
+    kimodoService.shutdown();
     await worker.stop();
     await workspace.flush();
     await app.close();

@@ -1,37 +1,59 @@
 import { request } from './client';
 
 export interface KimodoStatus {
+  /** .env 里的可执行文件 / 模型是否齐备 */
+  ready: boolean;
+  /** 生成器进程是否已拉起（首次生成时懒启动） */
   running: boolean;
-  port: number;
-  url: string;
-  pid: number | null;
-  startedAt: number | null;
-  error: string | null;
+  /** 是否有任务正在生成 */
+  busy: boolean;
+  /** 排队中的任务数 */
+  queued: number;
+  generatorExe: string | null;
+  motionModel: string | null;
+  textBundle: string | null;
   outputDir: string;
+  backend: string;
+  /** 提示词转译模型名 */
+  promptModel: string;
+  /** 是否配置了提示词模型 Key */
+  promptModelReady: boolean;
+  error: string | null;
 }
+
+export type KimodoStatusValue = 'queued' | 'running' | 'ready' | 'failed';
 
 export interface KimodoAnimation {
   id: string;
   prompt: string;
   frames: number;
-  diffusion_steps: number;
+  steps: number;
   seed: number;
-  created_at: string;
-  status: 'queued' | 'running' | 'ready' | 'failed';
+  status: KimodoStatusValue;
   error?: string;
-  model: string;
-  text_quantization: string;
+  createdAt: number;
+  durationMs?: number;
+  /** 开始生成的时刻，用于计算进度 */
+  startedAt?: number;
+  /** 预计总耗时（毫秒） */
+  etaMs?: number;
+  /** 预计其中冷启动加载模型的耗时（毫秒），0 表示权重已驻留 */
+  loadMs?: number;
+}
+
+export interface SomaSkeleton {
+  names: string[];
+  parents: number[];
+  offsets: [number, number, number][];
 }
 
 export interface KimodoGenerateBody {
   prompt: string;
-  frames?: number;
-  steps?: number;
+  frames: number;
+  steps: number;
   seed?: number;
-  model?: string;
-  text_quantization?: string;
-  segments?: { prompt: string; frames: number }[];
-  transition_frames?: number;
+  /** 首尾过渡帧，留空用后端默认值 5 */
+  transitionFrames?: number;
 }
 
 export interface KimodoImportResult {
@@ -40,27 +62,103 @@ export interface KimodoImportResult {
   clipName: string;
 }
 
+export type KimodoArtifactKey = 'prompt' | 'meta' | 'mixamo' | 'root' | 'rotations';
+
+/** 一次生成留下的中间产物 */
+export interface KimodoArtifact {
+  key: KimodoArtifactKey;
+  label: string;
+  /** 相对输出目录的路径 */
+  file: string;
+  format: 'text' | 'json' | 'f32';
+  size: number;
+  exists: boolean;
+  /** 二进制产物只展示信息，不可当文本查看 */
+  viewable: boolean;
+  description: string;
+}
+
+/** 产物关联到的新建动画项目 */
+export interface KimodoRelation {
+  id: string;
+  name: string;
+  importedName: string | null;
+  updatedAt: string;
+  clipCount: number;
+  trackCount: number;
+}
+
+export interface KimodoArtifactsResponse {
+  task: KimodoAnimation;
+  artifacts: KimodoArtifact[];
+  relations: KimodoRelation[];
+}
+
+export interface KimodoArtifactContent {
+  key: 'prompt' | 'meta' | 'mixamo';
+  file: string;
+  format: 'text' | 'json';
+  size: number;
+  text: string;
+  truncated: boolean;
+}
+
+export interface EnhancePromptResult {
+  prompt: string;
+  model: string;
+  usedImage: boolean;
+}
+
 export const kimodoApi = {
   status: () => request<KimodoStatus>('/api/kimodo/status'),
-  start: () => request<KimodoStatus>('/api/kimodo/start', { method: 'POST' }),
-  stop: () => request<KimodoStatus>('/api/kimodo/stop', { method: 'POST' }),
 
-  /** 触发生成（透传到 kimodo demo） */
+  skeleton: () => request<SomaSkeleton>('/api/kimodo/skeleton'),
+
   generate: (body: KimodoGenerateBody) =>
     request<KimodoAnimation>('/api/kimodo/generate', {
       method: 'POST',
       body: JSON.stringify(body),
     }),
 
-  /** 列出 demo 里的所有动画（含 queued/running/ready） */
   animations: () => request<KimodoAnimation[]>('/api/kimodo/animations'),
 
-  /** 把指定动画转换成 Mixamo 动画 JSON 并返回 */
+  remove: (id: string) =>
+    request<{ ok: boolean }>(`/api/kimodo/animations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
   importAnimation: (id: string, clipName?: string) => {
     const query = clipName ? `?clipName=${encodeURIComponent(clipName)}` : '';
     return request<KimodoImportResult>(`/api/kimodo/import/${encodeURIComponent(id)}${query}`);
   },
 
-  /** iframe 内嵌用的地址（注入了 postMessage 桥） */
-  frameUrl: () => '/api/kimodo/frame',
+  /** 中间产物清单与关联关系 */
+  artifacts: (id: string) =>
+    request<KimodoArtifactsResponse>(`/api/kimodo/animations/${encodeURIComponent(id)}/artifacts`),
+
+  /** 产物文本内容（JSON 已格式化） */
+  artifact: (id: string, key: string) =>
+    request<KimodoArtifactContent>(
+      `/api/kimodo/animations/${encodeURIComponent(id)}/artifact?key=${encodeURIComponent(key)}`,
+    ),
+
+  /** 提示词转译：中文描述 / 参考图片 → 英文动作提示词 */
+  enhancePrompt: (body: { prompt: string; image?: string }) =>
+    request<EnhancePromptResult>('/api/kimodo/enhance-prompt', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** 拉取原始动作数据（Float32 小端） */
+  async motion(id: string): Promise<{ root: Float32Array; rotations: Float32Array }> {
+    const [rootResponse, rotationResponse] = await Promise.all([
+      fetch(`/api/kimodo/animations/${encodeURIComponent(id)}/root.f32`),
+      fetch(`/api/kimodo/animations/${encodeURIComponent(id)}/rotations.f32`),
+    ]);
+    if (!rootResponse.ok || !rotationResponse.ok) {
+      throw new Error('动作数据读取失败');
+    }
+    return {
+      root: new Float32Array(await rootResponse.arrayBuffer()),
+      rotations: new Float32Array(await rotationResponse.arrayBuffer()),
+    };
+  },
 };

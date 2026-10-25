@@ -8,6 +8,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json && node scripts/copy-runtime-files.mjs",
     "start": "node dist/index.js",
+    "mcp": "node dist/mcp.js",
+    "mcp:dev": "tsx src/mcp.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "smoke": "tsx src/scripts/smoke.ts",
     "test:providers": "tsx src/scripts/provider-selftest.ts",

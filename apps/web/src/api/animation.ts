@@ -75,6 +75,8 @@ export interface SavedAnimationProject {
   clipCount: number;
   trackCount: number;
   hasData: boolean;
+  /** 进入回收站的时间（只有回收站里的项目才有） */
+  deletedAt?: string;
 }
 
 export interface SavedAnimationProjectDetail extends SavedAnimationProject {
@@ -126,8 +128,30 @@ export const animationApi = {
       body: JSON.stringify(project),
     }),
 
+  /** 删除 = 移入回收站（软删除） */
   deleteProject: (id: string) =>
-    request<{ ok: boolean }>(`/api/anim/projects/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    request<{ ok: boolean; trashed: boolean }>(`/api/anim/projects/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  /** 重命名；重名时服务端返回 409 */
+  renameProject: (id: string, name: string) =>
+    request<SavedAnimationProject>(`/api/anim/projects/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name }),
+    }),
+
+  trash: () => request<{ projects: SavedAnimationProject[] }>('/api/anim/trash'),
+
+  restoreProject: (id: string) =>
+    request<{ ok: boolean; renamed: boolean; project: SavedAnimationProject }>(
+      `/api/anim/projects/${encodeURIComponent(id)}/restore`,
+      { method: 'POST', body: '{}' },
+    ),
+
+  /** 彻底删除回收站里的项目（不可恢复） */
+  purgeProject: (id: string) =>
+    request<{ ok: boolean }>(`/api/anim/trash/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   /** 只取流，不进 HTTP 缓存（服务端 no-store，客户端只在内存里留一份） */
   fileUrl: (filePath: string) => `/api/anim/file?path=${encodeURIComponent(filePath)}`,

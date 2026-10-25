@@ -2,9 +2,26 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import { config } from '../config.js';
-import { joinData } from '../lib/paths.js';
 import { createLogger } from '../lib/logger.js';
 import { animationCover, COVER_CACHE_VERSION } from '../services/covers.js';
+import {
+  clipsOf,
+  countTracks,
+  importedOf,
+  isNameTaken,
+  listProjects,
+  listTrash,
+  normalizeName,
+  projectId,
+  purgeProject,
+  readProject,
+  renameProject,
+  restoreProject,
+  summaryOf,
+  trashProject,
+  writeProject,
+  type SavedProject,
+} from '../services/animProjects.js';
 
 const log = createLogger('anim');
 
@@ -371,16 +388,7 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
 
   /** 项目列表：只返回摘要，动画数据按 id 单独取，避免一次传输几百 MB */
   app.get('/api/anim/projects', async () => {
-    const entries = await fs.readdir(projectsDir, { withFileTypes: true }).catch(() => []);
-    const projects: ProjectSummary[] = [];
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
-      const id = entry.name.slice(0, -'.json'.length);
-      const record = await readProject(id);
-      if (record) projects.push(summaryOf(record));
-    }
-    projects.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-    return { projects };
+    return { projects: await listProjects() };
   });
 
   app.get('/api/anim/projects/:id', async (request, reply) => {
@@ -416,8 +424,12 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
     const trackCount = countTracks(clips);
     const name =
       typeof body.name === 'string' && body.name.trim()
-        ? body.name.trim().slice(0, 80)
+        ? normalizeName(body.name as string)
         : (existing?.name ?? '新建动画');
+    // 重名校验：同一时间只允许一个未删除项目使用同一个名称
+    if (await isNameTaken(name, id)) {
+      return reply.code(409).send({ error: `名称「${name}」已被使用` });
+    }
 
     const record: SavedProject = {
       id,
@@ -440,8 +452,7 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
     };
 
     try {
-      await fs.mkdir(projectsDir, { recursive: true });
-      await fs.writeFile(projectPath(id), JSON.stringify(record), 'utf8');
+      await writeProject(record);
     } catch (err) {
       return reply.code(500).send({ error: `保存失败：${(err as Error).message}` });
     }
@@ -449,123 +460,47 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
     return summaryOf(record);
   });
 
+  /** 重命名（只改名称，不动动画数据） */
+  app.patch('/api/anim/projects/:id', async (request, reply) => {
+    const id = projectId((request.params as { id?: string }).id);
+    if (!id) return reply.code(400).send({ error: '无效的项目 id' });
+    const body = (request.body ?? {}) as { name?: unknown };
+    if (typeof body.name !== 'string') return reply.code(400).send({ error: 'name 必须是字符串' });
+    const result = await renameProject(id, body.name);
+    if ('error' in result) return reply.code(result.status).send({ error: result.error });
+    log.info(`新建动画已重命名：${result.project.name}`);
+    return result.project;
+  });
+
+  /** 删除 = 移入回收站（软删除），可在回收站恢复 */
   app.delete('/api/anim/projects/:id', async (request, reply) => {
     const id = projectId((request.params as { id?: string }).id);
     if (!id) return reply.code(400).send({ error: '无效的项目 id' });
-    const removed = await fs.rm(projectPath(id), { force: true }).then(
-      () => true,
-      () => false,
-    );
-    return { ok: removed };
+    const trashed = await trashProject(id);
+    return { ok: trashed, trashed };
+  });
+
+  /** 回收站列表 */
+  app.get('/api/anim/trash', async () => {
+    return { projects: await listTrash() };
+  });
+
+  /** 从回收站恢复 */
+  app.post('/api/anim/projects/:id/restore', async (request, reply) => {
+    const id = projectId((request.params as { id?: string }).id);
+    if (!id) return reply.code(400).send({ error: '无效的项目 id' });
+    const result = await restoreProject(id);
+    if (!result) return reply.code(404).send({ error: '回收站里没有该项目' });
+    log.info(`新建动画已恢复：${result.project.name}${result.renamed ? '（重名，已自动改名）' : ''}`);
+    return { ok: true, renamed: result.renamed, project: result.project };
+  });
+
+  /** 彻底删除回收站项目 */
+  app.delete('/api/anim/trash/:id', async (request, reply) => {
+    const id = projectId((request.params as { id?: string }).id);
+    if (!id) return reply.code(400).send({ error: '无效的项目 id' });
+    return { ok: await purgeProject(id) };
   });
 }
 
-// ===== 新建动画项目的磁盘格式 =====
 
-const projectsDir = joinData('anim-projects');
-
-interface ProjectImportedSummary {
-  name: string;
-  clipCount: number;
-  trackCount: number;
-}
-
-interface SavedProject {
-  id: string;
-  name: string;
-  basePath: string;
-  baseName: string;
-  createdAt: string;
-  updatedAt: string;
-  imported: ProjectImportedSummary | null;
-  clipCount: number;
-  trackCount: number;
-  hasData: boolean;
-  data: unknown;
-}
-
-type ProjectSummary = Omit<SavedProject, 'data'>;
-
-/** 只允许字母数字下划线短横线，避免拼出目录穿越路径 */
-function projectId(raw: string | undefined): string | null {
-  const id = (raw ?? '').trim();
-  return /^[A-Za-z0-9_-]{1,80}$/.test(id) ? id : null;
-}
-
-function projectPath(id: string): string {
-  return path.join(projectsDir, `${id}.json`);
-}
-
-function importedOf(raw: unknown): ProjectImportedSummary | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const value = raw as { name?: unknown; clipCount?: unknown; trackCount?: unknown };
-  if (typeof value.name !== 'string' || !value.name.trim()) return null;
-  return {
-    name: value.name,
-    clipCount: Number.isFinite(value.clipCount) ? Number(value.clipCount) : 0,
-    trackCount: Number.isFinite(value.trackCount) ? Number(value.trackCount) : 0,
-  };
-}
-
-function normalizeRecord(raw: unknown, id: string): SavedProject | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const value = raw as Partial<SavedProject>;
-  const now = new Date().toISOString();
-  const data = value.data ?? null;
-  const clips = clipsOf(data);
-  return {
-    id,
-    name: typeof value.name === 'string' && value.name.trim() ? value.name : '新建动画',
-    basePath: typeof value.basePath === 'string' ? value.basePath : '',
-    baseName: typeof value.baseName === 'string' ? value.baseName : '',
-    createdAt: typeof value.createdAt === 'string' ? value.createdAt : now,
-    updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : now,
-    imported: importedOf(value.imported),
-    clipCount: clips.length,
-    trackCount: countTracks(clips),
-    hasData: data !== null,
-    data,
-  };
-}
-
-/** 从动画数据里取出片段数组（格式不对时返回空数组） */
-function clipsOf(data: unknown): unknown[] {
-  if (!data || typeof data !== 'object') return [];
-  const clips = (data as { clips?: unknown }).clips;
-  return Array.isArray(clips) ? clips : [];
-}
-
-/** 统计片段里的轨迹总数 */
-function countTracks(clips: unknown[]): number {
-  let total = 0;
-  for (const clip of clips) {
-    const tracks = (clip as { tracks?: unknown }).tracks;
-    if (Array.isArray(tracks)) total += tracks.length;
-  }
-  return total;
-}
-
-async function readProject(id: string): Promise<SavedProject | null> {
-  const text = await fs.readFile(projectPath(id), 'utf8').catch(() => null);
-  if (text === null) return null;
-  try {
-    return normalizeRecord(JSON.parse(text), id);
-  } catch {
-    return null;
-  }
-}
-
-function summaryOf(record: SavedProject): ProjectSummary {
-  return {
-    id: record.id,
-    name: record.name,
-    basePath: record.basePath,
-    baseName: record.baseName,
-    createdAt: record.createdAt,
-    updatedAt: record.updatedAt,
-    imported: record.imported,
-    clipCount: record.clipCount,
-    trackCount: record.trackCount,
-    hasData: record.hasData,
-  };
-}

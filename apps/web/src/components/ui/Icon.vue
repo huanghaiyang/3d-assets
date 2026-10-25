@@ -52,6 +52,8 @@ const PATHS: Record<string, string> = {
   chevronDown: 'M6 9l6 6 6-6',
   chevronRight: 'M9 6l6 6-6 6',
   pose: 'M12 2.5v6.5M12 9l-4 3.5M12 9l4 3.5M12 12v9.5M8 21.5h8M4.5 12.5h15',
+  restore: 'M1 4v6h6M3.51 15a9 9 0 1 0 2.13-9.36L1 10',
+  dice: 'M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM8.5 8.5h.01M15.5 8.5h.01M12 12h.01M8.5 15.5h.01M15.5 15.5h.01',
 };
 
 const path = computed(() => PATHS[props.name] ?? '');

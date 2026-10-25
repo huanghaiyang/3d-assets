@@ -31,14 +31,15 @@ function onJsonPicked(event: Event): void {
 async function deleteActive(): Promise<void> {
   const id = store.activeNewAnimationId;
   if (!id) return;
-  const detail = store.activeNewAnimation?.saved
-    ? '该项目已保存到服务端，删除后无法恢复。'
-    : '已导入的动画数据会一并清除。';
+  const project = store.activeNewAnimation;
+  const detail = project?.saved
+    ? '已保存的项目会移入回收站，之后仍可恢复。'
+    : '该动画尚未保存，移除后无法找回。';
   const ok = await confirmAction({
-    title: '删除新建动画',
+    title: project?.saved ? '移入回收站' : '移除新建动画',
     message: '确定删除当前新建动画？',
     detail,
-    confirmText: '删除',
+    confirmText: project?.saved ? '移入回收站' : '移除',
   });
   if (!ok) return;
   store.deleteNewAnimation(id);
@@ -136,9 +137,20 @@ function clipDuration(seconds: number): string {
             <Icon name="check" :size="13" />
             {{ store.savingAnimation ? '保存中…' : '保存' }}
           </button>
-          <button class="btn" type="button" @click="store.exitNewAnimation()">退出编辑</button>
+          <button
+            class="btn"
+            type="button"
+            title="退出编辑只是回到进入编辑前选中的原动画；当前项目仍保留在左侧「新建动画」里，可随时重新打开，不代表保存失败"
+            @click="store.exitNewAnimation()"
+          >
+            退出编辑
+          </button>
           <button class="btn btn-danger" type="button" @click="deleteActive">删除</button>
         </div>
+        <p class="data-hint">
+          「退出编辑」不会删除项目，也不会撤销已保存的内容；它只是把 3D 视图切回进入编辑前选中的原动画。
+          保存进度见上方「保存状态」，左侧「新建动画」卡片会标出「已保存 / 未保存」。
+        </p>
         <input
           ref="jsonInput"
           class="hidden-input"

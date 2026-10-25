@@ -1,6 +1,11 @@
 import { computed, ref, shallowRef, watch } from 'vue';
 import { defineStore } from 'pinia';
-import { animationApi, type AnimationFile, type AnimationInfoResponse } from '@/api/animation';
+import {
+  animationApi,
+  type AnimationFile,
+  type AnimationInfoResponse,
+  type SavedAnimationProject,
+} from '@/api/animation';
 import {
   FbxPlayer,
   type AnimationData,
@@ -46,6 +51,8 @@ export interface NewAnimationProject {
   updatedAt: string | null;
   /** 服务端存有动画数据，但本地还没取回来 */
   hasData: boolean;
+  /** 进入回收站的时间（只有回收站里的项目才有） */
+  deletedAt?: string;
 }
 
 export const useAnimationStore = defineStore('animation', () => {
@@ -95,6 +102,11 @@ export const useAnimationStore = defineStore('animation', () => {
   const savingAnimation = ref(false);
   const projectsLoading = ref(false);
   const importedAnimation = ref<{ name: string; clipCount: number; trackCount: number } | null>(null);
+  /** 回收站里的新建动画（软删除，可恢复或彻底删除） */
+  const trashProjects = shallowRef<NewAnimationProject[]>([]);
+  const trashLoading = ref(false);
+  /** 左侧列表是否正在展示回收站 */
+  const trashOpen = ref(false);
   /** 进入新建动画之前选中的 FBX，退出编辑时回到它 */
   const previousFile = ref<AnimationFile | null>(null);
 
@@ -497,11 +509,11 @@ export const useAnimationStore = defineStore('animation', () => {
     );
   }
 
-  /** 项目名按序号递增，避开已保存项目用掉的名字 */
+  /** 项目名按序号递增，避开已保存项目用掉的名字（大小写不敏感） */
   function nextProjectName(): string {
-    const used = new Set(newAnimations.value.map((item) => item.name));
+    const used = new Set(newAnimations.value.map((item) => item.name.toLowerCase()));
     let index = 1;
-    while (used.has(`新建动画 ${index}`)) index += 1;
+    while (used.has(`新建动画 ${index}`.toLowerCase())) index += 1;
     return `新建动画 ${index}`;
   }
 
@@ -623,6 +635,7 @@ export const useAnimationStore = defineStore('animation', () => {
   /** 退出编辑但保留新建动画；回到之前选中的 FBX（没有就清空视图） */
   function exitNewAnimation(): void {
     if (!newAnimationMode.value) return;
+    const project = activeNewAnimation.value;
     if (poseMode.value) setPoseMode(false);
     closeAnimationData();
     activeNewAnimationId.value = null;
@@ -630,25 +643,38 @@ export const useAnimationStore = defineStore('animation', () => {
     const target = previousFile.value ?? files.value[0] ?? null;
     if (target) {
       void select(target);
-      return;
+    } else {
+      player?.clear();
+      selectedPath.value = null;
+      resetSelection();
+      syncBones();
+      syncNodes();
     }
-    player?.clear();
-    selectedPath.value = null;
-    resetSelection();
-    syncBones();
-    syncNodes();
+    if (project?.dirty) {
+      toast('info', `已退出编辑。注意「${project.name}」还有未保存的修改，重新打开项目后需要再次保存`);
+    } else if (project) {
+      toast('info', `已退出编辑：「${project.name}」仍保留在左侧「新建动画」中，视图切回了原动画`);
+    }
   }
 
-  /** 删除新建动画；已保存的项目同时从服务端删除。原有 FBX 动画没有删除入口 */
+  /** 删除新建动画 = 移入回收站；原有 FBX 动画没有删除入口 */
   function deleteNewAnimation(id: string): void {
     const project = newAnimations.value.find((item) => item.id === id);
     if (!project) return;
     const wasActive = activeNewAnimationId.value === id;
     newAnimations.value = newAnimations.value.filter((item) => item.id !== id);
     if (project.saved) {
-      void animationApi.deleteProject(id).catch((err) => {
-        toast('error', `删除已保存的动画失败：${(err as Error).message}`);
-      });
+      void animationApi
+        .deleteProject(id)
+        .then(() => {
+          toast('info', `「${project.name}」已移入回收站，可在回收站恢复`);
+          void loadTrash();
+        })
+        .catch((err) => {
+          toast('error', `移入回收站失败：${(err as Error).message}`);
+        });
+    } else {
+      toast('info', `已移除未保存的「${project.name}」`);
     }
     if (!wasActive) return;
 
@@ -774,6 +800,105 @@ export const useAnimationStore = defineStore('animation', () => {
     }
   }
 
+  /** 服务端摘要 → 本地项目（动画数据选中时再按需拉取） */
+  function projectFromSaved(item: SavedAnimationProject): NewAnimationProject {
+    return {
+      id: item.id,
+      name: item.name,
+      basePath: item.basePath,
+      baseName: item.baseName,
+      data: null,
+      imported: item.imported,
+      saved: true,
+      dirty: false,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      hasData: item.hasData,
+      deletedAt: item.deletedAt,
+    };
+  }
+
+  /** 改名：本地先查重（大小写不敏感），已保存的项目交给服务端落盘 */
+  async function renameNewAnimation(id: string, rawName: string): Promise<boolean> {
+    const name = rawName.trim().replace(/\s+/g, ' ').slice(0, 80);
+    if (!name) {
+      toast('error', '名称不能为空');
+      return false;
+    }
+    const project = newAnimations.value.find((item) => item.id === id);
+    if (!project) return false;
+    if (project.name === name) return true;
+
+    const key = name.toLowerCase();
+    if (newAnimations.value.some((item) => item.id !== id && item.name.toLowerCase() === key)) {
+      toast('error', `名称「${name}」已被使用`);
+      return false;
+    }
+
+    if (!project.saved) {
+      updateProject(id, { name });
+      return true;
+    }
+    try {
+      const saved = await animationApi.renameProject(id, name);
+      updateProject(id, { name: saved.name, updatedAt: saved.updatedAt });
+      toast('success', `已重命名为「${saved.name}」`);
+      return true;
+    } catch (err) {
+      toast('error', (err as Error).message);
+      return false;
+    }
+  }
+
+  /** 读取回收站项目 */
+  async function loadTrash(): Promise<void> {
+    trashLoading.value = true;
+    try {
+      const result = await animationApi.trash();
+      trashProjects.value = result.projects.map(projectFromSaved);
+    } catch (err) {
+      toast('error', `读取回收站失败：${(err as Error).message}`);
+    } finally {
+      trashLoading.value = false;
+    }
+  }
+
+  /** 打开/关闭回收站视图（打开时重新读取，保证列表是最新的） */
+  async function toggleTrash(): Promise<void> {
+    trashOpen.value = !trashOpen.value;
+    if (trashOpen.value) await loadTrash();
+  }
+
+  /** 从回收站恢复；重名时服务端会自动加后缀 */
+  async function restoreFromTrash(id: string): Promise<void> {
+    try {
+      const result = await animationApi.restoreProject(id);
+      trashProjects.value = trashProjects.value.filter((item) => item.id !== id);
+      if (!newAnimations.value.some((item) => item.id === result.project.id)) {
+        newAnimations.value = [...newAnimations.value, projectFromSaved(result.project)];
+      }
+      toast(
+        'success',
+        result.renamed
+          ? `已恢复，因重名自动改名为「${result.project.name}」`
+          : `已恢复「${result.project.name}」`,
+      );
+    } catch (err) {
+      toast('error', `恢复失败：${(err as Error).message}`);
+    }
+  }
+
+  /** 彻底删除回收站项目（不可恢复） */
+  async function purgeFromTrash(id: string): Promise<void> {
+    try {
+      await animationApi.purgeProject(id);
+      trashProjects.value = trashProjects.value.filter((item) => item.id !== id);
+      toast('success', '已彻底删除');
+    } catch (err) {
+      toast('error', `删除失败：${(err as Error).message}`);
+    }
+  }
+
   /** 读取服务端已保存的新建动画（只取摘要，选中时再拉动画数据） */
   async function loadProjects(): Promise<void> {
     projectsLoading.value = true;
@@ -782,27 +907,15 @@ export const useAnimationStore = defineStore('animation', () => {
       const existing = new Set(newAnimations.value.map((item) => item.id));
       const loaded = result.projects
         .filter((item) => !existing.has(item.id))
-        .map(
-          (item): NewAnimationProject => ({
-            id: item.id,
-            name: item.name,
-            basePath: item.basePath,
-            baseName: item.baseName,
-            data: null,
-            imported: item.imported,
-            saved: true,
-            dirty: false,
-            createdAt: item.createdAt,
-            updatedAt: item.updatedAt,
-            hasData: item.hasData,
-          }),
-        );
+        .map(projectFromSaved);
       newAnimations.value = [...newAnimations.value, ...loaded];
     } catch (err) {
       toast('error', `读取已保存的动画失败：${(err as Error).message}`);
     } finally {
       projectsLoading.value = false;
     }
+    // 顺带刷新回收站，让列表上的入口能显示数量
+    if (!trashOpen.value) void loadTrash();
   }
 
   // ===== 骨骼 =====
@@ -1097,6 +1210,14 @@ export const useAnimationStore = defineStore('animation', () => {
     applyImportedData,
     saveNewAnimation,
     loadProjects,
+    renameNewAnimation,
+    trashProjects,
+    trashLoading,
+    trashOpen,
+    loadTrash,
+    toggleTrash,
+    restoreFromTrash,
+    purgeFromTrash,
     showSkeleton,
     boneDisplayMode,
     boneTree,

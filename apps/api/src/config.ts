@@ -55,6 +55,32 @@ export const config = {
   pollIntervalMs: int(process.env.POLL_INTERVAL_MS, 5000),
   /** 本地并发上限，接口默认提供 3 个并发 */
   maxConcurrency: Math.min(int(process.env.MAX_CONCURRENCY, 3), 3),
+  /** Kimodo 文生动作（本地 CPU 推理），路径全部由 .env 指定 */
+  kimodo: {
+    /** kmd-generate 可执行文件（必填，未配置时功能不可用） */
+    generatorExe: text(process.env.KIMODO_GENERATE_EXE),
+    /** SOMA RP v1.1 动作模型 GGUF */
+    motionModel: text(process.env.KIMODO_MOTION_MODEL),
+    /** LLM2Vec 文本编码器 GGUF */
+    textBundle: text(process.env.KIMODO_TEXT_BUNDLE),
+    /** 生成结果目录，留空用 data/kimodo-output */
+    outputDir:
+      text(process.env.KIMODO_OUTPUT_DIR) ?? path.resolve(repoRoot, 'data', 'kimodo-output'),
+    /** 运行 to_mixamo.py 的 Python 解释器（需要 numpy） */
+    python: text(process.env.KIMODO_PYTHON) ?? 'python',
+    /** ggml 计算后端，CPU 机器用 cpu */
+    backend: text(process.env.KIMODO_BACKEND) ?? 'cpu',
+    /** 文本编码器分层驻留块数，留空给生成器默认值 */
+    textLayerChunk: text(process.env.KIMODO_TEXT_LAYER_CHUNK),
+    /**
+     * 提示词转译用的大模型（DeepSeek，OpenAI 兼容接口）。
+     * Key 只在服务端读取，绝不返回给前端 / MCP。
+     */
+    promptApiKey: text(process.env.DEEPSEEK_API_KEY),
+    promptBaseUrl: (text(process.env.DEEPSEEK_BASE_URL) ?? 'https://api.deepseek.com').replace(/\/+$/, ''),
+    promptModel: text(process.env.KIMODO_PROMPT_MODEL) ?? 'deepseek-flash',
+    promptTimeoutMs: int(process.env.KIMODO_PROMPT_TIMEOUT_MS, 90_000),
+  },
   webDistDir,
   repoRoot,
   isProd: process.env.NODE_ENV === 'production',

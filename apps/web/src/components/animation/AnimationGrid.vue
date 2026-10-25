@@ -46,17 +46,68 @@ function pick(file: AnimationFile): void {
   void store.select(file);
 }
 
+// ===== 新建动画：内联改名 =====
+const renamingId = ref<string | null>(null);
+const renameDraft = ref('');
+
+/** 输入框挂载后立即聚焦并全选，减少一次点击 */
+function focusRenameInput(el: unknown): void {
+  if (!(el instanceof HTMLInputElement)) return;
+  el.focus();
+  el.select();
+}
+
+function startRename(project: NewAnimationProject): void {
+  renamingId.value = project.id;
+  renameDraft.value = project.name;
+}
+
+function cancelRename(): void {
+  renamingId.value = null;
+}
+
+/** Enter / 失焦提交；重名或为空时保留输入框便于继续修改 */
+async function commitRename(project: NewAnimationProject): Promise<void> {
+  if (renamingId.value !== project.id) return;
+  const name = renameDraft.value;
+  renamingId.value = null;
+  const ok = await store.renameNewAnimation(project.id, name);
+  if (!ok) {
+    renamingId.value = project.id;
+    renameDraft.value = name;
+  }
+}
+
+function formatDeleted(value?: string): string {
+  if (!value) return '';
+  return new Date(value).toLocaleString('zh-CN', { hour12: false });
+}
+
 /** 只有新建动画允许删除；原有 FBX 卡片没有删除入口 */
 async function removeProject(project: NewAnimationProject): Promise<void> {
-  const detail = project.saved ? '该项目已保存到服务端，删除后无法恢复。' : '已导入的动画数据会一并清除。';
+  const detail = project.saved
+    ? '已保存的项目会移入回收站，之后仍可恢复。'
+    : '该动画尚未保存，移除后无法找回。';
   const ok = await confirmAction({
-    title: '删除新建动画',
+    title: project.saved ? '移入回收站' : '移除新建动画',
     message: `确定删除「${project.name}」？`,
     detail,
-    confirmText: '删除',
+    confirmText: project.saved ? '移入回收站' : '移除',
   });
   if (!ok) return;
   store.deleteNewAnimation(project.id);
+}
+
+/** 彻底删除回收站里的项目（不可恢复） */
+async function purgeProject(project: NewAnimationProject): Promise<void> {
+  const ok = await confirmAction({
+    title: '彻底删除',
+    message: `确定彻底删除「${project.name}」？`,
+    detail: '该项目的数据文件会从回收站中永久移除，无法再恢复。',
+    confirmText: '彻底删除',
+  });
+  if (!ok) return;
+  void store.purgeFromTrash(project.id);
 }
 
 /** 卡片角标：新建 / 未保存 / 已保存 */
@@ -156,7 +207,16 @@ function onPageSize(event: Event): void {
           <Icon name="plus" :size="11" />
           <span>新建动画</span>
           <span class="chip">{{ store.newAnimations.length }}</span>
-          <span class="section-hint">仅新建动画可删除</span>
+          <button
+            class="trash-toggle"
+            :class="{ active: store.trashOpen }"
+            type="button"
+            title="打开回收站"
+            @click="store.toggleTrash()"
+          >
+            <Icon name="trash" :size="10" />
+            回收站<template v-if="store.trashProjects.length > 0"> {{ store.trashProjects.length }}</template>
+          </button>
         </div>
         <div class="grid">
           <div
@@ -179,12 +239,72 @@ function onPageSize(event: Event): void {
                 </div>
                 <span class="new-badge" :class="{ dirty: project.dirty }">{{ projectStatus(project) }}</span>
               </div>
-              <span class="name">{{ project.name }}</span>
+            </button>
+            <form
+              v-if="renamingId === project.id"
+              class="rename-form"
+              @submit.prevent="commitRename(project)"
+            >
+              <input
+                :ref="focusRenameInput"
+                v-model="renameDraft"
+                class="rename-input"
+                type="text"
+                maxlength="80"
+                placeholder="输入新名称"
+                @keydown.esc.stop.prevent="cancelRename"
+                @blur="commitRename(project)"
+              />
+            </form>
+            <template v-else>
+              <span class="name" :title="project.name">{{ project.name }}</span>
               <span class="name-sub" :title="project.baseName">
                 {{ project.baseName }} · {{ project.imported ? project.imported.name : '无动画数据' }}
               </span>
+            </template>
+            <div class="card-actions">
+              <button class="card-icon" type="button" title="重命名" @click.stop="startRename(project)">
+                <Icon name="edit" :size="12" />
+              </button>
+              <button class="card-icon" type="button" title="移入回收站" @click.stop="removeProject(project)">
+                <Icon name="trash" :size="12" />
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section v-if="store.trashOpen" class="new-section trash-section">
+        <div class="section-head">
+          <Icon name="trash" :size="11" />
+          <span>回收站</span>
+          <span class="chip">{{ store.trashProjects.length }}</span>
+          <span class="section-hint">恢复后回到新建动画</span>
+        </div>
+        <p v-if="store.trashLoading" class="state">读取回收站…</p>
+        <p v-else-if="store.trashProjects.length === 0" class="state">回收站是空的</p>
+        <div v-else class="trash-list">
+          <div v-for="item in store.trashProjects" :key="item.id" class="trash-item">
+            <div class="trash-main">
+              <span class="name" :title="item.name">{{ item.name }}</span>
+              <span class="name-sub" :title="item.baseName">
+                {{ item.baseName }} · 删除于 {{ formatDeleted(item.deletedAt) }}
+              </span>
+            </div>
+            <button
+              class="btn btn-ghost btn-icon"
+              type="button"
+              title="恢复到新建动画"
+              @click="store.restoreFromTrash(item.id)"
+            >
+              <Icon name="restore" :size="12" />
             </button>
-            <button class="card-delete" type="button" title="删除新建动画" @click.stop="removeProject(project)">
+            <button
+              class="btn btn-ghost btn-icon danger"
+              type="button"
+              title="彻底删除（不可恢复）"
+              @click="purgeProject(item)"
+            >
               <Icon name="trash" :size="12" />
             </button>
           </div>
@@ -467,10 +587,80 @@ function onPageSize(event: Event): void {
   white-space: nowrap;
 }
 
-.card-delete {
+.trash-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.trash-toggle:hover {
+  background: var(--bg-hover);
+  color: var(--text-dim);
+}
+
+.trash-toggle.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+
+.trash-section {
+  border-bottom: none;
+}
+
+.trash-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.trash-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel-2);
+}
+
+.trash-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.trash-item .btn-icon.danger:hover {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.card-actions {
   position: absolute;
   right: 4px;
   top: 4px;
+  display: flex;
+  gap: 3px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.new-card:hover .card-actions,
+.new-card.active .card-actions {
+  opacity: 1;
+}
+
+.card-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -480,18 +670,30 @@ function onPageSize(event: Event): void {
   border-radius: 4px;
   background: rgba(12, 14, 20, 0.78);
   color: #cbd5e1;
-  opacity: 0.7;
-  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
-.new-card:hover .card-delete,
-.new-card.active .card-delete {
-  opacity: 1;
-}
-
-.card-delete:hover {
+.card-icon:hover {
   background: var(--danger-soft);
   color: var(--danger);
+}
+
+.rename-form {
+  display: flex;
+  width: 100%;
+}
+
+.rename-input {
+  width: 100%;
+  min-width: 0;
+  height: 20px;
+  padding: 0 5px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--bg-app);
+  color: var(--text);
+  font-size: 10.5px;
+  outline: none;
 }
 
 .anim-card {
