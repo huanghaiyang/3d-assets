@@ -247,6 +247,8 @@ function labelOf(dir: string): string {
   flex-direction: column;
   gap: 8px;
   max-width: 340px;
+  /* 提示浮层只是通知，不拦截点击，避免遮住右栏底部「应用手型」按钮 */
+  pointer-events: none;
 }
 
 .toast {

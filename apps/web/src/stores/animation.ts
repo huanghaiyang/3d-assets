@@ -4,6 +4,9 @@ import {
   animationApi,
   type AnimationFile,
   type AnimationInfoResponse,
+  type FingerPoseLibrary,
+  type FingerPosePreset,
+  type FingerSide,
   type SavedAnimationProject,
 } from '@/api/animation';
 import {
@@ -20,6 +23,7 @@ import {
 } from '@/viewer/FbxPlayer';
 import type { BoneDisplayMode, BoneNode, FlatBone } from '@/viewer/SkeletonOverlay';
 import { matchToken } from '@/utils/fuzzy';
+import { applyFingerPoses, type FingerApplyResult, type FingerApplyTarget } from '@/utils/fingerPose';
 
 /** 封面尺寸：由后端 worker 子线程渲染，浏览器只负责 <img> 显示 */
 const THUMB_SIZE = 192;
@@ -102,6 +106,11 @@ export const useAnimationStore = defineStore('animation', () => {
   const savingAnimation = ref(false);
   const projectsLoading = ref(false);
   const importedAnimation = ref<{ name: string; clipCount: number; trackCount: number } | null>(null);
+
+  // 手指形态库（仅新建动画使用）：从现有 Mixamo 动画缓存采样，左右手分别可选
+  const fingerPoses = shallowRef<FingerPoseLibrary | null>(null);
+  const fingerPosesLoading = ref(false);
+  const fingerPosesError = ref<string | null>(null);
   /** 回收站里的新建动画（软删除，可恢复或彻底删除） */
   const trashProjects = shallowRef<NewAnimationProject[]>([]);
   const trashLoading = ref(false);
@@ -768,6 +777,117 @@ export const useAnimationStore = defineStore('animation', () => {
     toast('success', `已绑定 kimodo 动画：${clips.length} 个片段、${trackCount} 条轨迹`);
   }
 
+  // ===== 手指形态（仅新建动画）=====
+
+  /** 读取手指形态库；已加载时直接复用，refresh=true 让服务端重新采样 */
+  async function loadFingerPoses(refresh = false): Promise<void> {
+    if (fingerPosesLoading.value) return;
+    if (!refresh && fingerPoses.value) return;
+    fingerPosesLoading.value = true;
+    fingerPosesError.value = null;
+    try {
+      fingerPoses.value = await animationApi.fingerPoses(refresh);
+    } catch (err) {
+      fingerPosesError.value = (err as Error).message;
+    } finally {
+      fingerPosesLoading.value = false;
+    }
+  }
+
+  /**
+   * 把选中的左右手形态写入当前片段的手指骨轨道。
+   * 只替换 [from,to] 区间；其它骨骼、腕关节以及 kimodo 生成的动画数据都不动。
+   */
+  function applyFingerPoseSelection(
+    selections: { side: FingerSide; preset: FingerPosePreset }[],
+    from: number,
+    to: number,
+  ): boolean {
+    const project = activeNewAnimation.value;
+    if (!project?.data) {
+      toast('error', '当前新建动画还没有动画数据，请先导入 JSON 或生成 kimodo 动画');
+      return false;
+    }
+    if (!player) {
+      toast('error', '视图尚未准备好，请稍候');
+      return false;
+    }
+    if (selections.length === 0) {
+      toast('error', '请先选择左手或右手的手指形态');
+      return false;
+    }
+
+    const clipIndex = Math.min(activeClipIndex.value, project.data.clips.length - 1);
+    if (clipIndex < 0) {
+      toast('error', '当前没有可编辑的动画片段');
+      return false;
+    }
+
+    if (poseMode.value) setPoseMode(false);
+    const resumeTime = currentTime.value;
+    const wasPlaying = playing.value;
+
+    let result: FingerApplyResult;
+    try {
+      const targets: FingerApplyTarget[] = selections.map((item) => ({
+        side: item.side,
+        preset: item.preset,
+      }));
+      result = applyFingerPoses(project.data, clipIndex, targets, from, to);
+      if (!player) throw new Error('视图尚未准备好，请稍候');
+    } catch (err) {
+      toast('error', (err as Error).message);
+      return false;
+    }
+
+    try {
+      const clips = player.applyAnimationData(result.data);
+      selectedClips.value = clips;
+      const nextIndex = Math.min(clipIndex, Math.max(0, clips.length - 1));
+      activeClipIndex.value = nextIndex;
+      if (clips[nextIndex]) {
+        player.playClip(nextIndex);
+        const at = Math.min(resumeTime, clips[nextIndex]!.duration);
+        player.seek(at);
+        currentTime.value = at;
+        duration.value = clips[nextIndex]!.duration;
+        player.setPlaying(wasPlaying);
+        playing.value = wasPlaying;
+      }
+    } catch (err) {
+      toast('error', `应用手型后刷新视图失败：${(err as Error).message}`);
+      return false;
+    }
+
+    const summary = project.imported
+      ? {
+          ...project.imported,
+          clipCount: result.data.clips.length,
+          trackCount: result.trackCount,
+        }
+      : {
+          name: `${project.name} 动画`,
+          clipCount: result.data.clips.length,
+          trackCount: result.trackCount,
+        };
+    updateProject(project.id, {
+      data: result.data,
+      imported: summary,
+      dirty: true,
+      hasData: true,
+    });
+    importedAnimation.value = summary;
+
+    const names = selections
+      .map((item) => `${item.side === 'left' ? '左手' : '右手'}「${item.preset.name}」`)
+      .join(' + ');
+    toast(
+      'success',
+      `已在 ${from.toFixed(2)}–${to.toFixed(2)} 秒替换 ${names}：写入 ${result.bones} 根手指骨（记得保存）`,
+    );
+    return true;
+  }
+
   /** 把当前新建动画保存到服务端（写入项目自己的数据目录，不碰 FBX 源文件夹） */
   async function saveNewAnimation(): Promise<void> {
     const project = activeNewAnimation.value;
@@ -1358,6 +1478,11 @@ export const useAnimationStore = defineStore('animation', () => {
     savingAnimation,
     projectsLoading,
     importedAnimation,
+    fingerPoses,
+    fingerPosesLoading,
+    fingerPosesError,
+    loadFingerPoses,
+    applyFingerPoseSelection,
     createNewAnimation,
     selectNewAnimation,
     exitNewAnimation,

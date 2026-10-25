@@ -4,6 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { config } from '../config.js';
 import { createLogger } from '../lib/logger.js';
 import { animationCover, COVER_CACHE_VERSION } from '../services/covers.js';
+import { getFingerPoseLibrary } from '../services/fingerPoses.js';
 import {
   clipsOf,
   countTracks,
@@ -177,6 +178,12 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
       readOnly: true,
       limits: { maxFiles: MAX_FILES, maxDepth: MAX_DEPTH, maxDirs: MAX_DIRS },
     };
+  });
+
+  /** 手指形态库：从现有 Mixamo 动画缓存里采样去重，左右手分别返回 */
+  app.get('/api/anim/finger-poses', async (request) => {
+    const query = request.query as { refresh?: string };
+    return getFingerPoseLibrary(query.refresh === '1' || query.refresh === 'true');
   });
 
   /** 读取已记录的文件夹列表 */

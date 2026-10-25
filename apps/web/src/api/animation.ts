@@ -84,6 +84,33 @@ export interface SavedAnimationProjectDetail extends SavedAnimationProject {
   data: unknown;
 }
 
+export type FingerSide = 'left' | 'right';
+
+/** 从现有 Mixamo 动画里采样得到的一种手型（只含手指骨局部旋转） */
+export interface FingerPosePreset {
+  id: string;
+  side: FingerSide;
+  name: string;
+  /** 拇指、食指、中指、无名指、小指的弯曲度，0–1 */
+  curls: number[];
+  /** 关节名（已去掉 mixamorig 前缀）→ 局部四元数 xyzw */
+  bones: Record<string, [number, number, number, number]>;
+  source: { clip: string; file: string; time: number };
+  /** 同一形态在动画库里出现的次数 */
+  samples: number;
+}
+
+export interface FingerPoseLibrary {
+  version: number;
+  available: boolean;
+  message: string | null;
+  generatedAt: string;
+  scanned: number;
+  poses: number;
+  left: FingerPosePreset[];
+  right: FingerPosePreset[];
+}
+
 /**
  * 封面缓存版本：后端渲染逻辑升级（例如修复 T-pose）时 +1，
  * 让所有已缓存在浏览器/中间的旧封面 URL 直接失效。
@@ -109,6 +136,10 @@ export const animationApi = {
     request<AnimationBrowseResponse>(`/api/anim/browse${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`),
 
   // ===== 新建动画（内置白模 + 导入的动画 JSON） =====
+
+  /** 手指形态库（从现有 Mixamo 动画采样去重；refresh 时后台重建） */
+  fingerPoses: (refresh = false) =>
+    request<FingerPoseLibrary>(`/api/anim/finger-poses${refresh ? '?refresh=1' : ''}`),
 
   projects: () => request<{ projects: SavedAnimationProject[] }>('/api/anim/projects'),
 

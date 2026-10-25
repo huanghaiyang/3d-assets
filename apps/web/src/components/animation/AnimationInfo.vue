@@ -3,21 +3,22 @@ import { computed, ref, watch } from 'vue';
 import Icon from '../ui/Icon.vue';
 import BoneTree from './BoneTree.vue';
 import NodeTree from './NodeTree.vue';
+import FingerPanel from './FingerPanel.vue';
 import { useAnimationStore } from '@/stores/animation';
 import { formatBytes } from '@/utils/image';
 import { confirmAction } from '@/composables/useConfirm';
 
 const store = useAnimationStore();
-const tab = ref<'info' | 'bones' | 'nodes'>('info');
+const tab = ref<'info' | 'bones' | 'nodes' | 'fingers'>('info');
 
 const file = computed(() => store.selectedFile);
 const jsonInput = ref<HTMLInputElement | null>(null);
 
-// 新建动画后自动切到信息页，方便立即导入 JSON
+// 新建动画后自动切到信息页，方便立即导入 JSON；退出编辑时收起手指模块
 watch(
   () => store.newAnimationMode,
-  (on) => {
-    if (on) tab.value = 'info';
+  () => {
+    tab.value = 'info';
   },
 );
 
@@ -77,6 +78,17 @@ function clipDuration(seconds: number): string {
           <Icon name="cube" :size="13" />
           节点
         </button>
+        <button
+          v-if="store.newAnimationMode"
+          class="tab"
+          :class="{ active: tab === 'fingers' }"
+          type="button"
+          title="从现有 Mixamo 动画提取的手型，左右手可分别替换"
+          @click="tab = 'fingers'"
+        >
+          <Icon name="bone" :size="13" />
+          手指
+        </button>
       </div>
     </header>
 
@@ -92,6 +104,7 @@ function clipDuration(seconds: number): string {
       @clear="store.clearNodeSelection()"
     />
     <BoneTree v-else-if="tab === 'bones'" />
+    <FingerPanel v-else-if="tab === 'fingers'" />
 
     <div v-else class="body">
       <section v-if="store.newAnimationMode" class="block new-anim">
