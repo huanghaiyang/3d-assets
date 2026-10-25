@@ -9,6 +9,12 @@ import { promptEnhancerReady } from './promptEnhance.js';
 
 const log = createLogger('kimodo');
 
+/** 多段生成里的一段提示词 */
+export interface KimodoPromptSegment {
+  prompt: string;
+  frames: number;
+}
+
 /** 单次生成的请求参数 */
 export interface KimodoGenerateRequest {
   prompt: string;
@@ -17,6 +23,11 @@ export interface KimodoGenerateRequest {
   seed?: number;
   /** 首尾过渡帧，默认 5，与 kimodo.cpp 官方 demo 一致 */
   transitionFrames?: number;
+  /**
+   * 复合动作分段：按顺序生成并自动过渡（接近 / 施力 / 收势）。
+   * 至少 2 段才生效，为空时退回单段 prompt。
+   */
+  segments?: KimodoPromptSegment[];
 }
 
 export type KimodoStatusValue = 'queued' | 'running' | 'ready' | 'failed';
@@ -31,6 +42,8 @@ export interface KimodoAnimation {
   status: KimodoStatusValue;
   error?: string;
   createdAt: number;
+  /** 多段生成时的分段提示词与各自帧数（单段任务不写） */
+  segments?: KimodoPromptSegment[];
   /** 生成耗时（毫秒），完成后写入 */
   durationMs?: number;
   /** 开始生成的时刻（进入 running 时写入），供前端计算进度 */
@@ -181,7 +194,7 @@ class KimodoService {
   /**
    * 提交一次生成：只做参数规整与入队，真正的推理在后台串行执行。
    *
-   * - 帧数限制在 8–300，步数至少 1，都是为了让单次任务不会占满 CPU 太久；
+   * - 单段帧数限制在 8–300，多段总帧数最多 900，避免一次任务占满 CPU 太久；
    * - 种子必须为正整数，传 0 / 留空时服务端自己掷一个，保证结果可复现；
    * - 任务先落盘再排队，服务重启后能立刻从 meta.json 恢复出「排队中」状态。
    */
@@ -189,16 +202,28 @@ class KimodoService {
     const check = this.validate();
     if (!check.ok) throw new Error(`Kimodo 未正确配置：${check.missing.join('；')}`);
 
-    const frames = Math.max(8, Math.min(300, Math.round(request.frames)));
+    const segments = (request.segments ?? [])
+      .map((segment) => ({
+        prompt: segment.prompt.trim(),
+        frames: Math.max(8, Math.min(300, Math.round(segment.frames) || 0)),
+      }))
+      .filter((segment) => segment.prompt.length > 0)
+      .slice(0, 6);
+    const multi = segments.length >= 2;
+    const totalFrames = multi
+      ? Math.min(900, segments.reduce((sum, segment) => sum + segment.frames, 0))
+      : Math.max(8, Math.min(300, Math.round(request.frames)));
+
     const job: KimodoAnimation = {
       id: Math.random().toString(16).slice(2, 10) + Date.now().toString(16).slice(-6),
-      prompt: request.prompt,
-      frames,
+      prompt: multi ? segments.map((segment) => segment.prompt).join(' → ') : request.prompt,
+      frames: totalFrames,
       steps: Math.max(1, Math.round(request.steps)),
       seed: request.seed && request.seed > 0 ? Math.round(request.seed) : Math.floor(Math.random() * 1e9),
       status: 'queued',
       createdAt: Date.now(),
     };
+    if (multi) job.segments = segments;
     this.jobs.set(job.id, job);
     this.persist(job);
     this.pending += 1;
@@ -211,7 +236,8 @@ class KimodoService {
    * 执行一次生成（由队列串行调用）。
    *
    * 与生成器的交互只有一问一答：写入一行请求，读回一行 `OK` / `ERR\t原因`。
-   * 请求行按 TAB 分成 6 段：过渡帧、扩散步数、随机种子、输出目录、帧数、提示词文件。
+   * 请求行按 TAB 分成 4 段固定头（过渡帧、扩散步数、随机种子、输出目录），
+   * 之后每段追加「帧数 + 提示词文件」，单段任务就是一组、复合动作可多组。
    * 生成期间没有任何进度回传，所以进度条用「帧数 × 步数 × 实测速率」估算，
    * 每完成一个任务就用真实耗时反向校正 msPerUnit，下一次估算会更准。
    */
@@ -229,13 +255,20 @@ class KimodoService {
     try {
       const dir = path.join(this.outputDir, job.id);
       fs.mkdirSync(dir, { recursive: true });
-      const promptPath = path.join(dir, 'segment-01.txt');
-      fs.writeFileSync(promptPath, job.prompt, 'utf8');
+      // 单段与多段共用同一套协议：每段一个文本文件，按顺序拼到请求行里
+      const segments = job.segments?.length ? job.segments : [{ prompt: job.prompt, frames: job.frames }];
+      const fields: (string | number)[] = [transitionFrames, job.steps, job.seed, dir];
+      segments.forEach((segment, index) => {
+        const promptPath = path.join(dir, `segment-${String(index + 1).padStart(2, '0')}.txt`);
+        fs.writeFileSync(promptPath, segment.prompt, 'utf8');
+        fields.push(segment.frames, promptPath);
+      });
 
       const session = this.ensureSession();
-      // 请求格式：过渡帧 \t 步数 \t 种子 \t 输出目录 \t 帧数 \t 提示词文件
-      const line = [transitionFrames, job.steps, job.seed, dir, job.frames, promptPath].join('\t');
-      log.info(`生成 ${job.id}：${job.frames} 帧 / ${job.steps} 步，seed=${job.seed}`);
+      const line = fields.join('\t');
+      log.info(
+        `生成 ${job.id}：${job.frames} 帧 / ${job.steps} 步 / ${segments.length} 段，seed=${job.seed}`,
+      );
       session.stdin.write(`${line}\n`);
 
       // CPU 推理较慢，给足 30 分钟；超时视为进程卡死
@@ -530,7 +563,7 @@ class KimodoService {
           file: 'segment-01.txt',
           format: 'text',
           viewable: true,
-          description: '提交给生成器的原始提示词（kmd-generate 按段读取）',
+          description: '提交给生成器的原始提示词（多段任务依次写入 segment-01.txt、segment-02.txt…，此处按顺序合并展示）',
         };
       case 'meta':
         return {
@@ -591,12 +624,23 @@ class KimodoService {
     const artifacts = keys.map((key): KimodoArtifact => {
       const desc = this.describe(key, id);
       // Mixamo JSON 由导入动作时写到 <outputDir>/mixamo 下，不在任务目录内
-      const file = key === 'mixamo' ? this.mixamoFile(id) : path.join(dir, desc.file);
       let size = 0;
-      try {
-        size = fs.statSync(file).size;
-      } catch {
-        size = 0;
+      if (key === 'prompt') {
+        // 多段任务会有 segment-01/02/…，体积按全部段累加
+        for (const name of this.segmentFiles(dir)) {
+          try {
+            size += fs.statSync(path.join(dir, name)).size;
+          } catch {
+            /* 忽略单个文件读取失败 */
+          }
+        }
+      } else {
+        const file = key === 'mixamo' ? this.mixamoFile(id) : path.join(dir, desc.file);
+        try {
+          size = fs.statSync(file).size;
+        } catch {
+          size = 0;
+        }
       }
       return { ...desc, size, exists: size > 0 };
     });
@@ -648,8 +692,38 @@ class KimodoService {
     const dir = this.motionDir(id);
     if (!dir) return null;
 
-    const target = key === 'mixamo' ? this.mixamoFile(id) : path.join(dir, key === 'prompt' ? 'segment-01.txt' : 'meta.json');
-    const format: 'text' | 'json' = key === 'prompt' ? 'text' : 'json';
+    const MAX_BYTES = 2 * 1024 * 1024;
+
+    // 提示词可能有多段（segment-01.txt、segment-02.txt…），按顺序拼起来展示
+    if (key === 'prompt') {
+      const files = this.segmentFiles(dir);
+      if (files.length === 0) return null;
+      const chunks: string[] = [];
+      let size = 0;
+      let truncated = false;
+      for (const name of files) {
+        const buffer = fs.readFileSync(path.join(dir, name));
+        size += buffer.length;
+        if (size > MAX_BYTES) {
+          chunks.push(buffer.subarray(0, Math.max(0, MAX_BYTES - size + buffer.length)).toString('utf8'));
+          truncated = true;
+          break;
+        }
+        const body = buffer.toString('utf8');
+        chunks.push(files.length > 1 ? `# ${name}\n${body}` : body);
+      }
+      return {
+        key,
+        file: files[0]!,
+        format: 'text',
+        size,
+        text: chunks.join('\n\n'),
+        truncated,
+      };
+    }
+
+    const target = key === 'mixamo' ? this.mixamoFile(id) : path.join(dir, 'meta.json');
+    const format: 'text' | 'json' = 'json';
     let size = 0;
     try {
       size = fs.statSync(target).size;
@@ -658,7 +732,6 @@ class KimodoService {
     }
     if (size === 0) return null;
 
-    const MAX_BYTES = 2 * 1024 * 1024;
     const truncated = size > MAX_BYTES;
     let text: string;
     try {
@@ -673,8 +746,20 @@ class KimodoService {
         /* 解析失败就保留原文，交给前端按纯文本展示 */
       }
     }
-    const file = key === 'mixamo' ? `mixamo/${id}.json` : key === 'prompt' ? 'segment-01.txt' : 'meta.json';
+    const file = key === 'mixamo' ? `mixamo/${id}.json` : 'meta.json';
     return { key, file, format, size, text, truncated };
+  }
+
+  /** 任务目录里的分段提示词文件，按序号排序 */
+  private segmentFiles(dir: string): string[] {
+    try {
+      return fs
+        .readdirSync(dir)
+        .filter((name) => /^segment-\d+\.txt$/i.test(name))
+        .sort();
+    } catch {
+      return [];
+    }
   }
 
   remove(id: string): boolean {

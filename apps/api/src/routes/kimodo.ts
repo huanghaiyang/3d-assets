@@ -56,6 +56,18 @@ export async function registerKimodoRoutes(app: FastifyInstance): Promise<void> 
     const body = (request.body ?? {}) as Partial<KimodoGenerateRequest>;
     const prompt = (body.prompt ?? '').trim();
     if (!prompt) return reply.code(400).send({ error: '提示词不能为空' });
+
+    // 分段提示词：只接受数组，单段由服务层再过滤；非法项直接忽略
+    const segments = Array.isArray(body.segments)
+      ? body.segments
+          .filter(
+            (item): item is { prompt: string; frames: number } =>
+              !!item && typeof item.prompt === 'string' && typeof item.frames === 'number',
+          )
+          .map((item) => ({ prompt: item.prompt.trim(), frames: Number(item.frames) || 0 }))
+          .filter((item) => item.prompt.length > 0)
+      : undefined;
+
     try {
       return kimodoService.submit({
         prompt,
@@ -63,6 +75,7 @@ export async function registerKimodoRoutes(app: FastifyInstance): Promise<void> 
         steps: Number(body.steps) || 50,
         seed: body.seed,
         transitionFrames: body.transitionFrames,
+        segments,
       });
     } catch (err) {
       return reply.code(400).send({ error: (err as Error).message });

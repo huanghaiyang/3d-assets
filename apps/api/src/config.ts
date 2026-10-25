@@ -18,6 +18,11 @@ function text(value: string | undefined): string | null {
   return trimmed ? trimmed : null;
 }
 
+function rate(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseFloat(value ?? '');
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 2 ? parsed : fallback;
+}
+
 export interface ProviderEnvConfig {
   /** .env 里的 Key（界面设置优先） */
   envApiKey: string | null;
@@ -104,6 +109,8 @@ export const config = {
     /** 推理模型会先消耗思考 token，预算留足避免正文被截断 */
     promptMaxTokens: int(process.env.KIMODO_PROMPT_MAX_TOKENS, 1200),
     promptTimeoutMs: int(process.env.KIMODO_PROMPT_TIMEOUT_MS, 120_000),
+    /** 转译温度：越低越忠实于原意，默认 0.35 */
+    promptTemperature: rate(process.env.KIMODO_PROMPT_TEMPERATURE, 0.35),
   },
   webDistDir,
   repoRoot,

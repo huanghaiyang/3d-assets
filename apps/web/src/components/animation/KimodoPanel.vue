@@ -6,9 +6,11 @@ import Icon from '../ui/Icon.vue';
 import KimodoPreview from './KimodoPreview.vue';
 import {
   kimodoApi,
+  type EnhancePromptResult,
   type KimodoAnimation,
   type KimodoArtifactContent,
   type KimodoArtifactsResponse,
+  type KimodoPromptSegment,
   type KimodoRelation,
   type KimodoStatus,
   type SomaSkeleton,
@@ -37,10 +39,33 @@ const seed = ref(0);
 const imageDataUrl = ref<string | null>(null);
 const imageName = ref('');
 const enhancing = ref(false);
+/** 最近一次转译的结构化结果：动作拆解 + 分段建议 */
+const enhanced = ref<EnhancePromptResult | null>(null);
+/** 分段生成开关（只有转译给出 2 段以上、且提示词未被改写时才生效） */
+const splitEnabled = ref(false);
+/** 一次提交几个不同种子的候选 */
+const candidates = ref(1);
 const enhanceAvailable = computed(() => status.value?.promptModelReady === true);
 const canEnhance = computed(
   () => enhanceAvailable.value && (prompt.value.trim().length > 0 || imageDataUrl.value !== null),
 );
+
+/** 提示词还是转译给出的英文原文时，才能用它的分段 */
+const splitUsable = computed(() => {
+  const result = enhanced.value;
+  return Boolean(
+    result &&
+      result.segments.length >= 2 &&
+      prompt.value.trim() === result.prompt,
+  );
+});
+const splitActive = computed(() => splitEnabled.value && splitUsable.value);
+// 用户手动改了英文提示词后，原分段不再对应当前文本，自动关闭分段以避免错位
+watch(splitUsable, (usable) => {
+  if (!usable) splitEnabled.value = false;
+});
+const decomposition = computed(() => enhanced.value?.decomposition ?? null);
+const objectText = computed(() => decomposition.value?.objects.join('、') ?? '');
 
 const configured = computed(() => status.value?.ready === true);
 const pendingCount = computed(
@@ -157,26 +182,41 @@ function clearImage(): void {
   imageName.value = '';
 }
 
-/** 把中文描述 / 参考图片交给大模型，回填英文提示词 */
-async function enhance(): Promise<void> {
-  if (!canEnhance.value || enhancing.value) return;
+/** 中文提示词直接交给英文文本编码器会严重失真，生成前先自动转译 */
+const CJK_RE = /[\u3400-\u9fff]/;
+
+/**
+ * 调一次转译并回填表单。返回结果供 generate 复用；失败时返回 null（notice 已给出原因）。
+ */
+async function requestEnhance(source: string): Promise<EnhancePromptResult | null> {
   enhancing.value = true;
   notice.value = null;
   try {
     const result = await kimodoApi.enhancePrompt({
-      prompt: prompt.value.trim(),
+      prompt: source,
       image: imageDataUrl.value ?? undefined,
     });
     prompt.value = result.prompt;
+    enhanced.value = result;
+    splitEnabled.value = result.segments.length >= 2;
+    const splitHint = result.segments.length >= 2 ? `，并拆出 ${result.segments.length} 段可分段生成` : '';
     notice.value = {
       kind: 'info',
-      text: `已由 ${result.model} 转译为英文提示词${result.usedImage ? '（参考图已解析）' : ''}，可直接生成或继续微调。`,
+      text: `已由 ${result.model} 转译为英文提示词${result.usedImage ? '（参考图已解析）' : ''}${splitHint}，可直接生成或继续微调。`,
     };
+    return result;
   } catch (err) {
     notice.value = { kind: 'error', text: (err as Error).message };
+    return null;
   } finally {
     enhancing.value = false;
   }
+}
+
+/** 把中文描述 / 参考图片交给大模型，回填英文提示词 */
+async function enhance(): Promise<void> {
+  if (!canEnhance.value || enhancing.value) return;
+  await requestEnhance(prompt.value.trim());
 }
 
 // ===== 中间产物与关联关系 =====
@@ -293,8 +333,21 @@ async function ensureSkeleton(): Promise<void> {
   }
 }
 
+/**
+ * 把总帧数均分给各段提示词，每段至少 8 帧；总帧数不够分时返回 null（退回单段）。
+ */
+function buildSegments(total: number, list: string[]): KimodoPromptSegment[] | null {
+  const count = list.length;
+  if (count < 2 || total < count * 8) return null;
+  const share = Math.max(8, Math.floor(total / count));
+  return list.map((prompt, index) => ({
+    prompt,
+    frames: index === count - 1 ? Math.max(8, total - share * (count - 1)) : share,
+  }));
+}
+
 async function generate(): Promise<void> {
-  const text = prompt.value.trim();
+  let text = prompt.value.trim();
   if (!text) {
     notice.value = { kind: 'error', text: '请先填写提示词' };
     return;
@@ -302,19 +355,41 @@ async function generate(): Promise<void> {
   submitting.value = true;
   notice.value = null;
   try {
-    const job = await kimodoApi.generate({
-      prompt: text,
-      frames: frames.value,
-      steps: steps.value,
-      seed: seed.value > 0 ? seed.value : undefined,
-    });
+    // 中文提示词先自动转译：英文文本编码器直接读中文会把动作识别成别的语义
+    if (CJK_RE.test(text) && enhanceAvailable.value) {
+      const result = await requestEnhance(text);
+      if (!result) return; // 转译失败，notice 里已给出原因
+      text = result.prompt;
+    }
+
+    const segments =
+      splitActive.value && enhanced.value ? buildSegments(frames.value, enhanced.value.segments) : null;
+    const count = Math.max(1, Math.min(3, candidates.value));
+    const submitted: KimodoAnimation[] = [];
+    for (let index = 0; index < count; index += 1) {
+      submitted.push(
+        await kimodoApi.generate({
+          prompt: text,
+          frames: frames.value,
+          steps: steps.value,
+          // 多候选时用连续种子，避免服务端随机导致结果不可复现
+          seed: seed.value > 0 ? seed.value + index : undefined,
+          segments: segments ?? undefined,
+        }),
+      );
+    }
+
     // 先刷新列表再选中：让预览区拿到的任务状态是 queued，
     // 从而直接显示 loading，而不是先请求一次还不存在的动作文件
     await refresh();
-    selectedId.value = job.id;
+    selectedId.value = submitted[0]?.id ?? null;
+    const first = submitted[0];
+    const parts = [`${first?.frames ?? frames.value} 帧 / ${steps.value} 步`];
+    if (segments) parts.push(`${segments.length} 段`);
+    if (count > 1) parts.push(`${count} 个候选（种子连续）`);
     notice.value = {
       kind: 'info',
-      text: `已提交：${job.frames} 帧 / ${job.steps} 步，seed=${job.seed}。本地 CPU 推理，请保持页面打开。`,
+      text: `已提交：${parts.join('，')}，seed=${first?.seed ?? '随机'}。本地 CPU 推理，请保持页面打开。`,
     };
   } catch (err) {
     notice.value = { kind: 'error', text: (err as Error).message };
@@ -494,7 +569,7 @@ onBeforeUnmount(() => {
                     :disabled="!canEnhance || enhancing"
                     :title="
                       enhanceAvailable
-                        ? '把描述与参考图片交给大模型，转译成英文动作提示词'
+                        ? '把描述与参考图片交给大模型，转译成英文动作提示词并做动作拆解'
                         : '服务端未配置提示词模型 API Key，无法使用 AI 转译'
                     "
                     @click="enhance"
@@ -507,8 +582,23 @@ onBeforeUnmount(() => {
                     {{ enhancing ? '转译中…' : 'AI 转译' }}
                   </button>
                   <span class="hint">
-                    {{ enhanceAvailable ? '支持上传图片，由大模型转译成英文提示词' : '未配置提示词模型 API Key' }}
+                    {{ enhanceAvailable ? '支持图片；中文会自动转译成纯身体动作' : '未配置提示词模型 API Key' }}
                   </span>
+                </div>
+
+                <!-- 动作拆解：物体动作会被改写成等价的身体动力学 -->
+                <div v-if="decomposition" class="decomp-card">
+                  <div class="decomp-head">
+                    <Icon name="sparkle" :size="12" />
+                    <span>动作拆解</span>
+                    <span v-if="objectText" class="decomp-objects" :title="`模型没有物体接触，只能模拟身体动作：${objectText}`">
+                      物体：{{ objectText }}
+                    </span>
+                  </div>
+                  <ol v-if="decomposition.steps.length > 0" class="decomp-steps">
+                    <li v-for="(step, index) in decomposition.steps" :key="index">{{ step }}</li>
+                  </ol>
+                  <p v-if="decomposition.note" class="decomp-note">{{ decomposition.note }}</p>
                 </div>
 
                 <div class="row">
@@ -535,12 +625,39 @@ onBeforeUnmount(() => {
                     </div>
                   </label>
                 </div>
+                <div class="row options-row">
+                  <label
+                    class="toggle"
+                    :class="{ disabled: !splitUsable }"
+                    :title="
+                      splitUsable
+                        ? '把动作按「接近 / 施力 / 收势」分段生成，段间自动过渡'
+                        : 'AI 转译后若给出 2 段以上，且提示词未被手动修改，才能启用分段生成'
+                    "
+                  >
+                    <input v-model="splitEnabled" type="checkbox" :disabled="!splitUsable" />
+                    <span>
+                      分段生成<template v-if="enhanced && enhanced.segments.length >= 2">
+                        （{{ enhanced.segments.length }} 段 · 总帧数均分）</template>
+                    </span>
+                  </label>
+                  <label class="field small candidate-field" title="一次提交多个不同种子的任务，生成后对比挑选">
+                    <span>候选数</span>
+                    <select v-model.number="candidates">
+                      <option :value="1">1</option>
+                      <option :value="2">2</option>
+                      <option :value="3">3</option>
+                    </select>
+                  </label>
+                </div>
                 <div class="row">
                   <button class="btn btn-primary" type="button" :disabled="submitting" @click="generate">
                     <Icon :name="submitting ? 'refresh' : 'sparkle'" :size="13" :class="{ spin: submitting }" />
                     生成动画
                   </button>
-                  <span class="hint">CPU 推理：60 帧 / 10 步约 1 分钟，帧数和步数越多越慢</span>
+                  <span class="hint">
+                    CPU 推理：60 帧 / 10 步约 1 分钟{{ splitActive ? '，分段任务会依次排队' : '' }}
+                  </span>
                 </div>
               </div>
 
@@ -978,6 +1095,89 @@ onBeforeUnmount(() => {
   flex: none;
   width: 26px;
   height: 26px;
+}
+
+/* 动作拆解：把物体动作解释成可模拟的身体动作链 */
+.decomp-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 9px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--primary);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+}
+.decomp-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.decomp-objects {
+  margin-left: auto;
+  padding: 0 6px;
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 400;
+  color: #fbbf24;
+  cursor: help;
+}
+.decomp-steps {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.decomp-steps li::marker {
+  color: var(--primary);
+  font-size: 10px;
+}
+.decomp-note {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-faint);
+}
+
+/* 分段生成 / 多候选 */
+.options-row {
+  align-items: center;
+}
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.toggle input {
+  margin: 0;
+  accent-color: var(--primary);
+}
+.toggle.disabled {
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+.candidate-field {
+  margin-left: auto;
+}
+.candidate-field select {
+  height: 26px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 11.5px;
 }
 
 /* 中间产物对话框 */

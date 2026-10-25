@@ -38,6 +38,8 @@ export interface KimodoAnimation {
   status: KimodoStatusValue;
   error?: string;
   createdAt: number;
+  /** 多段生成时的分段提示词与各自帧数 */
+  segments?: KimodoPromptSegment[];
   durationMs?: number;
   /** 开始生成的时刻，用于计算进度 */
   startedAt?: number;
@@ -45,6 +47,12 @@ export interface KimodoAnimation {
   etaMs?: number;
   /** 预计其中冷启动加载模型的耗时（毫秒），0 表示权重已驻留 */
   loadMs?: number;
+}
+
+/** 多段生成里的一段提示词 */
+export interface KimodoPromptSegment {
+  prompt: string;
+  frames: number;
 }
 
 export interface SomaSkeleton {
@@ -60,6 +68,8 @@ export interface KimodoGenerateBody {
   seed?: number;
   /** 首尾过渡帧，留空用后端默认值 5 */
   transitionFrames?: number;
+  /** 复合动作分段：至少 2 段才生效 */
+  segments?: KimodoPromptSegment[];
 }
 
 export interface KimodoImportResult {
@@ -109,10 +119,23 @@ export interface KimodoArtifactContent {
   truncated: boolean;
 }
 
+export interface PromptDecomposition {
+  /** 按时间顺序的身体动作链（中文） */
+  steps: string[];
+  /** 描述的物体（模型无物体接触，仅提示） */
+  objects: string[];
+  /** 是否做过改写的一句话说明 */
+  note: string;
+}
+
 export interface EnhancePromptResult {
   prompt: string;
   model: string;
   usedImage: boolean;
+  /** 解析成功时为动作拆解，失败时为 null */
+  decomposition: PromptDecomposition | null;
+  /** 2–4 段英文提示词，可用于分段生成 */
+  segments: string[];
 }
 
 export const kimodoApi = {
