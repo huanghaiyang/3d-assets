@@ -34,6 +34,44 @@ const MOTION_RULES = [
   'Write in the style of motion-capture captions: present tense, "a person ...", one sentence, under 45 words, no camera, clothing, identity or rendering words.',
 ].join(' ');
 
+/**
+ * Kimodo 的动作语义库：它的文本编码器是按 mocap caption 训练的，
+ * 只有落在这些原型附近的描述才能被稳定编码。让模型先选原型再填参数，
+ * 比直接翻译用户原话更不容易漂移到无关动作（如掀桌子→哭泣、回马枪→下按）。
+ */
+const MOTION_MAP = [
+  '- stand: a person stands still in place',
+  '- walk: a person walks forward at a steady pace',
+  '- run: a person runs forward quickly',
+  '- step: a person steps forward or backward with one foot',
+  '- turn: a person turns the body around to face the opposite direction',
+  '- bend: a person bends the torso forward and down',
+  '- lean_back: a person leans the torso backward',
+  '- squat: a person squats down and stands up again',
+  '- reach: a person reaches one or both arms forward at shoulder height',
+  '- lift: a person lowers both hands to knee height, then lifts them while straightening the legs',
+  '- push: a person pushes both arms forward and leans the body weight forward',
+  '- pull: a person pulls both arms toward the chest and steps back',
+  '- punch: a person punches both arms straight forward at chest height',
+  '- swing: a person swings one or both arms horizontally across the body',
+  '- extend_back: a person extends both arms straight backward behind the body at chest height and keeps the torso upright',
+  '- throw: a person winds up and throws one arm forward fast',
+  '- kick: a person lifts one knee and kicks the lower leg forward',
+  '- wave: a person raises one arm and waves the hand side to side',
+  '- jump: a person jumps upward and lands on both feet',
+  '- crouch: a person crouches low and holds still',
+  '- cover_face: a person raises both hands to the face and bows the head',
+].join('\n');
+
+/** 统一的推导顺序：先选语义原型，再用绝对方向/高度/节奏实例化 */
+const DERIVE_STEPS = [
+  'Derive the answer in this order:',
+  '(1) name the intended body mechanics of the request;',
+  '(2) pick the closest archetypes from the semantic map above, in time order, combining several for a compound action;',
+  '(3) instantiate each archetype with explicit absolute direction, hand height, tempo and start/end pose, reusing the wording of the map;',
+  '(4) never invent motion verbs outside the map; when nothing matches, approximate with the nearest archetype instead of translating the original words literally.',
+].join(' ');
+
 /** 统一的结构化输出约定，方便前端展示拆解并直接用分段提示词生成 */
 const OUTPUT_SPEC = [
   'Return STRICT JSON only, no markdown and no prose, with exactly these keys:',
@@ -57,7 +95,9 @@ const EXAMPLES = [
 
 const TEXT_SYSTEM_PROMPT = [
   'You are an animation prompt engineer for Kimodo, a text-to-motion model.',
-  'Read the user request (Chinese or English), infer the intended action, then rewrite it as pure body motion.',
+  'Kimodo was trained on motion-capture captions and only renders motions close to the semantic map below.',
+  MOTION_MAP,
+  DERIVE_STEPS,
   MOTION_RULES,
   EXAMPLES,
   OUTPUT_SPEC,
@@ -77,6 +117,9 @@ const VISION_SYSTEM_PROMPT = [
   '- the direction and phase of the motion the pose implies.',
   'If several poses are visible, treat them as consecutive frames and describe the whole sequence.',
   'Then combine that analysis with the user note (if any) and rewrite it as pure body motion.',
+  'Kimodo only renders motions close to the semantic map below; map the observed motion to those archetypes before writing.',
+  MOTION_MAP,
+  DERIVE_STEPS,
   MOTION_RULES,
   EXAMPLES,
   OUTPUT_SPEC,
@@ -87,6 +130,10 @@ const REFINE_SYSTEM_PROMPT = [
   'You rewrite an edited Chinese body-motion breakdown into Kimodo motion prompts.',
   'The numbered steps are the source of truth: keep their order, directions, force and tempo, and do not add, remove or reorder actions.',
   'The target model renders one human body with no props and no scene: never name objects, describe body mechanics only.',
+  'Kimodo only renders motions close to the semantic map below: map each step to the nearest archetype, then instantiate it.',
+  'Keep every direction, height and tempo written in the steps; use the map only to choose the closest motion pattern.',
+  MOTION_MAP,
+  DERIVE_STEPS,
   MOTION_RULES,
   'Write in motion-capture caption style: present tense, "a person ...", one sentence under 45 words for "prompt".',
   'Split the steps into 2 to 4 consecutive English sentences for "segments", one per phase; if there are only one or two steps, 1 or 2 segments are fine.',
@@ -167,6 +214,12 @@ function sanitizePlain(raw: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
+/** 内容看起来是（可能被截断的）JSON 时不能当作提示词回退使用 */
+function looksLikeJsonPayload(raw: string): boolean {
+  const text = raw.trim();
+  return /^[[{]/.test(text) || /"prompt"\s*:/.test(text);
+}
+
 function toStringList(value: unknown, limit: number): string[] {
   if (!Array.isArray(value)) return [];
   return value
@@ -243,7 +296,7 @@ async function complete(
   userContent: unknown,
   maxTokens: number,
 ): Promise<CompletionResult> {
-  const body = {
+  const body: Record<string, unknown> = {
     model,
     messages: [
       { role: 'system', content: system },
@@ -251,9 +304,10 @@ async function complete(
     ],
     // 转译要求忠实于用户意图，温度过高会让「掀桌子」漂移成别的动作
     temperature: config.kimodo.promptTemperature,
-    max_tokens: maxTokens,
     stream: false,
   };
+  // 默认不传 max_tokens（0），由接口按模型自身的输出上限处理，避免思考 token 把正文挤掉
+  if (maxTokens > 0) body.max_tokens = maxTokens;
 
   let response: Response;
   try {
@@ -310,23 +364,22 @@ export async function enhancePrompt(input: EnhancePromptInput): Promise<EnhanceP
 
   let result = await complete(model, system, userContent, config.kimodo.promptMaxTokens);
   let parsed = parseModelOutput(result.content);
-  // 推理模型可能把 token 预算全花在 reasoning 上（finish_reason=length、正文为空），
-  // 这里自动加倍预算重试一次，避免用户直接看到失败。
-  if (!parsed && !sanitizePlain(result.content) && result.finishReason === 'length') {
-    const retryTokens = Math.min(config.kimodo.promptMaxTokens * 2, 8000);
-    log.warn(
-      `提示词模型正文为空（finish=length，max_tokens=${config.kimodo.promptMaxTokens}），用 ${retryTokens} 重试`,
-    );
+  // 推理模型可能把 token 预算花在 reasoning 上，导致 JSON 被截断（finish=length）；
+  // 只要没解析出结构化结果就加倍预算重试一次。
+  if (!parsed && result.finishReason === 'length') {
+    const retryTokens =
+      config.kimodo.promptMaxTokens > 0 ? config.kimodo.promptMaxTokens * 2 : 8192;
+    log.warn(`提示词模型输出被截断（finish=length），用 ${retryTokens} 重试`);
     result = await complete(model, system, userContent, retryTokens);
     parsed = parseModelOutput(result.content);
   }
 
-  // 模型没按 JSON 返回时，退化成「整段文字就是提示词」
-  const fallback = parsed ? '' : sanitizePlain(result.content);
+  // 模型没按 JSON 返回时，退化成「整段文字就是提示词」；被截断的 JSON 不能当提示词
+  const fallback = parsed || looksLikeJsonPayload(result.content) ? '' : sanitizePlain(result.content);
   const prompt = parsed?.prompt ?? fallback;
   if (!prompt) {
-    log.warn(`提示词模型没有返回内容（${model}，finish=${result.finishReason || 'unknown'}）`);
-    throw new Error('提示词模型没有返回内容，请重试（推理模型可调大 KIMODO_PROMPT_MAX_TOKENS）');
+    log.warn(`提示词模型没有返回完整结果（${model}，finish=${result.finishReason || 'unknown'}）`);
+    throw new Error('提示词模型输出不完整，请重试');
   }
 
   const decomposition: PromptDecomposition | null =
@@ -378,14 +431,17 @@ export async function refinePrompt(input: RefinePromptInput): Promise<RefineProm
 
   let result = await complete(model, REFINE_SYSTEM_PROMPT, userText, config.kimodo.promptMaxTokens);
   let parsed = parseModelOutput(result.content);
-  if (!parsed && !sanitizePlain(result.content) && result.finishReason === 'length') {
-    const retryTokens = Math.min(config.kimodo.promptMaxTokens * 2, 8000);
+  if (!parsed && result.finishReason === 'length') {
+    const retryTokens =
+      config.kimodo.promptMaxTokens > 0 ? config.kimodo.promptMaxTokens * 2 : 8192;
+    log.warn(`按拆解重新生成被截断（finish=length），用 ${retryTokens} 重试`);
     result = await complete(model, REFINE_SYSTEM_PROMPT, userText, retryTokens);
     parsed = parseModelOutput(result.content);
   }
 
-  const prompt = parsed?.prompt ?? sanitizePlain(result.content);
-  if (!prompt) throw new Error('提示词模型没有返回内容，请重试');
+  const prompt =
+    parsed?.prompt ?? (looksLikeJsonPayload(result.content) ? '' : sanitizePlain(result.content));
+  if (!prompt) throw new Error('提示词模型输出不完整，请重试');
 
   log.info(`按拆解重新生成（${model}）：${prompt.slice(0, 80)}`);
   return { prompt, segments: parsed?.segments ?? [], model };

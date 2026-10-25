@@ -503,6 +503,49 @@ function statusText(item: KimodoAnimation): string {
   return item.durationMs ? `已完成 · ${formatDuration(item.durationMs)}` : '已完成';
 }
 
+// ===== 生成结果注释：同一时刻只编辑一条，回车/失焦保存 =====
+const noteEditingId = ref<string | null>(null);
+const noteDraft = ref('');
+const noteInput = ref<HTMLInputElement | null>(null);
+
+/** 函数式 ref 在每次组件更新时都会重新调用，缓存元素保证只聚焦一次 */
+function focusNoteInput(el: unknown): void {
+  const input = el instanceof HTMLInputElement ? el : null;
+  if (noteInput.value === input) return;
+  noteInput.value = input;
+  if (!input) return;
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
+function startNote(item: KimodoAnimation): void {
+  noteEditingId.value = item.id;
+  noteDraft.value = item.note ?? '';
+}
+
+function cancelNote(): void {
+  noteEditingId.value = null;
+  noteDraft.value = '';
+}
+
+/** 只更新本地那一条任务，避免整表刷新打断其他输入 */
+async function saveNote(item: KimodoAnimation): Promise<void> {
+  if (noteEditingId.value !== item.id) return;
+  const note = noteDraft.value.trim();
+  const previous = item.note ?? '';
+  noteEditingId.value = null;
+  if (note === previous) return;
+  try {
+    const updated = await kimodoApi.updateNote(item.id, note);
+    const target = animations.value.find((entry) => entry.id === item.id);
+    if (target) target.note = updated.note;
+  } catch (err) {
+    noteEditingId.value = item.id;
+    noteDraft.value = note;
+    notice.value = { kind: 'error', text: `注释保存失败：${(err as Error).message}` };
+  }
+}
+
 function formatTime(value: number): string {
   const date = new Date(value);
   return `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
@@ -877,6 +920,28 @@ onBeforeUnmount(() => {
                       <span>seed {{ item.seed }}</span>
                       <span>{{ formatTime(item.createdAt) }}</span>
                     </div>
+                    <div v-if="noteEditingId === item.id" class="inote-edit" @click.stop>
+                      <input
+                        :ref="focusNoteInput"
+                        v-model="noteDraft"
+                        class="inote-input"
+                        type="text"
+                        maxlength="200"
+                        placeholder="写个注释，回车保存"
+                        @keydown.enter.prevent="saveNote(item)"
+                        @keydown.esc.stop.prevent="cancelNote"
+                        @blur="saveNote(item)"
+                      />
+                    </div>
+                    <button
+                      v-else-if="item.note"
+                      class="inote"
+                      type="button"
+                      :title="item.note"
+                      @click.stop="startNote(item)"
+                    >
+                      <span class="inote-tag">注释</span>{{ item.note }}
+                    </button>
                     <div v-if="item.status === 'running'" class="item-progress">
                       <div class="item-progress-fill" :style="{ width: `${percentOf(item)}%` }"></div>
                     </div>
@@ -899,6 +964,14 @@ onBeforeUnmount(() => {
                         :class="{ spin: importingId === item.id }"
                       />
                       导入
+                    </button>
+                    <button
+                      class="btn btn-ghost btn-icon"
+                      type="button"
+                      :title="item.note ? '编辑注释' : '添加注释'"
+                      @click.stop="startNote(item)"
+                    >
+                      <Icon name="edit" :size="12" />
                     </button>
                     <button
                       class="btn btn-ghost btn-icon"
@@ -1775,6 +1848,51 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
   font-size: 11px;
   color: var(--text-dim);
+}
+/* 已有注释：整行可点，点开编辑 */
+.inote {
+  display: block;
+  margin: 1px 0 0;
+  padding: 0;
+  border: none;
+  background: none;
+  font-family: inherit;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.inote:hover {
+  color: var(--text);
+}
+.inote-tag {
+  margin-right: 5px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--bg-panel);
+  color: var(--text-faint);
+  font-size: 10px;
+}
+.inote-edit {
+  margin-top: 2px;
+}
+.inote-input {
+  width: 100%;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg-panel);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11.5px;
+  outline: none;
+}
+.inote-input:focus {
+  border-color: var(--primary);
 }
 .state {
   color: var(--text-dim);

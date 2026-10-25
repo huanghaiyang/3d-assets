@@ -52,6 +52,8 @@ export interface KimodoAnimation {
   etaMs?: number;
   /** 其中估算的冷启动模型加载耗时（毫秒），权重已驻留时为 0 */
   loadMs?: number;
+  /** 用户给这条结果添加的注释（用于标记动作用途、候选编号等） */
+  note?: string;
 }
 
 export interface KimodoStatus {
@@ -529,6 +531,15 @@ class KimodoService {
 
   get(id: string): KimodoAnimation | null {
     return this.jobs.get(id) ?? this.readMeta(id);
+  }
+
+  /** 更新某条结果的注释并落盘（空字符串表示清除注释） */
+  updateNote(id: string, note: string): KimodoAnimation | null {
+    const job = this.get(id);
+    if (!job) return null;
+    job.note = note.trim() || undefined;
+    this.persist(job);
+    return job;
   }
 
   /** 读取动作数据文件（root_positions.f32 / local_rotations_xyzw.f32） */

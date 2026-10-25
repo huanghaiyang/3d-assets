@@ -59,10 +59,19 @@ const renamingId = ref<string | null>(null);
 const renameDraft = ref('');
 
 /** 输入框挂载后立即聚焦并全选，减少一次点击 */
+const renameInput = ref<HTMLInputElement | null>(null);
+
+/**
+ * 函数式 ref 在组件每次更新时都会被重新调用；这里缓存元素，
+ * 只在输入框首次挂载时聚焦+全选，否则每输入一个字就会被重新全选。
+ */
 function focusRenameInput(el: unknown): void {
-  if (!(el instanceof HTMLInputElement)) return;
-  el.focus();
-  el.select();
+  const input = el instanceof HTMLInputElement ? el : null;
+  if (renameInput.value === input) return;
+  renameInput.value = input;
+  if (!input) return;
+  input.focus();
+  input.select();
 }
 
 function startRename(project: NewAnimationProject): void {

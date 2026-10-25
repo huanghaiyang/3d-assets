@@ -47,6 +47,8 @@ export interface KimodoAnimation {
   etaMs?: number;
   /** 预计其中冷启动加载模型的耗时（毫秒），0 表示权重已驻留 */
   loadMs?: number;
+  /** 用户给这条结果添加的注释 */
+  note?: string;
 }
 
 /** 多段生成里的一段提示词 */
@@ -166,6 +168,13 @@ export const kimodoApi = {
 
   remove: (id: string) =>
     request<{ ok: boolean }>(`/api/kimodo/animations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  /** 添加/修改注释（传空字符串清除） */
+  updateNote: (id: string, note: string) =>
+    request<KimodoAnimation>(`/api/kimodo/animations/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ note }),
+    }),
 
   importAnimation: (id: string, clipName?: string) => {
     const query = clipName ? `?clipName=${encodeURIComponent(clipName)}` : '';

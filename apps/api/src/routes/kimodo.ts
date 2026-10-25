@@ -126,6 +126,16 @@ export async function registerKimodoRoutes(app: FastifyInstance): Promise<void> 
     return reply.type('application/octet-stream').header('cache-control', 'no-store').send(buffer);
   });
 
+  /** 给生成结果添加/修改注释（传空字符串表示清除） */
+  app.patch('/api/kimodo/animations/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const body = (request.body ?? {}) as { note?: unknown };
+    if (typeof body.note !== 'string') return reply.code(400).send({ error: '注释必须是字符串' });
+    const updated = kimodoService.updateNote(id, body.note.slice(0, 200));
+    if (!updated) return reply.code(404).send({ error: '任务不存在' });
+    return updated;
+  });
+
   /** 删除生成结果 */
   app.delete('/api/kimodo/animations/:id', async (request, reply) => {
     const { id } = request.params as { id: string };

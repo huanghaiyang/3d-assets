@@ -106,8 +106,8 @@ export const config = {
     promptModel,
     /** 带参考图时使用的视觉模型（可与纯文字模型不同） */
     promptVisionModel,
-    /** 推理模型会先消耗思考 token，预算留足避免正文被截断 */
-    promptMaxTokens: int(process.env.KIMODO_PROMPT_MAX_TOKENS, 1200),
+    /** 推理模型会先消耗思考 token；默认 0 表示不传 max_tokens，交给接口按模型默认上限处理 */
+    promptMaxTokens: int(process.env.KIMODO_PROMPT_MAX_TOKENS, 0),
     promptTimeoutMs: int(process.env.KIMODO_PROMPT_TIMEOUT_MS, 120_000),
     /** 转译温度：越低越忠实于原意，默认 0.35 */
     promptTemperature: rate(process.env.KIMODO_PROMPT_TEMPERATURE, 0.35),
