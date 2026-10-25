@@ -81,7 +81,10 @@ function publicStatus(): Record<string, unknown> {
     busy: status.busy,
     queued: status.queued,
     backend: status.backend,
+    promptProvider: status.promptProvider,
+    promptProviderLabel: status.promptProviderLabel,
     promptModel: status.promptModel,
+    promptVisionModel: status.promptVisionModel,
     promptModelReady: status.promptModelReady,
     error: status.error ? scrub(status.error) : null,
   };
@@ -449,7 +452,11 @@ const tools: ToolDefinition[] = [
       image: { type: 'string', description: '可选：参考图片的 data URL（data:image/png;base64,...）' },
     }),
     handler: async (args) => {
-      if (!promptEnhancerReady()) throw new Error('服务端未配置 DEEPSEEK_API_KEY');
+      if (!promptEnhancerReady()) {
+        throw new Error(
+          '服务端未配置提示词模型：请设置 KIMODO_PROMPT_PROVIDER 与对应的 API Key（默认 DeepSeek 用 DEEPSEEK_API_KEY）',
+        );
+      }
       return enhancePrompt({
         prompt: readString(args, 'prompt'),
         image: readString(args, 'image'),

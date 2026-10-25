@@ -14,9 +14,15 @@ export interface KimodoStatus {
   textBundle: string | null;
   outputDir: string;
   backend: string;
-  /** 提示词转译模型名 */
+  /** 提示词转译厂商（deepseek / openai / qwen / ...） */
+  promptProvider: string;
+  /** 厂商显示名 */
+  promptProviderLabel: string;
+  /** 纯文字转译模型名 */
   promptModel: string;
-  /** 是否配置了提示词模型 Key */
+  /** 带参考图时使用的视觉模型名 */
+  promptVisionModel: string;
+  /** 提示词模型是否可用 */
   promptModelReady: boolean;
   error: string | null;
 }

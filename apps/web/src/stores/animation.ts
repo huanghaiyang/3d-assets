@@ -1179,28 +1179,61 @@ export const useAnimationStore = defineStore('animation', () => {
   }
 
   /**
-   * 重新生成单个模型的封面：让服务端强制重渲染并覆盖磁盘缓存，
+   * 重新生成封面：让服务端强制重渲染并覆盖磁盘缓存，
    * 再用带版本号的 URL 顶掉浏览器里的旧图。
-   * 同一基础模型的多张卡片（新建动画共用 basePath）会一起更新。
+   * key 由调用方给（原始 FBX 用路径，新建动画用 project:<id>）。
    */
-  async function refreshCover(filePath: string): Promise<void> {
-    if (!filePath || isRefreshingCover(filePath)) return;
-    refreshingCoverPaths.value = [...refreshingCoverPaths.value, filePath];
+  async function runCoverRefresh(
+    key: string,
+    buildUrl: (options: { refresh?: boolean; version: string }) => string,
+  ): Promise<void> {
+    if (!key || isRefreshingCover(key)) return;
+    refreshingCoverPaths.value = [...refreshingCoverPaths.value, key];
     const version = Date.now().toString(36);
     try {
-      const url = animationApi.animationCoverUrl(filePath, THUMB_SIZE, THUMB_POSE, { refresh: true, version });
-      const response = await fetch(url);
+      const response = await fetch(buildUrl({ refresh: true, version }));
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      thumbnails.value = {
-        ...thumbnails.value,
-        [filePath]: animationApi.animationCoverUrl(filePath, THUMB_SIZE, THUMB_POSE, { version }),
-      };
+      thumbnails.value = { ...thumbnails.value, [key]: buildUrl({ version }) };
       toast('success', '封面已重新生成');
     } catch (err) {
       toast('error', `封面生成失败：${(err as Error).message}`);
     } finally {
-      refreshingCoverPaths.value = refreshingCoverPaths.value.filter((item) => item !== filePath);
+      refreshingCoverPaths.value = refreshingCoverPaths.value.filter((item) => item !== key);
     }
+  }
+
+  /** 动画库里原始 FBX 的封面（按文件自带动画取帧） */
+  async function refreshCover(filePath: string): Promise<void> {
+    await runCoverRefresh(filePath, (options) =>
+      animationApi.animationCoverUrl(filePath, THUMB_SIZE, THUMB_POSE, options),
+    );
+  }
+
+  /**
+   * 新建动画卡片的封面 key：
+   * - 已保存 → project:<id>（后端按项目里保存的动画数据取姿势）
+   * - 未保存 → 基础模型路径（服务端没有项目数据，只能看基础模型）
+   */
+  function projectCoverKey(project: NewAnimationProject): string {
+    return project.saved ? `project:${project.id}` : project.basePath;
+  }
+
+  function projectCoverUrl(
+    project: NewAnimationProject,
+    options: { refresh?: boolean; version?: string } = {},
+  ): string {
+    if (!project.saved) {
+      return animationApi.animationCoverUrl(project.basePath, THUMB_SIZE, THUMB_POSE, options);
+    }
+    return animationApi.animationCoverUrl('', THUMB_SIZE, THUMB_POSE, {
+      ...options,
+      project: project.id,
+    });
+  }
+
+  /** 重新生成某个新建动画的封面（按项目动画数据重新取姿势） */
+  async function refreshProjectCover(project: NewAnimationProject): Promise<void> {
+    await runCoverRefresh(projectCoverKey(project), (options) => projectCoverUrl(project, options));
   }
 
   function coverUrl(file: AnimationFile): string {
@@ -1210,6 +1243,22 @@ export const useAnimationStore = defineStore('animation', () => {
   function requestThumbnail(file: AnimationFile): void {
     if (thumbnails.value[file.path]) return;
     thumbnails.value = { ...thumbnails.value, [file.path]: coverUrl(file) };
+  }
+
+  /**
+   * 按封面 key 请求图片：动画库卡片传文件路径，新建动画卡片传 projectCoverKey()。
+   * 卡片进入视口时调用（IntersectionObserver），避免一次性渲染所有封面。
+   */
+  function requestCover(key: string): void {
+    if (!key || thumbnails.value[key]) return;
+    if (key.startsWith('project:')) {
+      const project = newAnimations.value.find((item) => projectCoverKey(item) === key);
+      if (!project) return;
+      thumbnails.value = { ...thumbnails.value, [key]: projectCoverUrl(project) };
+      return;
+    }
+    const file = files.value.find((item) => item.path === key);
+    if (file) requestThumbnail(file);
   }
 
   /** 提前给当前页所有卡片挂上封面 URL（图片由浏览器并发加载） */
@@ -1392,10 +1441,13 @@ export const useAnimationStore = defineStore('animation', () => {
     setPage,
     setPageSize,
     requestThumbnail,
+    requestCover,
     generatePageThumbnails,
     refreshPageCovers,
     refreshingCovers,
     refreshCover,
+    projectCoverKey,
+    refreshProjectCover,
     isRefreshingCover,
     resetThumbQueue,
     dispose,

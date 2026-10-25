@@ -21,9 +21,9 @@ function setupObserver(): void {
     (entries) => {
       for (const entry of entries) {
         if (!entry.isIntersecting) continue;
-        const path = (entry.target as HTMLElement).dataset.path;
-        const file = store.files.find((item) => item.path === path);
-        if (file) store.requestThumbnail(file);
+        // 动画库卡片是文件路径，新建动画卡片是 project:<id>（由 store 区分）
+        const key = (entry.target as HTMLElement).dataset.path;
+        if (key) store.requestCover(key);
       }
     },
     { root: listRef.value, rootMargin: '120px' },
@@ -34,6 +34,14 @@ function setupObserver(): void {
 watch(files, () => {
   requestAnimationFrame(setupObserver);
 });
+
+// 新建动画的封面 key 会随「保存/新增/删除」变化（basePath → project:<id>），重新观察一遍
+watch(
+  () => store.newAnimations,
+  () => {
+    requestAnimationFrame(setupObserver);
+  },
+);
 
 onMounted(() => setupObserver());
 
@@ -214,14 +222,14 @@ function onPageSize(event: Event): void {
             :key="project.id"
             class="anim-card new-card"
             :class="{ active: store.activeNewAnimationId === project.id }"
-            :data-path="project.basePath"
+            :data-path="store.projectCoverKey(project)"
             :title="`模型 ${project.baseName}${project.imported ? ` · ${project.imported.name}` : ' · 无动画数据'}`"
           >
             <button class="card-select" type="button" @click="store.selectNewAnimation(project.id)">
               <div class="thumb">
                 <img
-                  v-if="store.thumbnails[project.basePath]"
-                  :src="store.thumbnails[project.basePath]"
+                  v-if="store.thumbnails[store.projectCoverKey(project)]"
+                  :src="store.thumbnails[store.projectCoverKey(project)]"
                   :alt="project.name"
                 />
                 <div v-else class="thumb-placeholder">
@@ -256,14 +264,14 @@ function onPageSize(event: Event): void {
               <button
                 class="card-icon"
                 type="button"
-                :disabled="store.isRefreshingCover(project.basePath)"
-                title="重新生成封面（服务端重渲染基础模型）"
-                @click.stop="store.refreshCover(project.basePath)"
+                :disabled="store.isRefreshingCover(store.projectCoverKey(project))"
+                title="重新生成封面（按当前动画数据取姿势）"
+                @click.stop="store.refreshProjectCover(project)"
               >
                 <Icon
                   name="refresh"
                   :size="12"
-                  :class="{ spin: store.isRefreshingCover(project.basePath) }"
+                  :class="{ spin: store.isRefreshingCover(store.projectCoverKey(project)) }"
                 />
               </button>
               <button class="card-icon" type="button" title="重命名" @click.stop="startRename(project)">

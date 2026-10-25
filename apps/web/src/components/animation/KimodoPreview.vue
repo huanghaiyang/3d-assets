@@ -1,10 +1,25 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import * as THREE from 'three';
 import Icon from '../ui/Icon.vue';
-import { kimodoApi, type SomaSkeleton } from '@/api/kimodo';
+import { kimodoApi, type KimodoStatusValue, type SomaSkeleton } from '@/api/kimodo';
 
-const props = defineProps<{ animationId: string; skeleton: SomaSkeleton | null }>();
+const props = defineProps<{
+  animationId: string;
+  skeleton: SomaSkeleton | null;
+  /** 当前选中任务的状态：queued / running 时动作文件还不存在，预览区显示 loading */
+  jobStatus?: KimodoStatusValue | null;
+  /** 生成进度（0~100），仅 running 时有意义 */
+  progress?: number;
+  /** 阶段文案（例如「扩散采样与动作解码」），排队时是排队提示 */
+  stage?: string;
+}>();
+
+/** 任务还在排队/生成中：还没有 .f32 结果，不要去请求 motion 接口 */
+const generating = computed(() => props.jobStatus === 'queued' || props.jobStatus === 'running');
+const generatingTitle = computed(() =>
+  props.jobStatus === 'queued' ? '排队等待生成' : '正在生成动画',
+);
 
 const container = ref<HTMLDivElement | null>(null);
 const loading = ref(false);
@@ -225,31 +240,51 @@ function resize(): void {
   camera.updateProjectionMatrix();
 }
 
+/** 移除上一次的骨架（生成中/切换任务时先清空，避免旧动作留在画面里） */
+function clearRig(): void {
+  if (scene) {
+    for (const child of [...scene.children]) {
+      if (child instanceof THREE.LineSegments || child instanceof THREE.Points) {
+        scene.remove(child);
+        child.geometry.dispose();
+      } else if (child instanceof THREE.Group) {
+        scene.remove(child);
+      }
+    }
+  }
+  lineGeometry = null;
+  points = null;
+  joints = [];
+  rotations = null;
+  rootPositions = null;
+  totalFrames.value = 0;
+  frame.value = 0;
+  clock = 0;
+}
+
 async function load(): Promise<void> {
   if (!props.animationId || !props.skeleton) return;
+  // 排队/生成中的任务还没有动作文件，直接展示 loading，不发起请求
+  if (generating.value) {
+    clearRig();
+    error.value = null;
+    loading.value = false;
+    return;
+  }
+  if (props.jobStatus === 'failed') {
+    clearRig();
+    loading.value = false;
+    error.value = props.stage ? `生成失败：${props.stage}` : '生成失败';
+    return;
+  }
   loading.value = true;
   error.value = null;
   try {
     const data = await kimodoApi.motion(props.animationId);
+    clearRig();
     rotations = data.rotations;
     rootPositions = data.root;
     totalFrames.value = Math.floor(data.root.length / 3);
-    frame.value = 0;
-    clock = 0;
-
-    // 清掉上一次的骨架
-    if (scene) {
-      for (const child of [...scene.children]) {
-        if (child instanceof THREE.LineSegments || child instanceof THREE.Points) {
-          scene.remove(child);
-          child.geometry.dispose();
-        } else if (child instanceof THREE.Group) {
-          scene.remove(child);
-        }
-      }
-    }
-    lineGeometry = null;
-    points = null;
     if (totalFrames.value > 0) {
       buildRig(props.skeleton);
       fitCamera();
@@ -266,6 +301,15 @@ watch(() => props.animationId, load);
 watch(() => props.skeleton, (value) => {
   if (value) void load();
 });
+// 生成完成（ready）后自动加载动作；排队→生成中时清空画面并显示 loading
+watch(
+  () => props.jobStatus,
+  (value) => {
+    if (value === 'ready' || value === 'failed' || value === 'queued' || value === 'running') {
+      void load();
+    }
+  },
+);
 
 onMounted(() => {
   setupScene();
@@ -321,7 +365,21 @@ function scrub(value: number): void {
   <div class="preview">
     <div ref="container" class="canvas"></div>
 
-    <div v-if="loading" class="hint">
+    <!-- 排队/生成中：动作文件还不存在，用 loading 卡片占位，完成后自动切换成骨架预览 -->
+    <div v-if="generating" class="hint">
+      <div class="gen-card">
+        <Icon name="refresh" :size="16" class="spin" />
+        <div class="gen-body">
+          <p class="gen-title">{{ generatingTitle }}</p>
+          <p class="gen-sub">{{ stage || '任务开始后会自动载入预览' }}</p>
+          <div v-if="jobStatus === 'running'" class="gen-track">
+            <div class="gen-fill" :style="{ width: `${Math.min(100, Math.max(0, progress ?? 0))}%` }" />
+          </div>
+          <p v-if="jobStatus === 'running'" class="gen-percent mono">{{ Math.round(progress ?? 0) }}%</p>
+        </div>
+      </div>
+    </div>
+    <div v-else-if="loading" class="hint">
       <Icon name="refresh" :size="14" class="spin" /> 读取动作数据…
     </div>
     <div v-else-if="error" class="hint error">{{ error }}</div>
@@ -378,6 +436,53 @@ function scrub(value: number): void {
 }
 .hint.error {
   color: var(--danger);
+}
+/* 生成中 loading 卡片：深色玻璃底，和 3D 视口区分开 */
+.gen-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  max-width: min(420px, 82%);
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(15, 20, 30, 0.86);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.36);
+  color: var(--text);
+}
+.gen-body {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+}
+.gen-title {
+  margin: 0 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.gen-sub {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.gen-track {
+  margin-top: 10px;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.18);
+  overflow: hidden;
+}
+.gen-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--primary, #60a5fa);
+  transition: width 0.4s ease;
+}
+.gen-percent {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--text-dim);
 }
 .controls {
   display: flex;

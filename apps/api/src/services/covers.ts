@@ -32,6 +32,16 @@ export interface CoverRequest {
   ground?: 'shadow' | 'none';
   /** 相机垂直视角，默认 42（工作台 ModelViewer 的 42 / 动画 FbxPlayer 的 40） */
   fov?: number;
+  /**
+   * 新建动画项目的动画数据（fbx-animation-data JSON）。
+   * 用于把「导入的动画」套到基础模型上再取某一个时刻的姿势，
+   * 否则封面只能看到基础模型自带的 Mixamo 动作。
+   */
+  animation?: unknown;
+  /** true = 只使用 animation 里的数据，不回退到 FBX 自带动画（新建动画的基础模型应是无动画的） */
+  animationOnly?: boolean;
+  /** 缓存标识（如项目 updatedAt）：参与内存/磁盘缓存 key，项目改动画后封面自动失效 */
+  cacheTag?: string;
   timeoutMs?: number;
 }
 
@@ -151,6 +161,8 @@ export class CoverRenderer {
       engine: task.request.engine ?? 'auto',
       ground: task.request.ground ?? 'shadow',
       fov: task.request.fov ?? 42,
+      animation: task.request.animation ?? null,
+      animationOnly: task.request.animationOnly ?? false,
     });
   }
 
@@ -234,11 +246,20 @@ export function getCoverCacheDir(): string {
 // 封面渲染行为变化时 +1，让旧缓存自然失效（文件 mtime 之外的第二层保险）
 export const COVER_CACHE_VERSION = '2';
 
-/** 缓存 key → 文件名：包含路径、mtime、尺寸、姿态，文件更新会自动失效 */
-function coverCacheFile(filePath: string, mtimeMs: number, size: number, pose: number): string {
+/**
+ * 缓存 key → 文件名：包含路径、mtime、尺寸、姿态，
+ * 以及 cacheTag（新建动画项目的 updatedAt），基础文件或项目动画更新都会自动失效。
+ */
+function coverCacheFile(
+  filePath: string,
+  mtimeMs: number,
+  size: number,
+  pose: number,
+  cacheTag: string,
+): string {
   const hash = crypto
     .createHash('sha1')
-    .update(`${COVER_CACHE_VERSION}|${filePath}|${mtimeMs}|${size}|${pose}`)
+    .update(`${COVER_CACHE_VERSION}|${filePath}|${mtimeMs}|${size}|${pose}|${cacheTag}`)
     .digest('hex');
   return path.join(coversCacheDir, `${hash}.png`);
 }
@@ -265,12 +286,22 @@ async function writeCacheFile(target: string, png: Buffer): Promise<void> {
  */
 export async function animationCover(
   filePath: string,
-  options: { size?: number; poseFraction?: number; refresh?: boolean } = {},
+  options: {
+    size?: number;
+    poseFraction?: number;
+    refresh?: boolean;
+    /** 项目动画数据：套到基础模型上再取姿势（新建动画封面） */
+    animation?: unknown;
+    animationOnly?: boolean;
+    /** 项目级缓存标识（通常是 updatedAt） */
+    cacheTag?: string;
+  } = {},
 ): Promise<Buffer> {
   const stat = await fs.stat(filePath);
   const size = options.size ?? 256;
   const pose = options.poseFraction ?? 0.35;
-  const key = `${filePath}|${stat.mtimeMs}|${size}|${pose}`;
+  const cacheTag = options.cacheTag ?? '';
+  const key = `${filePath}|${stat.mtimeMs}|${size}|${pose}|${cacheTag}`;
 
   if (!options.refresh) {
     const cached = animationCache.get(key);
@@ -281,7 +312,7 @@ export async function animationCover(
       return cached.png;
     }
 
-    const cacheFile = coverCacheFile(filePath, stat.mtimeMs, size, pose);
+    const cacheFile = coverCacheFile(filePath, stat.mtimeMs, size, pose, cacheTag);
     const fromDisk = await fs.readFile(cacheFile).catch(() => null);
     if (fromDisk) {
       animationCache.set(key, { png: fromDisk, at: Date.now() });
@@ -295,6 +326,8 @@ export async function animationCover(
     poseFraction: pose,
     ground: 'shadow',
     fov: 40,
+    animation: options.animation ?? null,
+    animationOnly: options.animationOnly ?? false,
   });
   animationCache.set(key, { png, at: Date.now() });
   while (animationCache.size > ANIMATION_CACHE_MAX) {
@@ -302,7 +335,7 @@ export async function animationCover(
     if (oldest === undefined) break;
     animationCache.delete(oldest);
   }
-  await writeCacheFile(coverCacheFile(filePath, stat.mtimeMs, size, pose), png);
+  await writeCacheFile(coverCacheFile(filePath, stat.mtimeMs, size, pose, cacheTag), png);
   return png;
 }
 

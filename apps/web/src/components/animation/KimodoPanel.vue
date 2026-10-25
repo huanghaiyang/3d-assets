@@ -55,13 +55,18 @@ const queuedJobs = computed(() =>
   animations.value.filter((item) => item.status === 'queued').sort((a, b) => a.createdAt - b.createdAt),
 );
 const activeJob = computed<KimodoAnimation | null>(() => runningJob.value ?? queuedJobs.value[0] ?? null);
+/** 右侧预览当前选中的任务：用于在排队/生成中显示 loading，而不是去请求还存在的动作文件 */
+const selectedJob = computed(
+  () => animations.value.find((item) => item.id === selectedId.value) ?? null,
+);
 const lastReady = computed(() => animations.value.find((item) => item.status === 'ready') ?? null);
 const lastReadyDuration = computed(() => lastReady.value?.durationMs ?? 0);
-const queuePosition = computed(() => {
-  const active = activeJob.value;
-  if (!active || active.status !== 'queued') return 0;
-  return queuedJobs.value.findIndex((item) => item.id === active.id) + 1;
-});
+/** 某个排队任务在队列里的位置（1 起）；非排队任务返回 0 */
+function queueIndexOf(item: KimodoAnimation): number {
+  if (item.status !== 'queued') return 0;
+  return queuedJobs.value.findIndex((entry) => entry.id === item.id) + 1;
+}
+const queuePosition = computed(() => (activeJob.value ? queueIndexOf(activeJob.value) : 0));
 
 /**
  * 估算进度（0–1）。kmd-generate 不回报中间进度，只能按「已用时间 / 预计耗时」推算，
@@ -77,7 +82,8 @@ function percentOf(item: KimodoAnimation): number {
 }
 function stageOf(item: KimodoAnimation): string {
   if (item.status === 'queued') {
-    return queuePosition.value > 1 ? `排队中，前面还有 ${queuePosition.value - 1} 个任务` : '排队中，即将开始';
+    const position = queueIndexOf(item);
+    return position > 1 ? `排队中，前面还有 ${position - 1} 个任务` : '排队中，即将开始';
   }
   if (item.status === 'running') {
     const elapsed = item.startedAt ? now.value - item.startedAt : 0;
@@ -266,8 +272,12 @@ async function refresh(): Promise<void> {
   try {
     animations.value = await kimodoApi.animations();
     if (!selectedId.value) {
-      const firstReady = animations.value.find((item) => item.status === 'ready');
-      if (firstReady) selectedId.value = firstReady.id;
+      // 优先展示已生成的结果；没有结果时自动选中正在生成/排队的任务，预览区显示 loading
+      const preferred =
+        animations.value.find((item) => item.status === 'ready') ??
+        animations.value.find((item) => item.status === 'running') ??
+        animations.value.find((item) => item.status === 'queued');
+      if (preferred) selectedId.value = preferred.id;
     }
   } catch {
     /* ignore */
@@ -298,8 +308,10 @@ async function generate(): Promise<void> {
       steps: steps.value,
       seed: seed.value > 0 ? seed.value : undefined,
     });
-    selectedId.value = job.id;
+    // 先刷新列表再选中：让预览区拿到的任务状态是 queued，
+    // 从而直接显示 loading，而不是先请求一次还不存在的动作文件
     await refresh();
+    selectedId.value = job.id;
     notice.value = {
       kind: 'info',
       text: `已提交：${job.frames} 帧 / ${job.steps} 步，seed=${job.seed}。本地 CPU 推理，请保持页面打开。`,
@@ -442,7 +454,13 @@ onBeforeUnmount(() => {
                 <label class="field">
                   <span class="field-head">
                     提示词
-                    <span v-if="enhanceAvailable" class="ai-badge">{{ status?.promptModel }}</span>
+                    <span
+                      v-if="enhanceAvailable"
+                      class="ai-badge"
+                      :title="`${status?.promptProviderLabel} · 文字 ${status?.promptModel} · 视觉 ${status?.promptVisionModel}`"
+                    >
+                      {{ status?.promptProviderLabel }}
+                    </span>
                   </span>
                   <textarea
                     v-model="prompt"
@@ -477,7 +495,7 @@ onBeforeUnmount(() => {
                     :title="
                       enhanceAvailable
                         ? '把描述与参考图片交给大模型，转译成英文动作提示词'
-                        : '服务端未配置 DEEPSEEK_API_KEY，无法使用 AI 转译'
+                        : '服务端未配置提示词模型 API Key，无法使用 AI 转译'
                     "
                     @click="enhance"
                   >
@@ -489,7 +507,7 @@ onBeforeUnmount(() => {
                     {{ enhancing ? '转译中…' : 'AI 转译' }}
                   </button>
                   <span class="hint">
-                    {{ enhanceAvailable ? '支持上传图片，由大模型转译成英文提示词' : '未配置 DEEPSEEK_API_KEY' }}
+                    {{ enhanceAvailable ? '支持上传图片，由大模型转译成英文提示词' : '未配置提示词模型 API Key' }}
                   </span>
                 </div>
 
@@ -652,7 +670,13 @@ onBeforeUnmount(() => {
             </section>
 
             <section class="right">
-              <KimodoPreview :animation-id="selectedId ?? ''" :skeleton="skeleton" />
+              <KimodoPreview
+                :animation-id="selectedId ?? ''"
+                :skeleton="skeleton"
+                :job-status="selectedJob?.status ?? null"
+                :progress="selectedJob ? percentOf(selectedJob) : 0"
+                :stage="selectedJob ? stageOf(selectedJob) : ''"
+              />
             </section>
           </div>
         </aside>

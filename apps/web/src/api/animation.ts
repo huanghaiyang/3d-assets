@@ -160,19 +160,23 @@ export const animationApi = {
   /** 只取流，不进 HTTP 缓存（服务端 no-store，客户端只在内存里留一份） */
   fileUrl: (filePath: string) => `/api/anim/file?path=${encodeURIComponent(filePath)}`,
 
-  /** 封面：后端 worker 子线程渲染（浏览器只当图片加载，不占主线程） */
+  /**
+   * 封面：后端 worker 子线程渲染（浏览器只当图片加载，不占主线程）。
+   * 传 project 时按「项目动画数据」取姿势（新建动画卡片），否则按 FBX 自带动画取帧。
+   */
   animationCoverUrl: (
     filePath: string,
     size = 192,
     pose = 0.35,
-    options: { version?: string | number; refresh?: boolean } = {},
+    options: { version?: string | number; refresh?: boolean; project?: string } = {},
   ) => {
     const params = new URLSearchParams({
-      path: filePath,
       size: String(size),
       pose: String(pose),
       v: String(options.version ?? ANIMATION_COVER_VERSION),
     });
+    if (options.project) params.set('project', options.project);
+    else params.set('path', filePath);
     if (options.refresh) params.set('refresh', '1');
     return `/api/anim/cover?${params.toString()}`;
   },

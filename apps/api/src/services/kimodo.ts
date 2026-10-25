@@ -5,6 +5,7 @@ import { config } from '../config.js';
 import { createLogger } from '../lib/logger.js';
 import { repoRoot } from '../lib/paths.js';
 import { listProjects } from './animProjects.js';
+import { promptEnhancerReady } from './promptEnhance.js';
 
 const log = createLogger('kimodo');
 
@@ -54,9 +55,15 @@ export interface KimodoStatus {
   textBundle: string | null;
   outputDir: string;
   backend: string;
-  /** 提示词转译模型名（前端展示用） */
+  /** 提示词转译厂商（deepseek / openai / qwen / ...） */
+  promptProvider: string;
+  /** 厂商显示名（前端展示用） */
+  promptProviderLabel: string;
+  /** 纯文字转译模型名 */
   promptModel: string;
-  /** 是否配置了提示词模型的 Key */
+  /** 带参考图时使用的视觉模型名 */
+  promptVisionModel: string;
+  /** 提示词模型是否可用（Key、接口地址、模型名齐全） */
   promptModelReady: boolean;
   /** 配置或运行期的错误说明 */
   error: string | null;
@@ -162,8 +169,11 @@ class KimodoService {
       textBundle: config.kimodo.textBundle,
       outputDir: this.outputDir,
       backend: config.kimodo.backend,
+      promptProvider: config.kimodo.promptProvider,
+      promptProviderLabel: config.kimodo.promptProviderLabel,
       promptModel: config.kimodo.promptModel,
-      promptModelReady: Boolean(config.kimodo.promptApiKey),
+      promptVisionModel: config.kimodo.promptVisionModel,
+      promptModelReady: promptEnhancerReady(),
       error: check.ok ? this.lastError : check.missing.join('；'),
     };
   }

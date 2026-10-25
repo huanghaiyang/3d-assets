@@ -261,14 +261,47 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
   /**
    * 动画封面（由后端子线程渲染，浏览器只负责显示 <img>）。
    * 只允许已记录文件夹内的 .fbx；带 ETag，重复请求命中缓存直接 304。
+   *
+   * 两种取图方式：
+   *   - ?path=<fbx>          动画库里的原始 FBX，取文件自带动画的某一帧
+   *   - ?project=<id>        新建动画项目：用基础模型 + 项目里保存的动画数据取姿势，
+   *                          这样卡片封面展示的是实际编辑出来的动作（例如 kimodo 导入的动作），
+   *                          而不是基础模型自带的 Mixamo 动作。
    */
   app.get('/api/anim/cover', async (request, reply) => {
-    const query = request.query as { path?: string; size?: string; pose?: string; refresh?: string };
-    const raw = query.path?.trim();
-    if (!raw) return reply.code(400).send({ error: '缺少 path 参数' });
+    const query = request.query as {
+      path?: string;
+      project?: string;
+      size?: string;
+      pose?: string;
+      refresh?: string;
+    };
 
-    const target = path.resolve(raw);
-    if (!isFbx(target)) return reply.code(415).send({ error: '动画封面只支持 .fbx 文件' });
+    let target: string;
+    let animation: unknown = null;
+    let animationOnly = false;
+    let cacheTag = '';
+
+    const rawProject = query.project?.trim();
+    if (rawProject) {
+      const id = projectId(rawProject);
+      if (!id) return reply.code(400).send({ error: '无效的项目 id' });
+      const record = await readProject(id);
+      if (!record) return reply.code(404).send({ error: '项目不存在' });
+      target = path.resolve(record.basePath);
+      if (!record.basePath || !isFbx(target)) {
+        return reply.code(415).send({ error: '项目没有可用的 .fbx 基础模型' });
+      }
+      animation = record.data;
+      // 新建动画的基础模型应是无动画的：只用项目动画数据，没有数据就回到绑定姿态
+      animationOnly = true;
+      cacheTag = `${record.updatedAt}|${record.hasData ? '1' : '0'}`;
+    } else {
+      const raw = query.path?.trim();
+      if (!raw) return reply.code(400).send({ error: '缺少 path 参数' });
+      target = path.resolve(raw);
+      if (!isFbx(target)) return reply.code(415).send({ error: '动画封面只支持 .fbx 文件' });
+    }
 
     const { dirs } = await effectiveDirs();
     const inside = dirs.some(
@@ -282,14 +315,21 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
     const size = Math.min(384, Math.max(96, Number(query.size) || 256));
     const pose = Math.min(1, Math.max(0, Number(query.pose ?? 0.35)));
     const refresh = query.refresh === '1' || query.refresh === 'true';
-    // ETag 带上渲染器版本：渲染逻辑升级后浏览器不会继续用旧图（例如修掉 T-pose 封面）
-    const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}-${size}-${pose}-v${COVER_CACHE_VERSION}"`;
+    // ETag 带上渲染器版本与项目更新时间：渲染逻辑升级、或项目动画改动后浏览器不会继续用旧图
+    const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}-${size}-${pose}-v${COVER_CACHE_VERSION}-${cacheTag}"`;
     if (!refresh && request.headers['if-none-match'] === etag) {
       return reply.code(304).send();
     }
 
     try {
-      const png = await animationCover(target, { size, poseFraction: pose, refresh });
+      const png = await animationCover(target, {
+        size,
+        poseFraction: pose,
+        refresh,
+        animation,
+        animationOnly,
+        cacheTag,
+      });
       return reply
         .header('Content-Type', 'image/png')
         .header('Content-Length', String(png.length))

@@ -2,6 +2,7 @@ import path from 'node:path';
 import dotenv from 'dotenv';
 import { apiRoot, repoRoot, webDistDir } from './lib/paths.js';
 import { listProviders } from './providers/registry.js';
+import { promptProviderPreset } from './services/promptProviders.js';
 import { DEFAULT_PROVIDER_ID, type ProviderId } from './store/types.js';
 
 // 依次加载仓库根目录与 apps/api 下的 .env（后者优先覆盖）
@@ -36,6 +37,23 @@ const providerEnv: Record<string, ProviderEnvConfig> = Object.fromEntries(
     } satisfies ProviderEnvConfig,
   ]),
 );
+
+/**
+ * 提示词转译模型配置解析：
+ * 先按 KIMODO_PROMPT_PROVIDER 选厂商预设，再用 KIMODO_PROMPT_* 变量逐项覆盖。
+ * 默认 DeepSeek，保持原有 DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL 配置继续可用。
+ */
+const promptPreset = promptProviderPreset(text(process.env.KIMODO_PROMPT_PROVIDER) ?? 'deepseek');
+const promptApiKey =
+  text(process.env.KIMODO_PROMPT_API_KEY) ?? text(process.env[promptPreset.envKey]);
+const promptBaseUrl = (
+  text(process.env.KIMODO_PROMPT_BASE_URL) ??
+  text(process.env[promptPreset.envBaseUrl]) ??
+  promptPreset.baseUrl
+).replace(/\/+$/, '');
+const promptModel = text(process.env.KIMODO_PROMPT_MODEL) ?? promptPreset.model;
+const promptVisionModel =
+  text(process.env.KIMODO_PROMPT_VISION_MODEL) ?? (promptPreset.visionModel || promptModel);
 
 export const config = {
   host: process.env.HOST ?? '127.0.0.1',
@@ -73,13 +91,19 @@ export const config = {
     /** 文本编码器分层驻留块数，留空给生成器默认值 */
     textLayerChunk: text(process.env.KIMODO_TEXT_LAYER_CHUNK),
     /**
-     * 提示词转译用的大模型（DeepSeek，OpenAI 兼容接口）。
+     * 提示词转译用的大模型（OpenAI 兼容接口，默认 DeepSeek）。
      * Key 只在服务端读取，绝不返回给前端 / MCP。
      */
-    promptApiKey: text(process.env.DEEPSEEK_API_KEY),
-    promptBaseUrl: (text(process.env.DEEPSEEK_BASE_URL) ?? 'https://api.deepseek.com').replace(/\/+$/, ''),
-    promptModel: text(process.env.KIMODO_PROMPT_MODEL) ?? 'deepseek-flash',
-    promptTimeoutMs: int(process.env.KIMODO_PROMPT_TIMEOUT_MS, 90_000),
+    promptProvider: promptPreset.id,
+    promptProviderLabel: promptPreset.label,
+    promptApiKey,
+    promptBaseUrl,
+    promptModel,
+    /** 带参考图时使用的视觉模型（可与纯文字模型不同） */
+    promptVisionModel,
+    /** 推理模型会先消耗思考 token，预算留足避免正文被截断 */
+    promptMaxTokens: int(process.env.KIMODO_PROMPT_MAX_TOKENS, 1200),
+    promptTimeoutMs: int(process.env.KIMODO_PROMPT_TIMEOUT_MS, 120_000),
   },
   webDistDir,
   repoRoot,

@@ -10,7 +10,7 @@
  * 图片资源没有 DOM，这里把 `URL.createObjectURL` 接成内存 blob 表，
  * 再自己用 pngjs / jpeg-js 解码成 DataTexture 喂给 WebGL。
  *
- * 输入消息：{ id, filePath, size, poseFraction?, engine? }
+ * 输入消息：{ id, filePath, size, poseFraction?, engine?, animation?, animationOnly? }
  * 输出消息：{ id, ok: true, png, engine } | { id, ok: false, error }
  *
  * 这个文件是运行期 JS（不参与 tsc），由 scripts/copy-runtime-files.mjs 复制到 dist。
@@ -707,15 +707,94 @@ function loadModel(filePath, options = {}) {
 
 // ===== 参数归一化与姿态 =====
 
-function applyPose(root, animations, poseFraction) {
+/** 去掉 Mixamo 前缀，与前端 cleanBoneLabel 一致 */
+function cleanBoneLabel(name) {
+  return name.replace(/^mixamorig[:_]?/i, '') || name;
+}
+
+/**
+ * 把新建动画项目里保存的动画数据（fbx-animation-data）转成 three 的 AnimationClip。
+ *
+ * 轨道结构与前端 FbxPlayer.applyAnimationData 保持一致：
+ *   - 轨道名可能是 "mixamorigHips.quaternion" 或清理后的显示名，需要映射回真实骨骼名；
+ *   - 只接受 times/values 长度自洽的轨道，无法匹配骨骼的轨道直接跳过。
+ * 返回 null 表示这份数据不可用（调用方决定是否回退到 FBX 自带动画）。
+ */
+function clipFromAnimationData(root, data) {
+  const clips = Array.isArray(data?.clips) ? data.clips : [];
+  const clipData = clips.find((clip) => Array.isArray(clip?.tracks) && clip.tracks.length > 0);
+  if (!clipData) return null;
+
+  const nameMap = new Map();
+  root.traverse((child) => {
+    if (!child.name) return;
+    const aliases = [child.name, THREE.PropertyBinding.sanitizeNodeName(child.name), cleanBoneLabel(child.name)];
+    for (const alias of aliases) {
+      if (!nameMap.has(alias)) nameMap.set(alias, child.name);
+    }
+  });
+
+  const tracks = [];
+  for (const track of clipData.tracks) {
+    if (!track?.name || !Array.isArray(track.times) || !Array.isArray(track.values)) continue;
+    if (track.times.length === 0) continue;
+    const valueSize = Number(track.valueSize);
+    if (!valueSize || track.times.length * valueSize !== track.values.length) continue;
+
+    const dot = track.name.lastIndexOf('.');
+    const nodeName = dot > 0 ? track.name.slice(0, dot) : track.name;
+    const property =
+      typeof track.property === 'string' && track.property
+        ? track.property
+        : dot > 0
+          ? track.name.slice(dot + 1)
+          : '';
+    // 优先用导出时记录的 joint 名，再退回轨道里的节点名/去前缀名
+    const target =
+      (track.joint ? nameMap.get(track.joint) : undefined) ??
+      nameMap.get(nodeName) ??
+      nameMap.get(cleanBoneLabel(nodeName));
+    if (!target) continue;
+
+    const trackName = property ? `${target}.${property}` : track.name;
+    if (valueSize === 4) tracks.push(new THREE.QuaternionKeyframeTrack(trackName, track.times, track.values));
+    else if (valueSize === 3) tracks.push(new THREE.VectorKeyframeTrack(trackName, track.times, track.values));
+    else if (valueSize === 1) tracks.push(new THREE.NumberKeyframeTrack(trackName, track.times, track.values));
+  }
+  if (tracks.length === 0) return null;
+
+  const lastTime = tracks.reduce((max, track) => Math.max(max, track.times[track.times.length - 1] ?? 0), 0);
+  const duration = Math.max(Number(clipData.duration) || 0, lastTime);
+  return new THREE.AnimationClip(typeof clipData.name === 'string' && clipData.name ? clipData.name : 'project', duration, tracks);
+}
+
+/**
+ * 取某一时刻的姿态。
+ * @param {THREE.Object3D} root
+ * @param {THREE.AnimationClip[]} animations FBX 自带的动画片段
+ * @param {number|null} poseFraction 0~1，null 表示绑定姿态
+ * @param {unknown} animation 新建动画项目的动画数据（可选）
+ * @param {boolean} animationOnly true 时不回退到 FBX 自带动画（新建动画的基础模型应是无动画的）
+ */
+function applyPose(root, animations, poseFraction, animation = null, animationOnly = false) {
+  let clip = null;
+  if (animation) {
+    try {
+      clip = clipFromAnimationData(root, animation);
+    } catch {
+      clip = null;
+    }
+  }
   // 与前端 FbxPlayer 保持一致：过滤掉空片段（Mixamo 的 FBX 经常带一个
   // "Take 001"：duration=0、0 条轨道；直接用 animations[0] 会渲染成 T-pose）
-  const clips = (animations ?? []).filter((clip) => clip.duration > 0 && clip.tracks.length > 0);
-  if (clips.length === 0 || poseFraction === null || poseFraction === undefined) {
+  if (!clip && !animationOnly) {
+    const clips = (animations ?? []).filter((item) => item.duration > 0 && item.tracks.length > 0);
+    clip = clips[0] ?? null;
+  }
+  if (!clip || poseFraction === null || poseFraction === undefined) {
     root.updateMatrixWorld(true);
     return;
   }
-  const clip = clips[0];
   try {
     const mixer = new THREE.AnimationMixer(root);
     const action = mixer.clipAction(clip);
@@ -1291,10 +1370,18 @@ function extractRenderBatches(root) {
 /** 深色底：与前端 captureThumbnail / captureFrame 填充的 #1b1e25 一致 */
 const COVER_BACKGROUND = [0x1b / 255, 0x1e / 255, 0x25 / 255];
 
-async function renderWithWebGL({ filePath, size = 256, poseFraction = null, ground = 'shadow', fov = 42 }) {
+async function renderWithWebGL({
+  filePath,
+  size = 256,
+  poseFraction = null,
+  ground = 'shadow',
+  fov = 42,
+  animation = null,
+  animationOnly = false,
+}) {
   const createGL = await loadGLModule();
   const { root, animations } = await loadModel(filePath, { realTextures: true });
-  applyPose(root, animations, poseFraction);
+  applyPose(root, animations, poseFraction, animation, animationOnly);
   root.updateMatrixWorld(true);
   const batches = extractRenderBatches(root);
   if (batches.length === 0) throw new Error('模型没有可渲染的三角形');
@@ -1439,9 +1526,9 @@ async function renderWithWebGL({ filePath, size = 256, poseFraction = null, grou
 // ===== 消息入口 =====
 
 /** 软件光栅器兜底（没有 headless-gl 或 WebGL 渲染失败时） */
-async function renderWithSoftware({ filePath, size = 256, poseFraction = null }) {
+async function renderWithSoftware({ filePath, size = 256, poseFraction = null, animation = null, animationOnly = false }) {
   const { root, animations } = await loadModel(filePath);
-  applyPose(root, animations, poseFraction);
+  applyPose(root, animations, poseFraction, animation, animationOnly);
   const triangles = collectTriangles(root);
   const factor = size <= 256 ? 2 : 1;
   const big = size * factor;
@@ -1467,16 +1554,24 @@ async function renderCoverForFile({
   engine = 'auto',
   ground = 'shadow',
   fov = 42,
+  animation = null,
+  animationOnly = false,
 }) {
   if (engine === 'software') {
-    return { png: await renderWithSoftware({ filePath, size, poseFraction }), engine: 'software' };
+    return {
+      png: await renderWithSoftware({ filePath, size, poseFraction, animation, animationOnly }),
+      engine: 'software',
+    };
   }
   try {
-    return { png: await renderWithWebGL({ filePath, size, poseFraction, ground, fov }), engine: 'webgl' };
+    return {
+      png: await renderWithWebGL({ filePath, size, poseFraction, ground, fov, animation, animationOnly }),
+      engine: 'webgl',
+    };
   } catch (err) {
     if (engine === 'webgl') throw err;
     // headless-gl 不可用（例如其它平台缺原生模块）时，退回软件光栅器
-    const png = await renderWithSoftware({ filePath, size, poseFraction });
+    const png = await renderWithSoftware({ filePath, size, poseFraction, animation, animationOnly });
     return { png, engine: 'software', fallbackReason: err instanceof Error ? err.message : String(err) };
   }
 }
@@ -1496,9 +1591,18 @@ parentPort.on('message', async (message) => {
     }
     return;
   }
-  const { id, filePath, size, poseFraction, engine, ground, fov } = message ?? {};
+  const { id, filePath, size, poseFraction, engine, ground, fov, animation, animationOnly } = message ?? {};
   try {
-    const result = await renderCoverForFile({ filePath, size, poseFraction, engine, ground, fov });
+    const result = await renderCoverForFile({
+      filePath,
+      size,
+      poseFraction,
+      engine,
+      ground,
+      fov,
+      animation,
+      animationOnly,
+    });
     parentPort.postMessage({ id, ok: true, png: result.png, engine: result.engine, fallbackReason: result.fallbackReason });
   } catch (err) {
     parentPort.postMessage({ id, ok: false, error: err instanceof Error ? err.stack ?? err.message : String(err) });
