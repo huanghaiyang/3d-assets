@@ -65,10 +65,19 @@ onBeforeUnmount(() => {
         class="btn btn-icon"
         :class="{ active: store.onionSkin }"
         type="button"
-        title="起始帧洋葱皮（每段动画的第一帧残影，常驻舞台）"
+        title="起始帧洋葱皮（每段动画的第一帧残影，可拖拽改站位）"
         @click="store.setOnionSkin(!store.onionSkin)"
       >
-        <Icon name="layers" :size="14" />
+        <Icon name="ghostStart" :size="14" />
+      </button>
+      <button
+        class="btn btn-icon"
+        :class="{ active: store.showEndGhosts }"
+        type="button"
+        title="结尾帧洋葱皮（每段动画的最后一帧残影，常驻舞台）"
+        @click="store.setShowEndGhosts(!store.showEndGhosts)"
+      >
+        <Icon name="ghostEnd" :size="14" />
       </button>
       <button
         class="btn btn-icon"
@@ -77,7 +86,7 @@ onBeforeUnmount(() => {
         title="路径曲线（选中角色的整条时间线轨迹）"
         @click="store.setShowPath(!store.showPath)"
       >
-        <Icon name="flip" :size="14" />
+        <Icon name="pathCurve" :size="14" />
       </button>
       <span class="divider"></span>
       <button class="btn btn-icon" type="button" title="重置视角" @click="player?.resetCamera()">

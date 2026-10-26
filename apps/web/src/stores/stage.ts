@@ -63,6 +63,8 @@ export const useStageStore = defineStore('stage', () => {
   const catalogError = ref<string | null>(null);
 
   const onionSkin = ref(false);
+  /** 结尾帧残影开关：与运动残影(onionSkin)独立，默认开启 */
+  const showEndGhosts = ref(false);
   const showPath = ref(false);
 
   const time = ref(0);
@@ -130,6 +132,7 @@ export const useStageStore = defineStore('stage', () => {
     });
     instance.onSegmentPose((segmentId, pose) => updateSegmentPose(segmentId, pose));
     instance.setOnionSkin(onionSkin.value);
+    instance.setShowEndGhosts(showEndGhosts.value);
     instance.setShowPath(showPath.value);
     // 重进舞台页时恢复当前选中角色（选中环与 gizmo 依赖它）
     instance.setSelectedActor(selectedActorId.value);
@@ -827,6 +830,11 @@ export const useStageStore = defineStore('stage', () => {
     player?.setShowPath(on);
   }
 
+  function setShowEndGhosts(on: boolean): void {
+    showEndGhosts.value = on;
+    player?.setShowEndGhosts(on);
+  }
+
   function selectActor(id: string | null): void {
     selectedActorId.value = id;
     selectedSegmentId.value = null;
@@ -969,6 +977,7 @@ export const useStageStore = defineStore('stage', () => {
     catalogLoading,
     catalogError,
     onionSkin,
+    showEndGhosts,
     showPath,
     time,
     duration,
@@ -1017,6 +1026,7 @@ export const useStageStore = defineStore('stage', () => {
     setLoop,
     setGizmoMode,
     setOnionSkin,
+    setShowEndGhosts,
     setShowPath,
     selectActor,
     selectSegment,

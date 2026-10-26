@@ -61,6 +61,8 @@ interface ActorRuntime {
   footLock: FootLock;
   /** 每段动画起始帧的洋葱皮残影（常驻，不随时间变化） */
   startGhosts: StartGhostEntry[];
+  /** 每段动画结尾帧的洋葱皮残影（常驻，不随时间变化，与起始帧同色但不可拾取） */
+  endGhosts: ActorGhost[];
   /** 运动过程残影：随播放时间前后偏移，不可拾取 */
   motionGhosts: ActorGhost[];
   path: THREE.Group | null;
@@ -124,6 +126,8 @@ export class StagePlayer {
   private speed = 1;
   private loop = true;
   private onionSkin = false;
+  /** 结尾帧残影开关：独立于运动残影，默认开启 */
+  private showEndGhosts = false;
   private showPath = false;
   private lastEmit = 0;
   private disposed = false;
@@ -196,6 +200,8 @@ export class StagePlayer {
     shadowPlane.rotation.x = -Math.PI / 2;
     shadowPlane.receiveShadow = true;
     this.scene.add(shadowPlane);
+
+    this.buildRuler();
 
     this.selectionRing = new THREE.Mesh(
       new THREE.RingGeometry(0.32, 0.4, 48),
@@ -328,6 +334,13 @@ export class StagePlayer {
     this.apply(this.time);
     // 残影销毁后 gizmo 可能挂在已移除的节点上，重新挂一次
     this.attachGizmo();
+  }
+
+  /** 结尾帧残影开关：重建残影，而不是只切 visible——关掉时要把已建好的移除，打开时要重新创建 */
+  setShowEndGhosts(enabled: boolean): void {
+    if (this.showEndGhosts === enabled) return;
+    this.showEndGhosts = enabled;
+    this.refreshGhosts();
   }
 
   /** 路径曲线开关：只为选中角色绘制整条时间线轨迹 */
@@ -479,6 +492,7 @@ export class StagePlayer {
           segmentIds: [],
           footLock: new FootLock(),
           startGhosts: [],
+          endGhosts: [],
           motionGhosts: [],
           path: null,
         };
@@ -756,6 +770,8 @@ export class StagePlayer {
   private refreshGhosts(): void {
     for (const runtime of this.runtimes.values()) {
       this.disposeGhosts(runtime);
+      // 结尾帧残影有自己的开关，必须先于 onionSkin 的判断构建
+      this.buildEndGhosts(runtime);
       if (!this.onionSkin) continue;
       this.buildStartGhosts(runtime);
       this.buildMotionGhosts(runtime);
@@ -812,6 +828,38 @@ export class StagePlayer {
     });
   }
 
+  /**
+   * 每段动画的结尾帧残影：常驻展示该段「走完时的样子」，颜色与起始帧残影一致。
+   *
+   * 独立于 startGhosts / motionGhosts 构建，因为它有自己的开关（showEndGhosts），
+   * 不能被运动残影的 onionSkin 开关挡住——否则 onionSkin 关闭时这些残影从未被创建，
+   * 再点开关也只会切一个不存在的对象的 visible，表现为「点了没反应」。
+   * 不可拾取，避免和起始帧残影的拖拽改站位冲突。
+   */
+  private buildEndGhosts(runtime: ActorRuntime): void {
+    if (!this.showEndGhosts) return;
+    if (!runtime.actor.ready || runtime.plan.timings.length === 0) return;
+    runtime.plan.timings.forEach((timing, index) => {
+      const color = SEGMENT_COLORS[index % SEGMENT_COLORS.length] ?? 0x60a5fa;
+      // 取该段最后一帧，按段站位 + 根对齐偏移摆放，位置即该段结束时刻的真实位置
+      const slots = [{ index, clipTime: timing.trimStart + timing.length, weight: 1 }];
+      const ghost = runtime.actor.createGhost(runtime.clips, {
+        opacity: START_GHOST_OPACITY,
+        color,
+        pickable: false,
+      });
+      if (!ghost) return;
+      ghost.applySlots(slots);
+      ghost.updateWorld();
+      const offset = resolveRootOffset(runtime.align, slots);
+      ghost.setFrame(runtime.poses[index] ?? ZERO_SEGMENT_POSE, offset.x, offset.z);
+      ghost.updateWorld();
+      ghost.updateVisuals();
+      runtime.actor.placement.add(ghost.root);
+      runtime.endGhosts.push(ghost);
+    });
+  }
+
   /** 运动过程残影：前后偏移几帧的残影，随播放时间在 apply 里逐帧求值 */
   private buildMotionGhosts(runtime: ActorRuntime): void {
     if (!runtime.actor.ready || runtime.plan.timings.length === 0) return;
@@ -849,6 +897,86 @@ export class StagePlayer {
       ghost.updateVisuals();
       ghost.setVisible(true);
     });
+  }
+
+  /**
+   * 地面标尺：沿 X / Z 两条轴线铺 1m 刻度线 + 每 2m 一个距离数字。
+   *
+   * 只贴着两条轴线铺，是因为场景里已有 24×24 的均匀网格，再往四个方向撒数字
+   * 会和网格线糊成一片；5m 处刻度加长，方便快速数出大距离。
+   * X / Z 用不同颜色区分，看一眼就知道位移是横向还是纵深方向。
+   */
+  private buildRuler(): void {
+    const half = 12; // 与 GridHelper 的 24 单位对齐
+    const ticks: number[] = [];
+
+    for (let distance = -half; distance <= half; distance += 1) {
+      if (distance === 0) continue;
+      // 5m 处刻度加长，起视觉分档作用
+      const length = distance % 5 === 0 ? 0.3 : 0.14;
+      // 沿 X 轴排布：刻度垂直于 X 轴，落在 Z 方向上
+      ticks.push(distance, 0, -length, distance, 0, length);
+      // 沿 Z 轴排布：刻度垂直于 Z 轴，落在 X 方向上
+      ticks.push(-length, 0, distance, length, 0, distance);
+    }
+
+    const tickGeometry = new THREE.BufferGeometry();
+    tickGeometry.setAttribute('position', new THREE.Float32BufferAttribute(ticks, 3));
+    const tickLines = new THREE.LineSegments(
+      tickGeometry,
+      new THREE.LineBasicMaterial({ color: 0x7c8ea8, transparent: true, opacity: 0.9 }),
+    );
+    this.scene.add(tickLines);
+
+    const labels = new THREE.Group();
+    // Sprite 是以中心为锚点的，贴片高 0.4、半高 0.2。若把中心放在地面(y≈0)，
+    // 下半截就会沉到地板下面被裁掉；抬到半高以上才能整块浮在地面之上。
+    const labelY = 0.26;
+    for (let distance = -half; distance <= half; distance += 2) {
+      if (distance === 0) {
+        // 原点只标一次，避免两条轴的 0 重叠
+        const origin = this.makeRulerLabel('0', 0xd8e2f0);
+        origin.position.set(-0.62, labelY, -0.62);
+        labels.add(origin);
+        continue;
+      }
+      // X 轴数字（偏蓝）摆在轴线一侧，避免压在网格线上
+      const xLabel = this.makeRulerLabel(`${distance}m`, 0x8fb4ff);
+      xLabel.position.set(distance, labelY, -0.62);
+      labels.add(xLabel);
+      // Z 轴数字（偏绿）
+      const zLabel = this.makeRulerLabel(`${distance}m`, 0x8ee0c0);
+      zLabel.position.set(-0.62, labelY, distance);
+      labels.add(zLabel);
+    }
+    this.scene.add(labels);
+  }
+
+  /** 用 canvas 画一个距离数字贴片，避免引入字体资源；Sprite 始终朝向相机 */
+  private makeRulerLabel(text: string, color: number): THREE.Sprite {
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.font = 'bold 40px system-ui, -apple-system, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      // 先描深色外轮廓，保证在浅色地板上也读得清
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = 'rgba(8, 12, 18, 0.85)';
+      ctx.strokeText(text, 64, 34);
+      ctx.fillStyle = `#${color.toString(16).padStart(6, '0')}`;
+      ctx.fillText(text, 64, 34);
+    }
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    const sprite = new THREE.Sprite(
+      new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false }),
+    );
+    sprite.scale.set(0.8, 0.4, 1);
+    return sprite;
   }
 
   /**
@@ -906,6 +1034,8 @@ export class StagePlayer {
   private disposeGhosts(runtime: ActorRuntime): void {
     for (const entry of runtime.startGhosts) entry.ghost.dispose();
     runtime.startGhosts = [];
+    for (const ghost of runtime.endGhosts) ghost.dispose();
+    runtime.endGhosts = [];
     for (const ghost of runtime.motionGhosts) ghost.dispose();
     runtime.motionGhosts = [];
   }
