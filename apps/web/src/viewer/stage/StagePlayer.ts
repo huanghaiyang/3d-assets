@@ -80,6 +80,17 @@ const ONION_OPACITY = [0.18, 0.26, 0.12];
 const PATH_SAMPLES = 36;
 const SEGMENT_COLORS = [0x60a5fa, 0xf472b6, 0x34d399, 0xfbbf24, 0xa78bfa, 0x22d3ee];
 
+/** 段间站位差超过该值即视为换位过渡 */
+const TRAVEL_EPSILON = 0.05;
+
+/** 交叉窗口内两段站位不同：正在走过去，不能锁脚，否则补偿会把位移抵消掉 */
+function isTravelWindow(poses: readonly SegmentPose[], slots: readonly { index: number }[]): boolean {
+  if (slots.length < 2) return false;
+  const from = poses[slots[0].index] ?? ZERO_SEGMENT_POSE;
+  const to = poses[slots[1].index] ?? ZERO_SEGMENT_POSE;
+  return Math.hypot(to.x - from.x, to.z - from.z) > TRAVEL_EPSILON;
+}
+
 /** 舞台播放器：场景、多角色调度、手动权重驱动、根位移对齐与脚步锁定 */
 export class StagePlayer {
   private readonly container: HTMLElement;
@@ -451,7 +462,7 @@ export class StagePlayer {
     this.durationValue = Math.max(0, ...[...this.runtimes.values()].map((runtime) => runtime.plan.total));
     this.time = THREE.MathUtils.clamp(this.time, 0, this.durationValue);
     this.refreshGhosts();
-    this.refreshPath(true);
+    this.refreshPath();
     this.attachGizmo();
     this.apply(this.time);
     this.emit(true);
@@ -593,9 +604,11 @@ export class StagePlayer {
       if (!runtime.actor.currentHips(hips)) hips.set(0, 0, 0);
       const offset = resolveRootOffset(runtime.align, slots, { x: hips.x, z: hips.z });
 
-      // 交叉窗口内锁定支撑脚，消除混合姿势带来的滑步
+      // 交叉窗口内锁定支撑脚，消除混合姿势带来的滑步；
+      // 但两段站位不同时是在走过去，锁脚会抵消位移，此时放开
       const feet = runtime.actor.currentFeet();
-      const windowKey = slots.length > 1 ? `${slots[0].index}:${slots[1].index}` : null;
+      const travelling = isTravelWindow(runtime.poses, slots);
+      const windowKey = slots.length > 1 && !travelling ? `${slots[0].index}:${slots[1].index}` : null;
       const compensation = runtime.footLock.update(windowKey, feet, offset);
 
       // 用 sin 曲线做淡入淡出：窗口两端补偿/IK 强度都为 0，避免边缘跳变
@@ -638,13 +651,13 @@ export class StagePlayer {
     this.remapPoseTarget();
   }
 
-  /** 路径只画在选中角色上，切换选中时从其他角色上摘掉；force 用于站位变更后重建 */
-  private refreshPath(force = false): void {
+  /**
+   * 路径只画在选中角色上。每次都先彻底释放旧路径再重建：
+   * 否则站点/站位一变，旧位置的曲线会残留在场景里。
+   */
+  private refreshPath(): void {
+    for (const item of this.runtimes.values()) this.disposePath(item);
     const runtime = this.selectedId ? this.runtimes.get(this.selectedId) : null;
-    for (const item of this.runtimes.values()) {
-      if (item === runtime && this.showPath && !force) continue;
-      this.disposePath(item);
-    }
     if (runtime && this.showPath) this.buildPath(runtime);
   }
 
@@ -731,9 +744,9 @@ export class StagePlayer {
   }
 
   /**
-   * 整条时间线的根位移轨迹：逐段用一次性 mixer 采样髋部，
-   * 再加上该段的段偏移与根对齐偏移，坐标写在 placement 局部空间，
-   * 这样 gizmo 移动角色时路径会一起走。
+   * 整条时间线的根位移轨迹：逐段用一次性 mixer 采样双脚中点，
+   * 以该段起始帧的脚底正中为基准，叠加该段的根对齐偏移与段站位，
+   * 让曲线始终贴着角色的脚底走，坐标写在 placement 局部空间。
    */
   private buildPath(runtime: ActorRuntime): void {
     if (!runtime.actor.ready || runtime.plan.timings.length === 0) return;
@@ -745,18 +758,17 @@ export class StagePlayer {
       if (!clip) return;
       const pose = runtime.poses[index] ?? ZERO_SEGMENT_POSE;
       const color = SEGMENT_COLORS[index % SEGMENT_COLORS.length] ?? 0x60a5fa;
+      // 该段起始帧的脚底正中：后面所有采样都相对它取增量，路径起点正好落在段站位上
+      const start = runtime.actor.sampleFeetCenter(clip, timing.trimStart);
+      if (!start) return;
+      const frame = runtime.align.frames[index] ?? { x: 0, z: 0 };
       const points: THREE.Vector3[] = [];
 
       for (let sample = 0; sample < PATH_SAMPLES; sample += 1) {
         const local = (timing.length * sample) / Math.max(1, PATH_SAMPLES - 1);
-        const hips = runtime.actor.sampleHips(clip, timing.trimStart + local);
-        if (!hips) continue;
-        const offset = resolveRootOffset(
-          runtime.align,
-          [{ index, clipTime: timing.trimStart + local, weight: 1 }],
-          hips,
-        );
-        const rotated = rotateXZ(offset.x, offset.z, pose.yaw);
+        const center = runtime.actor.sampleFeetCenter(clip, timing.trimStart + local);
+        if (!center) continue;
+        const rotated = rotateXZ(frame.x + center.x - start.x, frame.z + center.z - start.z, pose.yaw);
         points.push(new THREE.Vector3(pose.x + rotated.x, 0.02, pose.z + rotated.z));
       }
       if (points.length < 2) return;
@@ -916,6 +928,38 @@ export class StagePlayer {
     for (const listener of this.selectListeners) listener(id);
   };
 
+  /**
+   * 右侧面板选中某段：定位到该段的起始帧残影并激活 gizmo。
+   * 洋葱皮关闭时没有残影，退回选中所属角色。
+   */
+  selectSegment(segmentId: string): void {
+    for (const runtime of this.runtimes.values()) {
+      const entry = runtime.startGhosts.find((item) => item.segmentId === segmentId);
+      if (entry) {
+        this.activateStartGhost(entry);
+        return;
+      }
+      if (!runtime.segmentIds.includes(segmentId)) continue;
+      this.poseTarget = null;
+      this.selectedId = runtime.def.id;
+      this.refreshPath();
+      this.attachGizmo();
+      for (const listener of this.selectListeners) listener(runtime.def.id);
+      for (const listener of this.segmentListeners) listener(runtime.def.id, segmentId);
+      return;
+    }
+  }
+
+  /** 选中一段起始帧残影：同时选中角色、重建路径、把 gizmo 挂到残影上 */
+  private activateStartGhost(entry: StartGhostEntry): void {
+    this.poseTarget = entry;
+    this.selectedId = entry.actorId;
+    this.refreshPath();
+    for (const listener of this.selectListeners) listener(entry.actorId);
+    for (const listener of this.segmentListeners) listener(entry.actorId, entry.segmentId);
+    this.attachGizmo();
+  }
+
   /** 由射线命中的下层对象向上找起始帧残影；命中则选中该段并把 gizmo 挂到残影上 */
   private selectStartGhost(object: THREE.Object3D): boolean {
     let node: THREE.Object3D | null = object;
@@ -925,13 +969,7 @@ export class StagePlayer {
     if (!data?.segmentId) return false;
     const entry = this.findStartGhost(data.actorId, data.segmentId);
     if (!entry) return false;
-
-    this.poseTarget = entry;
-    this.selectedId = data.actorId;
-    this.refreshPath();
-    for (const listener of this.selectListeners) listener(data.actorId);
-    for (const listener of this.segmentListeners) listener(data.actorId, data.segmentId);
-    this.attachGizmo();
+    this.activateStartGhost(entry);
     return true;
   };
 

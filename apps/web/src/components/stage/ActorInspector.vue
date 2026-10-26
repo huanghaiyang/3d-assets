@@ -40,8 +40,14 @@ function onNumberInput(axis: 'x' | 'z' | 'yaw', event: Event): void {
     <div class="head">
       <span class="section-title"><Icon name="layers" :size="12" />角色</span>
       <div class="add">
-        <button class="btn btn-sm" type="button" @click="add('fbx')">
-          <Icon name="plus" :size="12" />FBX
+        <button
+          class="btn btn-sm"
+          type="button"
+          :disabled="store.catalogLoading"
+          :title="store.catalogLoading ? '动画库加载中，请稍候' : '添加 FBX 角色'"
+          @click="add('fbx')"
+        >
+          <Icon name="plus" :size="12" />{{ store.catalogLoading ? '加载中' : 'FBX' }}
         </button>
         <button class="btn btn-sm" type="button" @click="add('soma')">
           <Icon name="plus" :size="12" />Soma
@@ -99,8 +105,10 @@ function onNumberInput(axis: 'x' | 'z' | 'yaw', event: Event): void {
         <select
           class="select-input"
           :value="store.selectedActor.modelPath ?? ''"
+          :disabled="store.catalogLoading"
           @change="store.updateActorModel(store.selectedActor!.id, ($event.target as HTMLSelectElement).value)"
         >
+          <option v-if="store.catalogLoading" value="">动画库加载中…</option>
           <option v-for="file in fbxFiles" :key="file.path" :value="file.path">{{ file.relative }}</option>
         </select>
       </label>

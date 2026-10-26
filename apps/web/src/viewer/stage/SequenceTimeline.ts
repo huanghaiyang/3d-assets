@@ -12,9 +12,20 @@ import type { ResolvedSlot, SegmentDef, SegmentPose, SegmentTiming, TimelinePlan
  */
 
 const MIN_LENGTH = 0.05;
+/** 段间换位时的移动速度（单位/秒）：站位差越大过渡窗口越长，避免一段距离在零点几秒内瞬移 */
+const TRAVEL_SPEED = 1.6;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+/** 两段摆放的水平距离（缺省视为原地） */
+function poseGap(from: SegmentDef['pose'], to: SegmentDef['pose']): number {
+  const ax = from?.x ?? 0;
+  const az = from?.z ?? 0;
+  const bx = to?.x ?? 0;
+  const bz = to?.z ?? 0;
+  return Math.hypot(bx - ax, bz - az);
 }
 
 /** 平滑插值：交叉窗口内权重按 smoothstep 变化，避免线性淡入的观感突变 */
@@ -34,7 +45,10 @@ export function buildTimeline(segments: readonly SegmentDef[]): TimelinePlan {
     const trimEnd = Number.isFinite(segment.trimEnd) ? Math.max(trimStart, segment.trimEnd) : trimStart;
     const length = Math.max(MIN_LENGTH, trimEnd - trimStart);
     const requested = Number.isFinite(segment.blendIn) ? Math.max(0, segment.blendIn) : 0;
-    const blend = index === 0 ? 0 : Math.min(requested, length / 2, previousLength / 2);
+    // 站位不同时按距离自动拉长交叉窗口，让身体走过去而不是瞬间滑过去
+    const travel = index === 0 ? 0 : poseGap(segments[index - 1].pose, segment.pose) / TRAVEL_SPEED;
+    const desired = Math.max(requested, travel);
+    const blend = index === 0 ? 0 : Math.min(desired, length / 2, previousLength / 2);
     const start = index === 0 ? 0 : previousEnd - blend;
     const end = start + length;
 

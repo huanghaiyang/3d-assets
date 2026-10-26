@@ -232,7 +232,9 @@ function projectMeta(projectId: string): string {
             <Icon name="cube" :size="12" />
             <span class="row-name">{{ file.relative }}</span>
           </button>
-          <div v-if="filteredFiles.length === 0" class="empty">动画库里没有匹配的 FBX</div>
+          <div v-if="filteredFiles.length === 0" class="empty">
+            {{ store.catalogLoading ? '动画库加载中…' : '动画库里没有匹配的 FBX' }}
+          </div>
         </div>
 
         <div v-if="openFile" class="clips">

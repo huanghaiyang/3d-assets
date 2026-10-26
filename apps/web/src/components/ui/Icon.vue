@@ -53,6 +53,8 @@ const PATHS: Record<string, string> = {
   chevronRight: 'M9 6l6 6-6 6',
   pose: 'M12 2.5v6.5M12 9l-4 3.5M12 9l4 3.5M12 12v9.5M8 21.5h8M4.5 12.5h15',
   restore: 'M1 4v6h6M3.51 15a9 9 0 1 0 2.13-9.36L1 10',
+  undo: 'M9 14L4 9l5-5M4 9h11a5 5 0 0 1 5 5v2',
+  redo: 'M15 14l5-5-5-5M20 9H9a5 5 0 0 0-5 5v2',
   dice: 'M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM8.5 8.5h.01M15.5 8.5h.01M12 12h.01M8.5 15.5h.01M15.5 15.5h.01',
 };
 

@@ -57,6 +57,8 @@ export const useStageStore = defineStore('stage', () => {
   const saving = ref(false);
   const loading = ref(false);
   const toasts = ref<StageToast[]>([]);
+  const canUndo = ref(false);
+  const canRedo = ref(false);
 
   let player: StagePlayer | null = null;
   let toastSeq = 0;
@@ -121,6 +123,78 @@ export const useStageStore = defineStore('stage', () => {
     void player?.setDoc(doc.value);
   }
 
+  // ===== 撤销 / 重做 =====
+
+  const HISTORY_LIMIT = 60;
+  const past: StageDoc[] = [];
+  const future: StageDoc[] = [];
+  let historyKey = '';
+  let historyAt = 0;
+
+  function cloneDoc(source: StageDoc): StageDoc {
+    return JSON.parse(JSON.stringify(source)) as StageDoc;
+  }
+
+  function syncHistoryFlags(): void {
+    canUndo.value = past.length > 0;
+    canRedo.value = future.length > 0;
+  }
+
+  function resetHistory(): void {
+    past.length = 0;
+    future.length = 0;
+    historyKey = '';
+    syncHistoryFlags();
+  }
+
+  /** 记录一次可撤销改动；同 key 的连续操作（拖 gizmo、连续输入）在 800ms 内合并成一步 */
+  function recordHistory(key: string, coalesce = true): void {
+    if (!doc.value) return;
+    const now = performance.now();
+    if (coalesce && key === historyKey && now - historyAt < 800) {
+      historyAt = now;
+      return;
+    }
+    past.push(cloneDoc(doc.value));
+    if (past.length > HISTORY_LIMIT) past.shift();
+    future.length = 0;
+    historyKey = key;
+    historyAt = now;
+    syncHistoryFlags();
+  }
+
+  function applySnapshot(snapshot: StageDoc): void {
+    const next = cloneDoc(snapshot);
+    doc.value = next;
+    if (selectedActorId.value && !next.actors.some((actor) => actor.id === selectedActorId.value)) {
+      selectedActorId.value = next.actors[0]?.id ?? null;
+    }
+    if (selectedSegmentId.value && !next.segments.some((segment) => segment.id === selectedSegmentId.value)) {
+      selectedSegmentId.value = null;
+    }
+    historyKey = '';
+    syncPlayer();
+    player?.setSelectedActor(selectedActorId.value);
+  }
+
+  function undo(): void {
+    if (!doc.value) return;
+    const previous = past.pop();
+    if (!previous) return;
+    future.push(cloneDoc(doc.value));
+    applySnapshot(previous);
+    syncHistoryFlags();
+  }
+
+  function redo(): void {
+    if (!doc.value) return;
+    const next = future.pop();
+    if (!next) return;
+    past.push(cloneDoc(doc.value));
+    applySnapshot(next);
+    syncHistoryFlags();
+  }
+
   // ===== 文档 =====
 
   function newStage(name = '新舞台'): void {
@@ -134,6 +208,7 @@ export const useStageStore = defineStore('stage', () => {
     };
     selectedActorId.value = null;
     selectedSegmentId.value = null;
+    resetHistory();
     void player?.setDoc(doc.value);
   }
 
@@ -155,6 +230,7 @@ export const useStageStore = defineStore('stage', () => {
       selectedActorId.value = doc.value.actors[0]?.id ?? null;
       selectedSegmentId.value = null;
       time.value = 0;
+      resetHistory();
       await player?.setDoc(doc.value);
       player?.setSelectedActor(selectedActorId.value);
     } catch (error) {
@@ -198,20 +274,53 @@ export const useStageStore = defineStore('stage', () => {
   function renameStage(name: string): void {
     if (!doc.value) return;
     const next = name.trim().slice(0, 80);
-    if (!next) return;
+    if (!next || next === doc.value.name) return;
+    recordHistory('rename-stage', false);
     doc.value.name = next;
+  }
+
+  /** 舞台列表里就地重命名已保存的舞台（会直接落盘） */
+  async function renameStageById(id: string, name: string): Promise<void> {
+    const next = name.trim().slice(0, 80);
+    if (!id || !next) return;
+    const summary = docs.value.find((item) => item.id === id);
+    if (summary) summary.name = next;
+    const isCurrent = doc.value?.id === id;
+    if (isCurrent) {
+      recordHistory('rename-stage', false);
+      doc.value!.name = next;
+    }
+    try {
+      if (isCurrent) {
+        await stageApi.save(doc.value!);
+      } else {
+        const loaded = await stageApi.get(id);
+        loaded.name = next;
+        await stageApi.save(loaded);
+      }
+      await loadStages();
+      toast('success', `已重命名为「${next}」`);
+    } catch (error) {
+      toast('error', `重命名失败：${(error as Error).message}`);
+    }
   }
 
   // ===== 角色 =====
 
   function addActor(kind: ActorKind, modelPath?: string): StageActorDef | null {
     if (!doc.value) return null;
-    const index = doc.value.actors.length + 1;
     const path = kind === 'fbx' ? modelPath ?? files.value[0]?.path : undefined;
     if (kind === 'fbx' && !path) {
-      toast('error', '请先在设置里添加动画文件夹，动画库里还没有可用的 FBX');
+      toast(
+        'info',
+        catalogLoading.value
+          ? '动画库还在加载，请稍候再添加 FBX 角色'
+          : '还没有可用的 FBX，请先在设置里添加动画文件夹',
+      );
       return null;
     }
+    recordHistory('add-actor', false);
+    const index = doc.value.actors.length + 1;
     const actor: StageActorDef = {
       id: createId(),
       name: kind === 'fbx' ? `FBX 角色 ${index}` : `Soma 角色 ${index}`,
@@ -229,6 +338,9 @@ export const useStageStore = defineStore('stage', () => {
 
   function removeActor(id: string): void {
     if (!doc.value) return;
+    const exists = doc.value.actors.some((actor) => actor.id === id);
+    if (!exists) return;
+    recordHistory('remove-actor', false);
     doc.value.actors = doc.value.actors.filter((actor) => actor.id !== id);
     doc.value.segments = doc.value.segments.filter((segment) => segment.actorId !== id);
     if (selectedActorId.value === id) {
@@ -241,6 +353,7 @@ export const useStageStore = defineStore('stage', () => {
   function updateActorTransform(id: string, transform: ActorTransform): void {
     const actor = doc.value?.actors.find((item) => item.id === id);
     if (!actor) return;
+    recordHistory(`transform:${id}`);
     actor.transform = { x: transform.x, z: transform.z, yaw: transform.yaw };
     syncPlayer();
   }
@@ -249,12 +362,15 @@ export const useStageStore = defineStore('stage', () => {
     const actor = doc.value?.actors.find((item) => item.id === id);
     if (!actor) return;
     const next = name.trim().slice(0, 80);
-    if (next) actor.name = next;
+    if (!next || next === actor.name) return;
+    recordHistory(`actor-name:${id}`, false);
+    actor.name = next;
   }
 
   function updateActorModel(id: string, modelPath: string): void {
     const actor = doc.value?.actors.find((item) => item.id === id);
     if (!actor || actor.kind !== 'fbx' || !modelPath) return;
+    recordHistory(`actor-model:${id}`, false);
     actor.modelPath = modelPath;
     // 换模型后原 FBX 片段可能不再匹配，清空该角色的序列避免播出空白
     doc.value!.segments = doc.value!.segments.filter((segment) => segment.actorId !== id);
@@ -264,6 +380,7 @@ export const useStageStore = defineStore('stage', () => {
   function toggleActorVisible(id: string): void {
     const actor = doc.value?.actors.find((item) => item.id === id);
     if (!actor) return;
+    recordHistory(`actor-visible:${id}`, false);
     actor.visible = !actor.visible;
     syncPlayer();
   }
@@ -272,6 +389,7 @@ export const useStageStore = defineStore('stage', () => {
 
   function addSegment(actorId: string, source: SegmentSource, clipDuration: number): void {
     if (!doc.value) return;
+    recordHistory('add-segment', false);
     const length = Math.max(0.05, clipDuration || 1);
     const segment: SegmentDef = {
       id: createId(),
@@ -289,6 +407,7 @@ export const useStageStore = defineStore('stage', () => {
   function updateSegment(id: string, patch: Partial<Pick<SegmentDef, 'trimStart' | 'trimEnd' | 'blendIn'>>): void {
     const segment = doc.value?.segments.find((item) => item.id === id);
     if (!segment) return;
+    recordHistory(`segment:${id}:${Object.keys(patch).join(',')}`);
     if (patch.trimStart !== undefined) segment.trimStart = Math.max(0, patch.trimStart);
     if (patch.trimEnd !== undefined) segment.trimEnd = Math.max(segment.trimStart + 0.05, patch.trimEnd);
     if (patch.blendIn !== undefined) segment.blendIn = Math.max(0, Math.min(2, patch.blendIn));
@@ -297,6 +416,9 @@ export const useStageStore = defineStore('stage', () => {
 
   function removeSegment(id: string): void {
     if (!doc.value) return;
+    const exists = doc.value.segments.some((item) => item.id === id);
+    if (!exists) return;
+    recordHistory('remove-segment', false);
     doc.value.segments = doc.value.segments.filter((item) => item.id !== id);
     if (selectedSegmentId.value === id) selectedSegmentId.value = null;
     syncPlayer();
@@ -306,6 +428,7 @@ export const useStageStore = defineStore('stage', () => {
   function updateSegmentPose(id: string, patch: Partial<SegmentPose>): void {
     const segment = doc.value?.segments.find((item) => item.id === id);
     if (!segment) return;
+    recordHistory(`pose:${id}`);
     const base = segment.pose ?? { x: 0, z: 0, yaw: 0 };
     segment.pose = {
       x: patch.x ?? base.x,
@@ -318,6 +441,7 @@ export const useStageStore = defineStore('stage', () => {
   function resetSegmentPose(id: string): void {
     const segment = doc.value?.segments.find((item) => item.id === id);
     if (!segment) return;
+    recordHistory(`pose-reset:${id}`, false);
     segment.pose = { x: 0, z: 0, yaw: 0 };
     syncPlayer();
   }
@@ -333,6 +457,7 @@ export const useStageStore = defineStore('stage', () => {
     const position = indexes.findIndex((entry) => entry.item.id === id);
     const target = indexes[position + delta];
     if (!target) return;
+    recordHistory('move-segment', false);
     const origin = indexes[position];
     const segments = doc.value.segments;
     [segments[origin.index], segments[target.index]] = [segments[target.index], segments[origin.index]];
@@ -357,6 +482,7 @@ export const useStageStore = defineStore('stage', () => {
 
   function setLoop(on: boolean): void {
     if (!doc.value) return;
+    recordHistory('loop', false);
     doc.value.loop = on;
     syncPlayer();
   }
@@ -382,8 +508,19 @@ export const useStageStore = defineStore('stage', () => {
     player?.setSelectedActor(id);
   }
 
+  /** 右侧面板选中某段：联动选中角色，并在舞台上激活该段起始帧残影的移动句柄 */
   function selectSegment(id: string | null): void {
     selectedSegmentId.value = id;
+    if (!id) return;
+    const segment = doc.value?.segments.find((item) => item.id === id);
+    if (!segment) return;
+    if (selectedActorId.value !== segment.actorId) {
+      selectedActorId.value = segment.actorId;
+      player?.setSelectedActor(segment.actorId);
+    }
+    // 起始帧残影就是拖动的对象，没开洋葱皮时先打开
+    if (!onionSkin.value) setOnionSkin(true);
+    player?.selectSegment(id);
   }
 
   // ===== 素材目录 =====
@@ -516,6 +653,10 @@ export const useStageStore = defineStore('stage', () => {
     saving,
     loading,
     toasts,
+    canUndo,
+    canRedo,
+    undo,
+    redo,
     attachPlayer,
     detachPlayer,
     bootstrap,
@@ -526,6 +667,7 @@ export const useStageStore = defineStore('stage', () => {
     saveStage,
     removeStage,
     renameStage,
+    renameStageById,
     addActor,
     removeActor,
     updateActorTransform,

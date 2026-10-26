@@ -8,17 +8,60 @@ import { useStageStore } from '@/stores/stage';
 
 const store = useStageStore();
 const confirmDeleteId = ref<string | null>(null);
+const editingId = ref<string | null>(null);
+const draftName = ref('');
 
 onMounted(() => {
   void store.bootstrap();
+  window.addEventListener('keydown', onKeydown);
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeydown);
   store.detachPlayer();
 });
 
 function onNameChange(event: Event): void {
   store.renameStage((event.target as HTMLInputElement).value);
+}
+
+/** 舞台列表就地重命名：双击名字进入编辑 */
+function beginRename(id: string, name: string): void {
+  editingId.value = id;
+  draftName.value = name;
+}
+
+function commitRename(): void {
+  const id = editingId.value;
+  if (!id) return;
+  editingId.value = null;
+  void store.renameStageById(id, draftName.value);
+}
+
+function cancelRename(): void {
+  editingId.value = null;
+}
+
+/** 内联输入框出现时自动聚焦并全选，避免还要再点一次 */
+function focusRename(element: unknown): void {
+  const input = element as HTMLInputElement | null;
+  if (!input || document.activeElement === input) return;
+  input.focus();
+  input.select();
+}
+
+/** Ctrl/⌘ + Z 撤销、Ctrl/⌘ + Shift + Z 或 Ctrl + Y 重做；输入框内交给浏览器原生撤销 */
+function onKeydown(event: KeyboardEvent): void {
+  if (!(event.ctrlKey || event.metaKey)) return;
+  const key = event.key.toLowerCase();
+  if (key !== 'z' && key !== 'y') return;
+  const target = event.target as HTMLElement | null;
+  const typing =
+    target !== null && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+  if (typing) return;
+  event.preventDefault();
+  if (key === 'y' || event.shiftKey) store.redo();
+  else store.undo();
 }
 
 function confirmRemove(id: string): void {
@@ -41,6 +84,24 @@ function confirmRemove(id: string): void {
         <div class="stages-head">
           <span class="section-title"><Icon name="layers" :size="12" />舞台</span>
           <div class="head-actions">
+            <button
+              class="btn btn-sm btn-icon"
+              type="button"
+              title="撤销（Ctrl+Z）"
+              :disabled="!store.canUndo"
+              @click="store.undo()"
+            >
+              <Icon name="undo" :size="12" />
+            </button>
+            <button
+              class="btn btn-sm btn-icon"
+              type="button"
+              title="重做（Ctrl+Shift+Z）"
+              :disabled="!store.canRedo"
+              @click="store.redo()"
+            >
+              <Icon name="redo" :size="12" />
+            </button>
             <button class="btn btn-sm" type="button" title="新建舞台" @click="store.newStage()">
               <Icon name="plus" :size="12" />新建
             </button>
@@ -64,15 +125,30 @@ function confirmRemove(id: string): void {
         />
 
         <div class="stage-list">
-          <button
+          <div
             v-for="item in store.docs"
             :key="item.id"
             class="stage-row"
             :class="{ active: item.id === store.doc?.id }"
-            type="button"
+            role="button"
+            tabindex="0"
             @click="store.openStage(item.id)"
+            @keydown.enter="store.openStage(item.id)"
           >
-            <span class="stage-name">{{ item.name }}</span>
+            <input
+              v-if="editingId === item.id"
+              :ref="(element) => focusRename(element)"
+              v-model="draftName"
+              class="text-input inline-name"
+              @click.stop
+              @dblclick.stop
+              @keydown.enter.stop="commitRename"
+              @keydown.esc.stop="cancelRename"
+              @blur="commitRename"
+            />
+            <span v-else class="stage-name" title="双击重命名" @dblclick.stop="beginRename(item.id, item.name)">
+              {{ item.name }}
+            </span>
             <span class="faint mono">{{ item.actorCount }} 角色 · {{ item.segmentCount }} 段</span>
             <span
               class="mini"
@@ -82,7 +158,7 @@ function confirmRemove(id: string): void {
             >
               <Icon name="trash" :size="12" />
             </span>
-          </button>
+          </div>
           <div v-if="store.docs.length === 0" class="faint hint">还没有保存过的舞台</div>
         </div>
       </div>
@@ -191,6 +267,16 @@ function confirmRemove(id: string): void {
   background: transparent;
   text-align: left;
   color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.inline-name {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  padding: 0 6px;
   font-size: 12px;
 }
 

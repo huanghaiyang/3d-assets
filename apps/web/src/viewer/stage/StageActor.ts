@@ -67,6 +67,8 @@ export interface StageActor {
   updateWorld(): void;
   /** 采样某个片段在指定时间（片段内秒）的髋部根变换 */
   sampleHips(clip: THREE.AnimationClip, time: number): HipsSample | null;
+  /** 采样某个片段在指定时间双脚中点的水平位置（motion 局部空间） */
+  sampleFeetCenter(clip: THREE.AnimationClip, time: number): { x: number; z: number } | null;
   /** 当前髋部位置，写入 actor 局部坐标；没有髋部返回 false */
   currentHips(out: THREE.Vector3): boolean;
   /** 双脚脚踝位置（actor 局部），供脚步锁定使用 */
@@ -304,11 +306,40 @@ export abstract class MixerActor implements StageActor {
   }
 
   sampleHips(clip: THREE.AnimationClip, time: number): HipsSample | null {
-    const root = this.mixerRoot;
-    const hips = this.hipsNode;
-    if (!root || !hips) return null;
+    if (!this.mixerRoot || !this.hipsNode) return null;
+    return this.withClipSample(clip, time, () => {
+      const hips = this.hipsNode;
+      if (!hips) return null;
+      const position = new THREE.Vector3();
+      hips.getWorldPosition(position);
+      this.motion.worldToLocal(position);
 
-    // 用一次性 mixer 采样，避免污染正在播放的主 mixer 状态
+      const worldQuaternion = new THREE.Quaternion();
+      hips.getWorldQuaternion(worldQuaternion);
+      const motionQuaternion = new THREE.Quaternion();
+      this.motion.getWorldQuaternion(motionQuaternion).invert();
+      worldQuaternion.premultiply(motionQuaternion);
+
+      return { x: position.x, z: position.z, yaw: yawFromQuaternion(worldQuaternion) };
+    });
+  }
+
+  /** 双脚脚踝中点在 motion 局部空间的水平位置；路径曲线用它作中心，避免用髋部左右摆动 */
+  sampleFeetCenter(clip: THREE.AnimationClip, time: number): { x: number; z: number } | null {
+    if (!this.mixerRoot) return null;
+    return this.withClipSample(clip, time, () => {
+      const [left, right] = this.footNodes();
+      if (!left || !right) return null;
+      const a = this.toLocal(left);
+      const b = this.toLocal(right);
+      return { x: (a.x + b.x) / 2, z: (a.z + b.z) / 2 };
+    });
+  }
+
+  /** 用一次性 mixer 求值某个片段，避免污染正在播放的主 mixer 状态 */
+  private withClipSample<T>(clip: THREE.AnimationClip, time: number, read: () => T | null): T | null {
+    const root = this.mixerRoot;
+    if (!root) return null;
     const mixer = new THREE.AnimationMixer(root);
     const action = mixer.clipAction(clip);
     action.reset();
@@ -319,20 +350,11 @@ export abstract class MixerActor implements StageActor {
     mixer.update(0);
     this.updateWorld();
 
-    const position = new THREE.Vector3();
-    hips.getWorldPosition(position);
-    this.motion.worldToLocal(position);
-
-    const worldQuaternion = new THREE.Quaternion();
-    hips.getWorldQuaternion(worldQuaternion);
-    const motionQuaternion = new THREE.Quaternion();
-    this.motion.getWorldQuaternion(motionQuaternion).invert();
-    worldQuaternion.premultiply(motionQuaternion);
+    const result = read();
 
     mixer.stopAllAction();
     mixer.uncacheRoot(root);
-
-    return { x: position.x, z: position.z, yaw: yawFromQuaternion(worldQuaternion) };
+    return result;
   }
 
   currentHips(out: THREE.Vector3): boolean {
