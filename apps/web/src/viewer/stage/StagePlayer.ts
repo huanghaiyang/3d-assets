@@ -495,7 +495,13 @@ export class StagePlayer {
       runtime.segmentIds = segments.map((segment) => segment.id);
       runtime.plan = plan;
       runtime.actor.buildSequence(clips);
-      runtime.align = buildRootAlign(runtime.actor, plan, clips.map((input) => input.clip));
+      // pose 显式设置过 = 用户手动摆过该段站位，位置以 pose 为准，不再累加前序根位移
+      runtime.align = buildRootAlign(
+        runtime.actor,
+        plan,
+        clips.map((input) => input.clip),
+        segments.map((segment) => segment.pose !== undefined),
+      );
     }
 
     this.durationValue = Math.max(0, ...[...this.runtimes.values()].map((runtime) => runtime.plan.total));
@@ -700,7 +706,6 @@ export class StagePlayer {
   }
 
   private apply(time: number): void {
-    const hips = new THREE.Vector3();
     for (const runtime of this.runtimes.values()) {
       if (!runtime.actor.ready || runtime.plan.timings.length === 0) continue;
       const slots = resolveTimeline(runtime.plan, time);
@@ -709,8 +714,7 @@ export class StagePlayer {
       runtime.actor.applySlots(slots);
       runtime.actor.updateWorld();
 
-      if (!runtime.actor.currentHips(hips)) hips.set(0, 0, 0);
-      const offset = resolveRootOffset(runtime.align, slots, { x: hips.x, z: hips.z });
+      const offset = resolveRootOffset(runtime.align, slots);
 
       // 交叉窗口内锁定支撑脚，消除混合姿势带来的滑步；
       // 但两段站位不同时是在走过去，锁脚会抵消位移，此时放开
@@ -778,7 +782,6 @@ export class StagePlayer {
    */
   private buildStartGhosts(runtime: ActorRuntime): void {
     if (!runtime.actor.ready || runtime.plan.timings.length === 0) return;
-    const hips = new THREE.Vector3();
     runtime.plan.timings.forEach((timing, index) => {
       const slots = [{ index, clipTime: timing.trimStart, weight: 1 }];
       const color = SEGMENT_COLORS[index % SEGMENT_COLORS.length] ?? 0x60a5fa;
@@ -790,8 +793,7 @@ export class StagePlayer {
       if (!ghost) return;
       ghost.applySlots(slots);
       ghost.updateWorld();
-      if (!ghost.currentHips(hips)) hips.set(0, 0, 0);
-      const offset = resolveRootOffset(runtime.align, slots, { x: hips.x, z: hips.z });
+      const offset = resolveRootOffset(runtime.align, slots);
       ghost.setFrame(runtime.poses[index] ?? ZERO_SEGMENT_POSE, offset.x, offset.z);
       ghost.updateWorld();
       ghost.updateVisuals();
@@ -825,7 +827,6 @@ export class StagePlayer {
   /** 把每个运动残影求值到 time + 偏移 的时刻；越界时隐藏 */
   private applyMotionGhosts(runtime: ActorRuntime, time: number): void {
     if (runtime.motionGhosts.length === 0) return;
-    const hips = new THREE.Vector3();
     ONION_OFFSETS.forEach((delta, slot) => {
       const ghost = runtime.motionGhosts[slot];
       if (!ghost) return;
@@ -842,8 +843,7 @@ export class StagePlayer {
       const pose = resolveSegmentPose(runtime.poses, slots);
       ghost.applySlots(slots);
       ghost.updateWorld();
-      if (!ghost.currentHips(hips)) hips.set(0, 0, 0);
-      const offset = resolveRootOffset(runtime.align, slots, { x: hips.x, z: hips.z });
+      const offset = resolveRootOffset(runtime.align, slots);
       ghost.setFrame(pose, offset.x, offset.z);
       ghost.updateWorld();
       ghost.updateVisuals();
