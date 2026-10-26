@@ -30,6 +30,11 @@ dist/
 .tmp-probe/
 *.tsbuildinfo
 *.log
+tools/kimodo-shim/build/
+*.obj
+*.exe
+*.dll
+*.tlog
 
 # ==========================================================
 # 编辑器 / 操作系统

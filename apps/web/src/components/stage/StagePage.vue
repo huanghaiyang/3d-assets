@@ -88,7 +88,7 @@ function confirmRemove(id: string): void {
               class="btn btn-sm btn-icon"
               type="button"
               title="撤销（Ctrl+Z）"
-              :disabled="!store.canUndo"
+              :disabled="!store.canUndo || store.busyGenerating"
               @click="store.undo()"
             >
               <Icon name="undo" :size="12" />
@@ -97,7 +97,7 @@ function confirmRemove(id: string): void {
               class="btn btn-sm btn-icon"
               type="button"
               title="重做（Ctrl+Shift+Z）"
-              :disabled="!store.canRedo"
+              :disabled="!store.canRedo || store.busyGenerating"
               @click="store.redo()"
             >
               <Icon name="redo" :size="12" />

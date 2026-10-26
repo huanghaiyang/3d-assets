@@ -14,6 +14,10 @@ export interface KimodoStatus {
   textBundle: string | null;
   outputDir: string;
   backend: string;
+  /** 约束过渡 shim 路径，null 表示未配置 */
+  conditionedShimExe: string | null;
+  /** shim 可执行文件存在（= 真实 pose 约束过渡可用） */
+  conditionedReady: boolean;
   /** 提示词转译厂商（deepseek / openai / qwen / ...） */
   promptProvider: string;
   /** 厂商显示名 */
@@ -38,6 +42,8 @@ export interface KimodoAnimation {
   status: KimodoStatusValue;
   error?: string;
   createdAt: number;
+  /** 生成模式：text=纯文本，conditioned=真实 pose 约束过渡 */
+  mode?: 'text' | 'conditioned';
   /** 多段生成时的分段提示词与各自帧数 */
   segments?: KimodoPromptSegment[];
   durationMs?: number;
@@ -49,6 +55,29 @@ export interface KimodoAnimation {
   loadMs?: number;
   /** 用户给这条结果添加的注释 */
   note?: string;
+}
+
+/**
+ * 真实 pose 约束过渡的请求体（推荐用 animationId 快捷方式）。
+ *
+ * 后端收到后会自动从两个 animationId 的输出目录切出 prev 尾部 / next 头部的 f32，
+ * 喂给 conditioned shim 生成首尾精确对齐的过渡段。
+ */
+export interface KimodoConditionedBody {
+  /** 前一段动画的 animationId（必须是 kimodo 生成的，才有原始 f32 可切） */
+  prevAnimationId: string;
+  /** 后一段动画的 animationId */
+  nextAnimationId: string;
+  /** 过渡段总帧数（8–300），决定中间过渡有多长 */
+  frames: number;
+  /** 首尾各硬约束多少帧，默认 1（只对齐 prev 末帧与 next 首帧） */
+  transitionFrames?: number;
+  /** DDIM 扩散步数，默认 50（条件生成需要更充分收敛） */
+  steps?: number;
+  /** 随机种子，不传则服务端随机 */
+  seed?: number;
+  /** 辅助提示词（英文，描述中间过渡的节奏/风格，如 "smooth walking forward"） */
+  prompt: string;
 }
 
 /** 多段生成里的一段提示词 */
@@ -160,6 +189,13 @@ export const kimodoApi = {
 
   generate: (body: KimodoGenerateBody) =>
     request<KimodoAnimation>('/api/kimodo/generate', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** 真实 pose 约束的双向过渡生成（首尾帧精确对齐 prev 末 / next 首） */
+  generateConditioned: (body: KimodoConditionedBody) =>
+    request<KimodoAnimation>('/api/kimodo/generate-conditioned', {
       method: 'POST',
       body: JSON.stringify(body),
     }),

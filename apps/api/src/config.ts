@@ -93,6 +93,8 @@ export const config = {
     python: text(process.env.KIMODO_PYTHON) ?? 'python',
     /** ggml 计算后端，CPU 机器用 cpu */
     backend: text(process.env.KIMODO_BACKEND) ?? 'cpu',
+    /** 约束过渡生成 shim（真实 pose 约束），留空则走旧版文本 prompt */
+    conditionedShimExe: text(process.env.KIMODO_CONDITIONED_SHIM),
     /** 文本编码器分层驻留块数，留空给生成器默认值 */
     textLayerChunk: text(process.env.KIMODO_TEXT_LAYER_CHUNK),
     /**

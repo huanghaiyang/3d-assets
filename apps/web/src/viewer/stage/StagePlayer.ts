@@ -112,6 +112,11 @@ export class StagePlayer {
   private token = 0;
   private selectedId: string | null = null;
   private gizmoMode: GizmoMode | null = null;
+  /** 当前文档：过渡段根位移拉伸需要按前后段站位取目标位移 */
+  private doc: StageDoc | null = null;
+  /** 过渡动画生成期间冻结的段与角色 */
+  private readonly lockedSegments = new Set<string>();
+  private readonly lockedActors = new Set<string>();
 
   private time = 0;
   private durationValue = 0;
@@ -262,6 +267,7 @@ export class StagePlayer {
 
   async setDoc(doc: StageDoc | null): Promise<void> {
     this.loop = doc?.loop ?? true;
+    this.doc = doc;
 
     if (!doc) {
       this.clearActors();
@@ -281,6 +287,7 @@ export class StagePlayer {
         segment.trimEnd,
         segment.blendIn,
         segment.pose ?? null,
+        segment.transition ?? null,
       ]),
     ]);
 
@@ -373,6 +380,38 @@ export class StagePlayer {
     if (!runtime) return null;
     const { position, rotation } = runtime.actor.placement;
     return { x: position.x, z: position.z, yaw: rotation.y };
+  }
+
+  /**
+   * 冻结若干段与角色：过渡动画生成期间禁止拖动站位/角色摆放。
+   * 段 id 对应起始帧残影的 gizmo，角色 id 对应角色摆放 gizmo。
+   */
+  setLocked(segmentIds: string[], actorIds: string[]): void {
+    this.lockedSegments.clear();
+    for (const id of segmentIds) this.lockedSegments.add(id);
+    this.lockedActors.clear();
+    for (const id of actorIds) this.lockedActors.add(id);
+    if (this.poseTarget && this.lockedSegments.has(this.poseTarget.segmentId)) this.poseTarget = null;
+    this.attachGizmo();
+  }
+
+  /**
+   * 某段播放到尾部时角色所在的位置与朝向（相对角色摆放的段站位坐标）。
+   * 过渡动画用它作为生成起点，保证新过渡段从上一段的落地位置开始。
+   */
+  segmentEndPose(actorId: string, segmentId: string): SegmentPose | null {
+    const runtime = this.runtimes.get(actorId);
+    if (!runtime || !runtime.actor.ready) return null;
+    const index = runtime.segmentIds.indexOf(segmentId);
+    const timing = runtime.plan.timings[index];
+    const clip = runtime.clips[index]?.clip;
+    if (index < 0 || !timing || !clip) return null;
+    const pose = runtime.poses[index] ?? ZERO_SEGMENT_POSE;
+    const start = runtime.actor.sampleFeetCenter(clip, timing.trimStart);
+    const end = runtime.actor.sampleFeetCenter(clip, timing.trimStart + timing.length);
+    if (!start || !end) return { ...pose };
+    const delta = rotateXZ(end.x - start.x, end.z - start.z, pose.yaw);
+    return { x: pose.x + delta.x, z: pose.z + delta.z, yaw: pose.yaw };
   }
 
   dispose(): void {
@@ -523,7 +562,12 @@ export class StagePlayer {
     const identity = segment.source.kind === 'fbx-clip'
       ? `${sourceKey(segment.source)}|${segment.source.fbxPath}`
       : `${sourceKey(segment.source)}|${actor.kind}|${actor.kind === 'fbx' ? (actor as FbxActor).boneNameMap.size : 0}`;
-    const key = `${identity}|${actor.id}`;
+    const target = this.transitionTarget(segment);
+    const yaw = segment.pose?.yaw ?? 0;
+    const targetKey = target
+      ? `|move:${target.dx.toFixed(3)}:${target.dz.toFixed(3)}:${yaw.toFixed(3)}`
+      : '';
+    const key = `${identity}|${actor.id}${targetKey}`;
     const cached = this.clipCache.get(key);
     if (cached) return cached;
 
@@ -543,7 +587,9 @@ export class StagePlayer {
         }
         const project = await animationApi.project(source.projectId);
         const converted = clipsFromAnimationData(project.data as AnimationData, (actor as FbxActor).boneNameMap);
-        return converted.clips[0] ?? null;
+        const clip = converted.clips[0] ?? null;
+        if (clip && target) this.stretchRootMotion(clip, segment, target);
+        return clip;
       }
 
       if (actor.kind === 'soma') {
@@ -552,12 +598,15 @@ export class StagePlayer {
         const motion = await kimodoApi.motion(source.animationId);
         const clip = somaClipFromMotion(motion, skeleton, source.animationId);
         if (!clip) this.notify('Kimodo 动作数据不完整，无法播放');
+        else if (target) this.stretchRootMotion(clip, segment, target);
         return clip;
       }
 
       const imported = await kimodoApi.importAnimation(source.animationId);
       const converted = clipsFromAnimationData(imported.data as AnimationData, (actor as FbxActor).boneNameMap);
-      return converted.clips[0] ?? null;
+      const clip = converted.clips[0] ?? null;
+      if (clip && target) this.stretchRootMotion(clip, segment, target);
+      return clip;
     })().catch((error: unknown) => {
       this.clipCache.delete(key);
       this.notify(error instanceof Error ? error.message : '片段加载失败');
@@ -566,6 +615,59 @@ export class StagePlayer {
 
     this.clipCache.set(key, promise);
     return promise;
+  }
+
+  /** 过渡段的根位移目标：从过渡段站位到下一段站位的水平位移 */
+  private transitionTarget(segment: SegmentDef): { dx: number; dz: number } | null {
+    if (!segment.transition || !this.doc) return null;
+    const next = this.doc.segments.find((item) => item.id === segment.transition!.nextId);
+    if (!next) return null;
+    const pose = segment.pose ?? ZERO_SEGMENT_POSE;
+    const nextPose = next.pose ?? ZERO_SEGMENT_POSE;
+    return { dx: nextPose.x - pose.x, dz: nextPose.z - pose.z };
+  }
+
+  /**
+   * 把 Kimodo 生成过渡段的根位移缩放到「过渡段站位 → 下一段站位」的实际距离：
+   * 保留原动作形态与节奏，只调整根节点的水平位移方向与长度，
+   * 让过渡动画正好把角色送到下一段的起始位置。
+   */
+  private stretchRootMotion(
+    clip: THREE.AnimationClip,
+    segment: SegmentDef,
+    target: { dx: number; dz: number },
+  ): void {
+    if (target.dx * target.dx + target.dz * target.dz < 1e-6) return;
+    const tracks = clip.tracks.filter((track) => track.name.endsWith('.position') && track.values.length >= 6);
+    if (tracks.length === 0) return;
+    const track = tracks.find((item) => /(hips|root)/i.test(item.name)) ?? tracks[0];
+    const values = track.values;
+    const size = track.getValueSize();
+    const keys = Math.floor(values.length / size);
+    if (keys < 2) return;
+
+    const x0 = values[0];
+    const z0 = values[2];
+    const x1 = values[(keys - 1) * size];
+    const z1 = values[(keys - 1) * size + 2];
+    const clipDx = x1 - x0;
+    const clipDz = z1 - z0;
+    const clipLength = Math.hypot(clipDx, clipDz);
+
+    // 目标位移转到片段局部空间（与段站位同一套旋转约定）
+    const pose = segment.pose ?? ZERO_SEGMENT_POSE;
+    const local = rotateXZ(target.dx, target.dz, -pose.yaw);
+    const targetLength = Math.hypot(local.x, local.z);
+    if (clipLength < 1e-3 || targetLength < 1e-3) return;
+
+    const turn = Math.atan2(local.x, local.z) - Math.atan2(clipDx, clipDz);
+    const scale = targetLength / clipLength;
+    for (let index = 0; index < keys; index += 1) {
+      const offset = index * size;
+      const moved = rotateXZ((values[offset] - x0) * scale, (values[offset + 2] - z0) * scale, turn);
+      values[offset] = x0 + moved.x;
+      values[offset + 2] = z0 + moved.z;
+    }
   }
 
   // ===== 每帧驱动 =====
@@ -850,6 +952,15 @@ export class StagePlayer {
       this.transform.detach();
       return;
     }
+    // 过渡动画生成期间：被冻结的段/角色不挂句柄，避免拖出与生成结果冲突的位置
+    if (this.poseTarget && this.lockedSegments.has(this.poseTarget.segmentId)) {
+      this.transform.detach();
+      return;
+    }
+    if (!this.poseTarget && this.selectedId && this.lockedActors.has(this.selectedId)) {
+      this.transform.detach();
+      return;
+    }
     const mode = this.gizmoMode;
     this.transform.setMode(mode);
     this.transform.setSpace(mode === 'rotate' ? 'local' : 'world');
@@ -868,6 +979,7 @@ export class StagePlayer {
   private commitPoseDrag(): void {
     const entry = this.poseTarget;
     if (!entry) return;
+    if (this.lockedSegments.has(entry.segmentId)) return;
     const runtime = this.runtimes.get(entry.actorId);
     if (!runtime) return;
     const root = entry.ghost.root;
@@ -885,6 +997,12 @@ export class StagePlayer {
   private emitPlacement(): void {
     const runtime = this.selectedId ? this.runtimes.get(this.selectedId) : null;
     if (!runtime) return;
+    if (this.lockedActors.has(runtime.def.id)) {
+      // 冻结期间被拖动的角色立刻回到文档里的摆放
+      runtime.actor.setPlacement(runtime.def.transform);
+      runtime.actor.updateWorld();
+      return;
+    }
     const { position, rotation } = runtime.actor.placement;
     if (position.y !== 0) position.y = 0;
     for (const listener of this.placementListeners) {

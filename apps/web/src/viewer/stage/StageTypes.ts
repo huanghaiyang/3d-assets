@@ -63,6 +63,14 @@ export interface SegmentDef {
   blendIn: number;
   /** 该段的独立站位；缺省表示沿用角色的摆放 */
   pose?: SegmentPose;
+  /** 由「过渡动画生成」得到的过渡段：记录它连接的前后两段 */
+  transition?: SegmentTransitionLink;
+}
+
+/** 过渡段连接的前后两段 id */
+export interface SegmentTransitionLink {
+  prevId: string;
+  nextId: string;
 }
 
 export interface StageDoc {

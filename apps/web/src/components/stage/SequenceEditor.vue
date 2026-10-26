@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import Icon from '../ui/Icon.vue';
-import { useStageStore } from '@/stores/stage';
+import { useStageStore, type TransitionTask } from '@/stores/stage';
 import { buildTimeline } from '@/viewer/stage/SequenceTimeline';
 import type { AnimationFile } from '@/api/animation';
 import type { SegmentDef } from '@/viewer/stage/StageTypes';
@@ -92,6 +92,32 @@ function projectMeta(projectId: string): string {
   if (!project) return '';
   return `${project.clipCount} 段 · ${project.trackCount} 轨`;
 }
+
+/** 逐段行数据：附带与上一段之间的过渡任务、冻结状态 */
+const rows = computed(() =>
+  store.actorSegmentsList.map((segment, index) => {
+    const prev = index > 0 ? store.actorSegmentsList[index - 1] : null;
+    return {
+      segment,
+      index,
+      prev,
+      task: prev ? store.transitionTaskFor(prev.id, segment.id) : null,
+      locked: store.isSegmentLocked(segment.id),
+    };
+  }),
+);
+
+const STATUS_TEXT: Record<TransitionTask['status'], string> = {
+  submitting: '提交中…',
+  queued: 'Kimodo 排队中…',
+  running: 'Kimodo 生成中…',
+  failed: '生成失败',
+};
+
+function transitionMeta(task: TransitionTask): string {
+  if (task.status === 'failed') return task.message ?? '';
+  return `${task.frames} 帧 · 位移 ${task.distance.toFixed(1)}m · 转向 ${task.turnDeg}°`;
+}
 </script>
 
 <template>
@@ -116,75 +142,103 @@ function projectMeta(projectId: string): string {
       </div>
 
       <div class="segments">
-        <div
-          v-for="(segment, index) in store.actorSegmentsList"
-          :key="segment.id"
-          class="segment"
-          :class="{ active: segment.id === store.selectedSegmentId }"
-          @click="store.selectSegment(segment.id)"
-        >
-          <div class="segment-head">
-            <span class="index mono">{{ index + 1 }}</span>
-            <span class="segment-name">{{ store.sourceLabel(segment.source) }}</span>
-            <span class="faint mono">
-              {{ format(timeline.timings[index]?.start ?? 0) }}–{{ format(timeline.timings[index]?.end ?? 0) }}s
-            </span>
-            <span class="segment-actions">
-              <span class="mini" title="上移" @click.stop="store.moveSegment(segment.id, -1)">
-                <Icon name="arrowUp" :size="12" />
+        <template v-for="row in rows" :key="row.segment.id">
+          <div v-if="row.prev" class="transition" :class="{ busy: row.task && row.task.status !== 'failed' }">
+            <template v-if="row.task">
+              <span class="transition-state" :class="row.task.status">
+                <Icon name="sparkle" :size="11" />
+                {{ STATUS_TEXT[row.task.status] }}
+                <span class="faint mono">{{ transitionMeta(row.task) }}</span>
               </span>
-              <span class="mini rotate" title="下移" @click.stop="store.moveSegment(segment.id, 1)">
-                <Icon name="arrowUp" :size="12" />
-              </span>
-              <span class="mini" title="删除片段" @click.stop="store.removeSegment(segment.id)">
-                <Icon name="trash" :size="12" />
-              </span>
-            </span>
+              <button
+                v-if="row.task.status === 'failed'"
+                class="btn btn-sm"
+                type="button"
+                @click.stop="store.generateTransition(row.prev.id, row.segment.id)"
+              >
+                重试
+              </button>
+            </template>
+            <button
+              v-else
+              class="transition-btn"
+              type="button"
+              title="用 Kimodo 生成前后两段之间的过渡动画"
+              @click.stop="store.generateTransition(row.prev.id, row.segment.id)"
+            >
+              <Icon name="sparkle" :size="12" />过渡动画生成
+            </button>
           </div>
 
-          <div class="segment-fields">
-            <label class="field">
-              <span class="field-label">起点 s</span>
-              <input class="text-input" type="number" step="0.05" min="0" :value="format(segment.trimStart)" @change="updateTrim(segment.id, 'trimStart', $event)" />
-            </label>
-            <label class="field">
-              <span class="field-label">终点 s</span>
-              <input class="text-input" type="number" step="0.05" min="0" :value="format(segment.trimEnd)" @change="updateTrim(segment.id, 'trimEnd', $event)" />
-            </label>
-            <label class="field">
-              <span class="field-label">重叠 s</span>
-              <input
-                class="text-input"
-                type="number"
-                step="0.05"
-                min="0"
-                :value="format(segment.blendIn)"
-                :disabled="index === 0"
-                @change="updateTrim(segment.id, 'blendIn', $event)"
-              />
-            </label>
-          </div>
+          <div
+            class="segment"
+            :class="{ active: row.segment.id === store.selectedSegmentId, locked: row.locked }"
+            @click="store.selectSegment(row.segment.id)"
+          >
+            <div class="segment-head">
+              <span class="index mono">{{ row.index + 1 }}</span>
+              <span class="segment-name">{{ store.sourceLabel(row.segment.source) }}</span>
+              <span v-if="row.segment.transition" class="chip chip-accent">过渡</span>
+              <span class="faint mono">
+                {{ format(timeline.timings[row.index]?.start ?? 0) }}–{{ format(timeline.timings[row.index]?.end ?? 0) }}s
+              </span>
+              <span class="segment-actions">
+                <span class="mini" :class="{ disabled: row.locked }" title="上移" @click.stop="store.moveSegment(row.segment.id, -1)">
+                  <Icon name="arrowUp" :size="12" />
+                </span>
+                <span class="mini rotate" :class="{ disabled: row.locked }" title="下移" @click.stop="store.moveSegment(row.segment.id, 1)">
+                  <Icon name="arrowUp" :size="12" />
+                </span>
+                <span class="mini" :class="{ disabled: row.locked }" title="删除片段" @click.stop="store.removeSegment(row.segment.id)">
+                  <Icon name="trash" :size="12" />
+                </span>
+              </span>
+            </div>
 
-          <div class="segment-fields">
-            <label class="field">
-              <span class="field-label">X</span>
-              <input class="text-input" type="number" step="0.1" :value="poseText(segment, 'x')" @change="updatePose(segment.id, 'x', $event)" />
-            </label>
-            <label class="field">
-              <span class="field-label">Z</span>
-              <input class="text-input" type="number" step="0.1" :value="poseText(segment, 'z')" @change="updatePose(segment.id, 'z', $event)" />
-            </label>
-            <label class="field">
-              <span class="field-label">朝向°</span>
-              <input class="text-input" type="number" step="5" :value="poseText(segment, 'yaw')" @change="updatePose(segment.id, 'yaw', $event)" />
-            </label>
-          </div>
+            <div class="segment-fields">
+              <label class="field">
+                <span class="field-label">起点 s</span>
+                <input class="text-input" type="number" step="0.05" min="0" :disabled="row.locked" :value="format(row.segment.trimStart)" @change="updateTrim(row.segment.id, 'trimStart', $event)" />
+              </label>
+              <label class="field">
+                <span class="field-label">终点 s</span>
+                <input class="text-input" type="number" step="0.05" min="0" :disabled="row.locked" :value="format(row.segment.trimEnd)" @change="updateTrim(row.segment.id, 'trimEnd', $event)" />
+              </label>
+              <label class="field">
+                <span class="field-label">重叠 s</span>
+                <input
+                  class="text-input"
+                  type="number"
+                  step="0.05"
+                  min="0"
+                  :value="format(row.segment.blendIn)"
+                  :disabled="row.index === 0 || row.locked"
+                  @change="updateTrim(row.segment.id, 'blendIn', $event)"
+                />
+              </label>
+            </div>
 
-          <div class="pose-foot">
-            <span class="faint">段站位相对角色摆放，播放到该段时生效</span>
-            <button class="btn btn-sm" type="button" @click.stop="store.resetSegmentPose(segment.id)">清除站位</button>
+            <div class="segment-fields">
+              <label class="field">
+                <span class="field-label">X</span>
+                <input class="text-input" type="number" step="0.1" :disabled="row.locked" :value="poseText(row.segment, 'x')" @change="updatePose(row.segment.id, 'x', $event)" />
+              </label>
+              <label class="field">
+                <span class="field-label">Z</span>
+                <input class="text-input" type="number" step="0.1" :disabled="row.locked" :value="poseText(row.segment, 'z')" @change="updatePose(row.segment.id, 'z', $event)" />
+              </label>
+              <label class="field">
+                <span class="field-label">朝向°</span>
+                <input class="text-input" type="number" step="5" :disabled="row.locked" :value="poseText(row.segment, 'yaw')" @change="updatePose(row.segment.id, 'yaw', $event)" />
+              </label>
+            </div>
+
+            <div class="pose-foot">
+              <span class="faint">{{ row.locked ? '冻结中：过渡动画生成完成前不可编辑' : '段站位相对角色摆放，播放到该段时生效' }}</span>
+              <button class="btn btn-sm" type="button" :disabled="row.locked" @click.stop="store.resetSegmentPose(row.segment.id)">清除站位</button>
+            </div>
           </div>
-        </div>
+        </template>
       </div>
     </template>
 
@@ -345,6 +399,70 @@ function projectMeta(projectId: string): string {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.transition {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 14px;
+  border-left: 2px solid var(--border);
+  min-height: 26px;
+}
+
+.transition.busy {
+  border-left-color: var(--accent);
+}
+
+.transition-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+
+.transition-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+
+.transition-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.transition-state.running,
+.transition-state.queued,
+.transition-state.submitting {
+  color: var(--accent-hover);
+}
+
+.transition-state.failed {
+  color: #f87171;
+}
+
+.segment.locked {
+  border-style: dashed;
+  border-color: var(--accent);
+  cursor: default;
+}
+
+.segment.locked .text-input {
+  opacity: 0.6;
+}
+
+.mini.disabled {
+  opacity: 0.3;
+  pointer-events: none;
 }
 
 .segment {

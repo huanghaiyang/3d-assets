@@ -8,6 +8,10 @@ const store = useStageStore();
 
 const fbxFiles = computed(() => store.files.slice(0, 400));
 
+const actorLocked = computed(() =>
+  store.selectedActorId ? store.isActorLocked(store.selectedActorId) : false,
+);
+
 const yawDegrees = computed(() => {
   const yaw = store.selectedActor?.transform.yaw ?? 0;
   return ((yaw * 180) / Math.PI).toFixed(1);
@@ -71,15 +75,22 @@ function onNumberInput(axis: 'x' | 'z' | 'yaw', event: Event): void {
         <span class="chip" :class="actor.kind === 'fbx' ? 'chip-info' : 'chip-accent'">
           {{ actor.kind === 'fbx' ? 'FBX' : 'Soma' }}
         </span>
+        <span v-if="store.isActorLocked(actor.id)" class="chip">锁定</span>
         <span class="actor-actions">
           <span
             class="mini"
-            :title="actor.visible ? '隐藏' : '显示'"
+            :class="{ disabled: store.isActorLocked(actor.id) }"
+            :title="store.isActorLocked(actor.id) ? '过渡动画生成中，角色已锁定' : actor.visible ? '隐藏' : '显示'"
             @click.stop="store.toggleActorVisible(actor.id)"
           >
             <Icon :name="actor.visible ? 'eye' : 'eyeOff'" :size="12" />
           </span>
-          <span class="mini" title="删除角色" @click.stop="store.removeActor(actor.id)">
+          <span
+            class="mini"
+            :class="{ disabled: store.isActorLocked(actor.id) }"
+            :title="store.isActorLocked(actor.id) ? '过渡动画生成中，角色已锁定' : '删除角色'"
+            @click.stop="store.removeActor(actor.id)"
+          >
             <Icon name="trash" :size="12" />
           </span>
         </span>
@@ -95,6 +106,7 @@ function onNumberInput(axis: 'x' | 'z' | 'yaw', event: Event): void {
         <span class="field-label">名称</span>
         <input
           class="text-input"
+          :disabled="actorLocked"
           :value="store.selectedActor.name"
           @change="store.updateActorName(store.selectedActor!.id, ($event.target as HTMLInputElement).value)"
         />
@@ -105,7 +117,7 @@ function onNumberInput(axis: 'x' | 'z' | 'yaw', event: Event): void {
         <select
           class="select-input"
           :value="store.selectedActor.modelPath ?? ''"
-          :disabled="store.catalogLoading"
+          :disabled="store.catalogLoading || actorLocked"
           @change="store.updateActorModel(store.selectedActor!.id, ($event.target as HTMLSelectElement).value)"
         >
           <option v-if="store.catalogLoading" value="">动画库加载中…</option>
@@ -116,18 +128,19 @@ function onNumberInput(axis: 'x' | 'z' | 'yaw', event: Event): void {
       <div class="grid-3">
         <label class="field">
           <span class="field-label">X</span>
-          <input class="text-input" type="number" step="0.1" :value="store.selectedActor.transform.x" @change="onNumberInput('x', $event)" />
+          <input class="text-input" type="number" step="0.1" :disabled="actorLocked" :value="store.selectedActor.transform.x" @change="onNumberInput('x', $event)" />
         </label>
         <label class="field">
           <span class="field-label">Z</span>
-          <input class="text-input" type="number" step="0.1" :value="store.selectedActor.transform.z" @change="onNumberInput('z', $event)" />
+          <input class="text-input" type="number" step="0.1" :disabled="actorLocked" :value="store.selectedActor.transform.z" @change="onNumberInput('z', $event)" />
         </label>
         <label class="field">
           <span class="field-label">朝向 °</span>
-          <input class="text-input" type="number" step="5" :value="yawDegrees" @change="onNumberInput('yaw', $event)" />
+          <input class="text-input" type="number" step="5" :disabled="actorLocked" :value="yawDegrees" @change="onNumberInput('yaw', $event)" />
         </label>
       </div>
-      <p class="hint">也可以在视口里直接拖拽选中的角色（移动 X/Z 或绕 Y 旋转）</p>
+      <p v-if="actorLocked" class="hint locked">过渡动画生成期间，该角色已锁定：不能删除、移动或换模型</p>
+      <p v-else class="hint">也可以在视口里直接拖拽选中的角色（移动 X/Z 或绕 Y 旋转）</p>
     </template>
   </div>
 </template>
@@ -256,6 +269,11 @@ function onNumberInput(axis: 'x' | 'z' | 'yaw', event: Event): void {
   color: var(--text);
 }
 
+.mini.disabled {
+  opacity: 0.3;
+  pointer-events: none;
+}
+
 .field {
   display: block;
 }
@@ -271,5 +289,9 @@ function onNumberInput(axis: 'x' | 'z' | 'yaw', event: Event): void {
   font-size: 11.5px;
   color: var(--text-faint);
   line-height: 1.5;
+}
+
+.hint.locked {
+  color: var(--accent-hover);
 }
 </style>

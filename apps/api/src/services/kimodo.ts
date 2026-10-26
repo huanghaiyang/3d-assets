@@ -30,6 +30,34 @@ export interface KimodoGenerateRequest {
   segments?: KimodoPromptSegment[];
 }
 
+/**
+ * 真实 pose 约束的双向过渡生成请求。
+ *
+ * 调用方（前端）需要把 prev / next 段的末帧 / 首帧写成 f32 文件
+ * （root_positions.f32: [T_prev, 3] + local_rotations_xyzw.f32: [T_prev, 30, 4]），
+ * 然后把它们的绝对路径传给这里。shim 会 encode → normalize → 双向构造
+ * observed / observed_mask → DDIM 采样 → 硬约束覆盖 → decode → 输出标准 f32。
+ */
+export interface KimodoConditionedRequest {
+  /** prev 段尾部的 root_positions.f32 绝对路径（至少 1 帧 = 12 字节） */
+  prevRootPath: string;
+  /** prev 段尾部的 local_rotations_xyzw.f32 绝对路径（至少 1 帧 = 480 字节） */
+  prevRotPath: string;
+  /** next 段头部的 root_positions.f32 绝对路径 */
+  nextRootPath: string;
+  /** next 段头部的 local_rotations_xyzw.f32 绝对路径 */
+  nextRotPath: string;
+  /** 过渡段总帧数（首尾帧精确对齐，中间 DDIM 生成） */
+  frames: number;
+  /** 约束帧数：首尾各约束这么多帧，默认 1（单帧对齐） */
+  transitionFrames?: number;
+  /** DDIM 扩散步数，默认 50（比文本 prompt 多，条件生成需要更充分收敛） */
+  steps?: number;
+  seed?: number;
+  /** 辅助提示词（告诉模型中间过渡的节奏/风格） */
+  prompt: string;
+}
+
 export type KimodoStatusValue = 'queued' | 'running' | 'ready' | 'failed';
 
 /** 一条生成任务（持久化到 <outputDir>/<id>/meta.json） */
@@ -42,6 +70,8 @@ export interface KimodoAnimation {
   status: KimodoStatusValue;
   error?: string;
   createdAt: number;
+  /** 生成模式：text=纯文本，conditioned=真实 pose 约束过渡 */
+  mode?: 'text' | 'conditioned';
   /** 多段生成时的分段提示词与各自帧数（单段任务不写） */
   segments?: KimodoPromptSegment[];
   /** 生成耗时（毫秒），完成后写入 */
@@ -70,6 +100,10 @@ export interface KimodoStatus {
   textBundle: string | null;
   outputDir: string;
   backend: string;
+  /** 约束过渡 shim 路径，null 表示未配置（回退到旧版文本 prompt） */
+  conditionedShimExe: string | null;
+  /** shim 可执行文件存在 */
+  conditionedReady: boolean;
   /** 提示词转译厂商（deepseek / openai / qwen / ...） */
   promptProvider: string;
   /** 厂商显示名（前端展示用） */
@@ -136,17 +170,33 @@ const COLD_LOAD_MS = 25_000;
  * 同一时间只跑一个任务（CPU 推理本来就是单线程瓶颈），其余排队。
  */
 class KimodoService {
+  // --- text prompt session ---
   private session: ChildProcessWithoutNullStreams | null = null;
   private stdoutBuffer = '';
   private pendingLines: string[] = [];
   private lineWaiters: Array<(line: string | null) => void> = [];
   private stderrTail: string[] = [];
+  private weightsLoaded = false;
+
+  // --- conditioned (真实 pose 约束) session ---
+  // 与 text session 结构完全对称，独立维护一套子进程 / stdout 缓冲 / 行等待队列，
+  // 因为两者命令行协议不同（shim 不走 --server、不接受分段），不能复用同一个进程。
+  private conditionedSession: ChildProcessWithoutNullStreams | null = null;
+  private conditionedStdoutBuffer = '';          // stdout 字节流缓冲（凑齐一行再派发）
+  private conditionedPendingLines: string[] = []; // 没有等待者时暂存的已读行
+  private conditionedLineWaiters: Array<(line: string | null) => void> = []; // 等待下一行响应的 Promise 回调
+  private conditionedStderrTail: string[] = [];   // 最近 30 条 stderr，用于排错
+  private conditionedWeightsLoaded = false;        // 模型权重是否已加载（冷启动耗时估算用）
+
+  // --- 全局状态（两个 session 共享同一套队列和计数器） ---
+  // 为什么两个 session 独立却共享一个 queue？
+  //   text 与 conditioned 是两个不同的子进程，理论上可以并行；但它们加载的是同一份
+  //   动作模型权重 + 同一个 Vulkan/CPU 后端，同时跑会争抢显存/算力导致 OOM 或速度骤降。
+  //   因此用一条全局 Promise 链把所有任务（不管走哪个 session）串行化，同一时间只跑一条。
   private busy = false;
   private queue: Promise<void> = Promise.resolve();
   private pending = 0;
   private lastError: string | null = null;
-  /** 常驻进程是否已完成过一次生成（权重已驻留，后续任务无需再加载） */
-  private weightsLoaded = false;
   /** 每「帧 × 步」单位的实测耗时（毫秒），随成功任务自适应修正 */
   private msPerUnit = DEFAULT_MS_PER_UNIT;
   private readonly jobs = new Map<string, KimodoAnimation>();
@@ -156,7 +206,7 @@ class KimodoService {
   }
 
   get isRunning(): boolean {
-    return this.session !== null;
+    return this.session !== null || this.conditionedSession !== null;
   }
 
   /** 检查 .env 配置是否齐备，返回缺失项说明 */
@@ -174,6 +224,8 @@ class KimodoService {
 
   status(): KimodoStatus {
     const check = this.validate();
+    const conditionedShimExe = config.kimodo.conditionedShimExe;
+    const conditionedReady = !!conditionedShimExe && fs.existsSync(conditionedShimExe);
     return {
       ready: check.ok,
       running: this.isRunning,
@@ -184,6 +236,8 @@ class KimodoService {
       textBundle: config.kimodo.textBundle,
       outputDir: this.outputDir,
       backend: config.kimodo.backend,
+      conditionedShimExe,
+      conditionedReady,
       promptProvider: config.kimodo.promptProvider,
       promptProviderLabel: config.kimodo.promptProviderLabel,
       promptModel: config.kimodo.promptModel,
@@ -454,13 +508,23 @@ class KimodoService {
     const child = this.session;
     this.session = null;
     this.weightsLoaded = false;
-    if (!child) return;
+    if (child) this.terminateChild(child);
+  }
+
+  private killConditionedSession(): void {
+    const child = this.conditionedSession;
+    this.conditionedSession = null;
+    this.conditionedWeightsLoaded = false;
+    if (child) this.terminateChild(child);
+  }
+
+  /** 通用兜底：kill + Windows taskkill /F /T 防止子线程残留 */
+  private terminateChild(child: ChildProcessWithoutNullStreams): void {
     try {
       child.kill();
     } catch {
       /* ignore */
     }
-    // Windows 下 kmd-generate 可能还有子线程句柄，强制兜底
     if (process.platform === 'win32' && child.pid) {
       try {
         spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' });
@@ -472,6 +536,257 @@ class KimodoService {
 
   shutdown(): void {
     this.killSession();
+    this.killConditionedSession();
+  }
+
+  // ---------------------------------------------------------- conditioned shim 子进程
+
+  /**
+   * 确保 conditioned shim（真实 pose 约束过渡）进程存在。
+   *
+   * 与 ensureSession 的差异：
+   *   - 命令行：shim 直接接受 GGUF 路径作为 args（不走 `--server`）
+   *   - 不设 KIMODO_BACKEND 环境变量（shim 不依赖）
+   *   - 其他（collectDllDirs、PATH 拼接、stdio 管道、stdout 行协议）与 text 版本完全一致，
+   *     因为两者输出都是 root_positions.f32 + local_rotations_xyzw.f32。
+   */
+  private ensureConditionedSession(): ChildProcessWithoutNullStreams {
+    if (this.conditionedSession) return this.conditionedSession;
+
+    const shimExe = config.kimodo.conditionedShimExe;
+    const { motionModel, textBundle } = config.kimodo;
+    if (!shimExe || !motionModel || !textBundle) {
+      throw new Error('Kimodo conditioned shim 未配置（KIMODO_CONDITIONED_SHIM / KIMODO_MOTION_MODEL / KIMODO_TEXT_BUNDLE）');
+    }
+
+    const env = { ...process.env };
+    const pathKey = Object.keys(env).find((key) => key.toLowerCase() === 'path') ?? 'PATH';
+    const dllDirs = this.collectDllDirs(shimExe);
+    env[pathKey] = [...dllDirs, env[pathKey] ?? ''].filter(Boolean).join(path.delimiter);
+    // 不设 KIMODO_BACKEND / KIMODO_TEXT_RESIDENT_LIMIT_MIB —— shim 有自己的默认值
+
+    log.info(`拉起 conditioned shim：${shimExe} ${motionModel} ${textBundle}`);
+    const child = spawn(shimExe, [motionModel, textBundle], {
+      cwd: path.dirname(shimExe),
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    this.conditionedSession = child;
+    this.conditionedStdoutBuffer = '';
+    this.conditionedPendingLines = [];
+    this.conditionedStderrTail = [];
+
+    child.stdout.on('data', (chunk: Buffer) => this.onConditionedStdout(chunk));
+    child.stderr.on('data', (chunk: Buffer) => {
+      const text = chunk.toString().trim();
+      if (!text) return;
+      this.conditionedStderrTail.push(text);
+      if (this.conditionedStderrTail.length > 30) this.conditionedStderrTail.shift();
+      log.warn(`[kmd-conditioned] ${text}`);
+    });
+    child.on('exit', (code) => {
+      if (this.conditionedSession === child) {
+        this.conditionedSession = null;
+        this.conditionedWeightsLoaded = false;
+        for (const wake of this.conditionedLineWaiters.splice(0)) wake(null);
+        this.conditionedPendingLines = [];
+      }
+      log.warn(`conditioned shim 退出，code=${code}${this.conditionedStderrTail.length ? `，stderr 末尾：${this.conditionedStderrTail.at(-1)}` : ''}`);
+    });
+    child.on('error', (err) => {
+      this.lastError = `启动 conditioned shim 失败：${err.message}`;
+      log.error(this.lastError);
+    });
+    return child;
+  }
+
+  /** conditioned shim stdout 行切分（与 onStdout 完全同构，只是作用在 conditioned 成员上） */
+  private onConditionedStdout(chunk: Buffer): void {
+    this.conditionedStdoutBuffer += chunk.toString();
+    let index = this.conditionedStdoutBuffer.indexOf('\n');
+    while (index >= 0) {
+      const line = this.conditionedStdoutBuffer.slice(0, index);
+      this.conditionedStdoutBuffer = this.conditionedStdoutBuffer.slice(index + 1);
+      const waiter = this.conditionedLineWaiters.shift();
+      if (waiter) waiter(line);
+      else this.conditionedPendingLines.push(line);
+      index = this.conditionedStdoutBuffer.indexOf('\n');
+    }
+  }
+
+  /** 等待 conditioned shim 回一行（超时返回 null；exit 时被 exit 回调以 null 唤醒） */
+  private nextConditionedLine(timeoutMs: number): Promise<string | null> {
+    if (this.conditionedPendingLines.length > 0) {
+      return Promise.resolve(this.conditionedPendingLines.shift() ?? '');
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (value: string | null): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const timer = setTimeout(() => {
+        const at = this.conditionedLineWaiters.indexOf(finish);
+        if (at >= 0) this.conditionedLineWaiters.splice(at, 1);
+        finish(null);
+      }, timeoutMs);
+      this.conditionedLineWaiters.push(finish);
+    });
+  }
+
+  /**
+   * 提交一次「真实 pose 约束的双向过渡」生成：只做参数规整与入队，
+   * 真正的推理在后台串行执行（与 text 任务共享同一 queue）。
+   *
+   * 四个 f32 文件必须提前由调用方写好（一般是前端把上一段尾部 / 下一段头部
+   * 各截几帧，用 Blob 写到本地临时目录），这里只校验路径存在性，不再做二次加工。
+   */
+  submitConditioned(req: KimodoConditionedRequest): KimodoAnimation {
+    const shimExe = config.kimodo.conditionedShimExe;
+    if (!shimExe || !fs.existsSync(shimExe)) {
+      throw new Error('Kimodo conditioned shim 未配置或不存在（KIMODO_CONDITIONED_SHIM）');
+    }
+
+    // 校验四个 f32 约束文件
+    const requiredFiles: Array<[string, string]> = [
+      ['prevRootPath', 'prev 段尾部 root_positions.f32'],
+      ['prevRotPath', 'prev 段尾部 local_rotations_xyzw.f32'],
+      ['nextRootPath', 'next 段头部 root_positions.f32'],
+      ['nextRotPath', 'next 段头部 local_rotations_xyzw.f32'],
+    ];
+    for (const [key, label] of requiredFiles) {
+      const value = (req as unknown as Record<string, string>)[key];
+      if (!value || typeof value !== 'string' || !fs.existsSync(value)) {
+        throw new Error(`约束文件 ${label} 不存在：${value ?? '(未提供)'}`);
+      }
+    }
+
+    // 参数二次夹紧（路由层已校验过，但 service 层作为最终防线再夹一次）
+    // frames: 8~300，同文本生成
+    const frames = Math.max(8, Math.min(300, Math.round(req.frames) || 0));
+    // transitionFrames: 1 ~ floor(frames/2)
+    //   上限设为总帧的一半，避免约束帧占比过高导致生成结果被「钉死」、中间没空间过渡
+    const transitionFrames = Math.max(1, Math.min(Math.floor(frames / 2), Math.round(req.transitionFrames ?? 1) || 1));
+    // steps: 至少 1 步；默认 50（条件生成需要比文本更充分收敛）
+    const steps = Math.max(1, Math.round(req.steps ?? 50) || 50);
+    // seed: 正整数才用，否则随机一个 0~1e9
+    const seed = req.seed && req.seed > 0 ? Math.round(req.seed) : Math.floor(Math.random() * 1e9);
+    const prompt = (req.prompt ?? '').trim();
+    if (!prompt) throw new Error('辅助提示词不能为空');
+
+    const job: KimodoAnimation = {
+      id: Math.random().toString(16).slice(2, 10) + Date.now().toString(16).slice(-6),
+      prompt,
+      frames,
+      steps,
+      seed,
+      mode: 'conditioned',
+      status: 'queued',
+      createdAt: Date.now(),
+    };
+    this.jobs.set(job.id, job);
+    this.persist(job);
+    this.pending += 1;
+
+    // 挂到全局 queue 尾部：与 text 任务串行执行，避免两个子进程同时抢 GPU
+    this.queue = this.queue.then(() => this.runConditioned(job, { ...req, frames, transitionFrames, steps, seed, prompt })).catch(() => void 0);
+    return job;
+  }
+
+  /**
+   * 执行一次 conditioned shim 生成（由队列串行调用）。
+   *
+   * 协议行（TAB 分隔）：
+   *   CONDITIONED<T>STEPS<T>SEED<T>OUTPUT_DIR<T>PREV_ROOT<T>PREV_ROT
+   *     <T>NEXT_ROOT<T>NEXT_ROT<T>TRANSITION_FRAMES<T>TOTAL_FRAMES<T>PROMPT.txt
+   *
+   * shim 输出到 OUTPUT_DIR：root_positions.f32 + local_rotations_xyzw.f32，
+   * 格式与 text 生成完全一致，后续 persist / readMotion / importKimodoAnimation 等
+   * 全部复用现有基础设施。
+   */
+  private async runConditioned(
+    job: KimodoAnimation,
+    req: KimodoConditionedRequest & { frames: number; transitionFrames: number; steps: number; seed: number; prompt: string },
+  ): Promise<void> {
+    this.pending = Math.max(0, this.pending - 1);
+    this.busy = true;
+    const startedAt = Date.now();
+    const units = Math.max(1, job.frames * job.steps);
+    const loadMs = this.conditionedWeightsLoaded ? 0 : COLD_LOAD_MS;
+    job.status = 'running';
+    job.startedAt = startedAt;
+    job.loadMs = loadMs;
+    job.etaMs = Math.round(units * this.msPerUnit + loadMs);
+    this.persist(job);
+    try {
+      const dir = path.join(this.outputDir, job.id);
+      fs.mkdirSync(dir, { recursive: true });
+      const promptPath = path.join(dir, 'prompt.txt');
+      fs.writeFileSync(promptPath, req.prompt, 'utf8');
+
+      // 协议行（TAB 分隔），与 shim main.cpp 解析顺序严格一一对应：
+      //   0: CONDITIONED       命令字（shim 用它区分协议分支）
+      //   1: steps             DDIM 扩散步数
+      //   2: seed              随机种子
+      //   3: dir               输出目录（shim 写 root_positions.f32 + local_rotations_xyzw.f32）
+      //   4: prevRootPath      prev 段尾部 root f32
+      //   5: prevRotPath       prev 段尾部 rotation f32
+      //   6: nextRootPath      next 段头部 root f32
+      //   7: nextRotPath       next 段头部 rotation f32
+      //   8: transitionFrames  首尾各约束多少帧
+      //   9: frames            过渡段总帧数
+      //  10: promptPath        辅助提示词文本文件路径
+      const fields: (string | number)[] = [
+        'CONDITIONED',
+        req.steps,
+        req.seed,
+        dir,
+        req.prevRootPath,
+        req.prevRotPath,
+        req.nextRootPath,
+        req.nextRotPath,
+        req.transitionFrames,
+        req.frames,
+        promptPath,
+      ];
+      const line = fields.join('\t');
+      const session = this.ensureConditionedSession();
+
+      log.info(
+        `conditioned 生成 ${job.id}：${job.frames} 帧 / ${req.steps} 步 / 约束 ${req.transitionFrames} 帧，seed=${req.seed}`,
+      );
+      session.stdin.write(`${line}\n`);
+
+      const response = await this.nextConditionedLine(30 * 60 * 1000);
+      if (response === null) throw new Error('conditioned shim 无响应（超时）');
+      const trimmed = response.trim();
+      if (trimmed.startsWith('ERR\t')) throw new Error(trimmed.slice(4));
+      if (!trimmed.startsWith('OK')) throw new Error(`conditioned shim 返回异常：${trimmed.slice(0, 200)}`);
+
+      const rootPath = path.join(dir, 'root_positions.f32');
+      const rotPath = path.join(dir, 'local_rotations_xyzw.f32');
+      if (!fs.existsSync(rootPath) || !fs.existsSync(rotPath)) {
+        throw new Error('conditioned shim 未输出动作数据文件');
+      }
+      job.status = 'ready';
+      job.error = undefined;
+      this.lastError = null;
+      const samplingMs = Math.max(1, Date.now() - startedAt - loadMs);
+      this.msPerUnit = Math.min(500, Math.max(10, samplingMs / units));
+      this.conditionedWeightsLoaded = true;
+    } catch (err) {
+      job.status = 'failed';
+      job.error = (err as Error).message;
+      this.lastError = job.error;
+      log.error(`conditioned 生成 ${job.id} 失败：${job.error}`);
+      this.killConditionedSession();
+    } finally {
+      job.durationMs = Date.now() - startedAt;
+      this.busy = false;
+      this.persist(job);
+    }
   }
 
   // ---------------------------------------------------------------- 任务持久化

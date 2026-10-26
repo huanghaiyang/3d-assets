@@ -1,7 +1,10 @@
 import type { FastifyInstance } from 'fastify';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   importKimodoAnimation,
   kimodoService,
+  type KimodoConditionedRequest,
   type KimodoGenerateRequest,
 } from '../services/kimodo.js';
 import { enhancePrompt, refinePrompt } from '../services/promptEnhance.js';
@@ -102,6 +105,146 @@ export async function registerKimodoRoutes(app: FastifyInstance): Promise<void> 
         seed: body.seed,
         transitionFrames: body.transitionFrames,
         segments,
+      });
+    } catch (err) {
+      return reply.code(400).send({ error: (err as Error).message });
+    }
+  });
+
+  /**
+   * 真实 pose 约束的双向过渡生成。
+   *
+   * 两种输入方式：
+   * A) 直接传四个 f32 路径：prevRootPath / prevRotPath / nextRootPath / nextRotPath
+   * B) 传 prevAnimationId / nextAnimationId：服务端自动从 outputDir 读原始 f32，
+   *    按 transitionFrames 切 prev 尾部 / next 头部，写临时 f32 后再喂给 shim。
+   *    前端只需要知道两段的 animationId，无需关心底层文件格式。
+   */
+  app.post('/api/kimodo/generate-conditioned', async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+    if (!prompt) return reply.code(400).send({ error: '缺少必填字段：prompt（辅助提示词）' });
+
+    // 过渡段总帧数：8 是扩散模型能稳定生成的下限，300 是单次任务的上限
+    // （再长会让单条推理占满显存/CPU 过久，应该拆成多段）
+    const frames = Math.round(Number(body.frames) || 0);
+    if (!Number.isFinite(frames) || frames < 8 || frames > 300) {
+      return reply.code(400).send({ error: 'frames 必须在 8–300 之间' });
+    }
+
+    // 约束帧数（首尾各取这么多帧作为 observed 硬约束）：
+    // 默认 1 帧 = 只对齐 prev 末帧与 next 首帧；前端过渡场景只用单帧对齐即可，
+    // 多帧约束会让首尾过度僵硬，中间过渡失去自然度。
+    const transitionFrames = Math.max(1, Math.round(Number(body.transitionFrames) || 1));
+    // DDIM 扩散步数：条件生成比纯文本需要更充分收敛，默认 50（文本生成默认 20）
+    const steps = Math.round(Number(body.steps) || 50);
+    // 随机种子：传了就用，没传由 service 层自己掷，保证结果可复现
+    const seed = Number.isFinite(Number(body.seed)) ? Math.round(Number(body.seed)) : undefined;
+
+    // ---- 解析四个 f32 路径 ----
+    let prevRootPath: string;
+    let prevRotPath: string;
+    let nextRootPath: string;
+    let nextRotPath: string;
+
+    const hasDirectPaths =
+      typeof body.prevRootPath === 'string' &&
+      typeof body.prevRotPath === 'string' &&
+      typeof body.nextRootPath === 'string' &&
+      typeof body.nextRotPath === 'string';
+    const hasAnimationIds =
+      typeof body.prevAnimationId === 'string' && typeof body.nextAnimationId === 'string';
+
+    if (hasDirectPaths) {
+      // 方式 A：直接路径，做存在性校验
+      const check = (key: string, p: string) =>
+        fs.existsSync(p) ? null : `${key} 指向的文件不存在：${p}`;
+      const errs: string[] = [];
+      prevRootPath = body.prevRootPath as string;
+      prevRotPath = body.prevRotPath as string;
+      nextRootPath = body.nextRootPath as string;
+      nextRotPath = body.nextRotPath as string;
+      errs.push(check('prevRootPath', prevRootPath)!);
+      errs.push(check('prevRotPath', prevRotPath)!);
+      errs.push(check('nextRootPath', nextRootPath)!);
+      errs.push(check('nextRotPath', nextRotPath)!);
+      const filtered = errs.filter(Boolean);
+      if (filtered.length) return reply.code(400).send({ error: filtered[0] });
+    } else if (hasAnimationIds) {
+      // 方式 B：animationId → 服务端自动切帧写临时 f32
+      const prevAnimId = body.prevAnimationId as string;
+      const nextAnimId = body.nextAnimationId as string;
+      const outDir = kimodoService.outputDir;
+      const prevJobDir = path.join(outDir, prevAnimId);
+      const nextJobDir = path.join(outDir, nextAnimId);
+
+      const missing = fs.existsSync(prevJobDir) ? null : `prevAnimationId=${prevAnimId} 的 job 目录不存在：${prevJobDir}`;
+      if (missing) return reply.code(400).send({ error: missing });
+      if (!fs.existsSync(nextJobDir)) return reply.code(400).send({ error: `nextAnimationId=${nextAnimId} 的 job 目录不存在` });
+
+      // 辅助：从 f32 文件切 [frameStart, frameEnd) 帧
+      // 负数索引：-N = 倒数第 N 帧；frameEnd=0 特例 = 到文件末尾
+      const slice = (src: string, perFrame: number, frameStart: number, frameEnd: number) => {
+        const buf = fs.readFileSync(src);
+        const totalFrames = buf.length / perFrame;
+        const start = frameStart < 0 ? Math.max(0, totalFrames + frameStart) : frameStart;
+        const end = frameEnd === 0 ? totalFrames
+          : (frameEnd < 0 ? Math.max(0, totalFrames + frameEnd) : frameEnd);
+        return Buffer.from(buf.subarray(start * perFrame, end * perFrame));
+      };
+
+      const makeSlice = (
+        jobDir: string, fileName: string, perFrame: number,
+        tail: boolean,  // true = 取尾部 transitionFrames 帧, false = 取头部
+      ) => {
+        const src = path.join(jobDir, fileName);
+        if (!fs.existsSync(src)) {
+          throw new Error(`${jobDir} 里缺少 ${fileName}`);
+        }
+        // tail: 倒数 N 帧到末尾 → slice(-N, 0)
+        // head: 前 N 帧 → slice(0, N)
+        const buf = tail
+          ? slice(src, perFrame, -transitionFrames, 0)
+          : slice(src, perFrame, 0, transitionFrames);
+        return buf;
+      };
+
+      // 写临时约束目录（放在输出目录的 _constraints 里，跟 job 并列）
+      // tag 格式：prev前6位-next前6位-时间戳(36进制)，既方便排查又避免碰撞
+      const tag = `${prevAnimId.slice(0, 6)}-${nextAnimId.slice(0, 6)}-${Date.now().toString(36)}`;
+      const tmpDir = path.join(outDir, '_constraints', tag);
+      fs.mkdirSync(tmpDir, { recursive: true });
+
+      // perFrame 字节数：
+      //   root_positions.f32      → 每帧 3 个 float32 (XYZ) = 12 字节
+      //   local_rotations_xyzw.f32 → 每帧 30 关节 × 4 分量 (XYZW) × 4 字节 = 480 字节
+      // tail=true  取 prev 段尾部 transitionFrames 帧（末帧 = prev 最后一帧）
+      // tail=false 取 next 段头部 transitionFrames 帧（首帧 = next 第一帧）
+      const prevRootBuf = makeSlice(prevJobDir, 'root_positions.f32', 12, true);
+      const prevRotBuf  = makeSlice(prevJobDir, 'local_rotations_xyzw.f32', 30 * 4 * 4, true);
+      const nextRootBuf = makeSlice(nextJobDir, 'root_positions.f32', 12, false);
+      const nextRotBuf  = makeSlice(nextJobDir, 'local_rotations_xyzw.f32', 30 * 4 * 4, false);
+
+      prevRootPath = path.join(tmpDir, 'prev_root.f32');
+      prevRotPath  = path.join(tmpDir, 'prev_rot.f32');
+      nextRootPath = path.join(tmpDir, 'next_root.f32');
+      nextRotPath  = path.join(tmpDir, 'next_rot.f32');
+
+      fs.writeFileSync(prevRootPath, prevRootBuf);
+      fs.writeFileSync(prevRotPath, prevRotBuf);
+      fs.writeFileSync(nextRootPath, nextRootBuf);
+      fs.writeFileSync(nextRotPath, nextRotBuf);
+    } else {
+      return reply.code(400).send({
+        error: '必须提供 animationId 组合（prevAnimationId + nextAnimationId）或直接路径（四个 .f32 绝对路径）',
+      });
+    }
+
+    try {
+      return kimodoService.submitConditioned({
+        prevRootPath, prevRotPath, nextRootPath, nextRotPath,
+        frames, transitionFrames, steps, seed,
+        prompt,
       });
     } catch (err) {
       return reply.code(400).send({ error: (err as Error).message });

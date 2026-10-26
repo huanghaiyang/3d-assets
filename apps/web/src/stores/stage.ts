@@ -9,6 +9,7 @@ import {
 } from '@/api/animation';
 import { kimodoApi, type KimodoAnimation } from '@/api/kimodo';
 import { stageApi } from '@/api/stage';
+import { rotateXZ } from '@/viewer/stage/StageActor';
 import type { StagePlayer } from '@/viewer/stage/StagePlayer';
 import type {
   ActorKind,
@@ -25,6 +26,21 @@ export interface StageToast {
   id: number;
   kind: 'info' | 'success' | 'error';
   text: string;
+}
+
+/** 一次「过渡动画生成」任务：生成期间冻结相邻两段与所属角色 */
+export interface TransitionTask {
+  key: string;
+  prevId: string;
+  nextId: string;
+  actorId: string;
+  status: 'submitting' | 'queued' | 'running' | 'failed';
+  jobId?: string;
+  frames: number;
+  distance: number;
+  turnDeg: number;
+  prompt: string;
+  message?: string;
 }
 
 function createId(): string {
@@ -59,6 +75,9 @@ export const useStageStore = defineStore('stage', () => {
   const toasts = ref<StageToast[]>([]);
   const canUndo = ref(false);
   const canRedo = ref(false);
+  /** 过渡动画生成任务，按 prevId:nextId 索引 */
+  const transitionTasks = ref<Record<string, TransitionTask>>({});
+  const busyGenerating = computed(() => Object.keys(transitionTasks.value).length > 0);
 
   let player: StagePlayer | null = null;
   let toastSeq = 0;
@@ -66,6 +85,8 @@ export const useStageStore = defineStore('stage', () => {
   let bootstrapped = false;
   /** 新建动画详情缓存：挑选片段时按需拉取，避免每次点选都请求 */
   const projectCache = new Map<string, Promise<SavedAnimationProjectDetail | null>>();
+  /** 过渡生成的轮询计时器 */
+  const transitionTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   const selectedActor = computed(
     () => doc.value?.actors.find((actor) => actor.id === selectedActorId.value) ?? null,
@@ -113,6 +134,8 @@ export const useStageStore = defineStore('stage', () => {
     // 重进舞台页时恢复当前选中角色（选中环与 gizmo 依赖它）
     instance.setSelectedActor(selectedActorId.value);
     void instance.setDoc(doc.value);
+    // 生成中重进舞台页：恢复冻结状态
+    applyLocks();
   }
 
   function detachPlayer(): void {
@@ -179,6 +202,10 @@ export const useStageStore = defineStore('stage', () => {
 
   function undo(): void {
     if (!doc.value) return;
+    if (busyGenerating.value) {
+      toast('info', '过渡动画生成中，暂不能撤销');
+      return;
+    }
     const previous = past.pop();
     if (!previous) return;
     future.push(cloneDoc(doc.value));
@@ -188,6 +215,10 @@ export const useStageStore = defineStore('stage', () => {
 
   function redo(): void {
     if (!doc.value) return;
+    if (busyGenerating.value) {
+      toast('info', '过渡动画生成中，暂不能重做');
+      return;
+    }
     const next = future.pop();
     if (!next) return;
     past.push(cloneDoc(doc.value));
@@ -195,9 +226,287 @@ export const useStageStore = defineStore('stage', () => {
     syncHistoryFlags();
   }
 
+  // ===== 过渡动画生成 =====
+
+  function taskKey(prevId: string, nextId: string): string {
+    return `${prevId}:${nextId}`;
+  }
+
+  /** 生成中的任务（不含已失败的）会冻结相邻两段与角色 */
+  function activeTasks(): TransitionTask[] {
+    return Object.values(transitionTasks.value).filter((task) => task.status !== 'failed');
+  }
+
+  function isSegmentLocked(id: string): boolean {
+    return activeTasks().some((task) => task.prevId === id || task.nextId === id);
+  }
+
+  function isActorLocked(id: string): boolean {
+    return activeTasks().some((task) => task.actorId === id);
+  }
+
+  function guardLockedSegment(id: string): boolean {
+    if (!isSegmentLocked(id)) return false;
+    toast('info', '过渡动画生成期间，这两段已冻结');
+    return true;
+  }
+
+  function guardLockedActor(id: string): boolean {
+    if (!isActorLocked(id)) return false;
+    toast('info', '过渡动画生成期间，角色已锁定');
+    return true;
+  }
+
+  function transitionTaskFor(prevId: string, nextId: string): TransitionTask | null {
+    return transitionTasks.value[taskKey(prevId, nextId)] ?? null;
+  }
+
+  function applyLocks(): void {
+    const segmentIds: string[] = [];
+    const actorIds: string[] = [];
+    for (const task of activeTasks()) {
+      segmentIds.push(task.prevId, task.nextId);
+      actorIds.push(task.actorId);
+    }
+    player?.setLocked(segmentIds, actorIds);
+  }
+
+  function putTask(task: TransitionTask): void {
+    transitionTasks.value = { ...transitionTasks.value, [task.key]: task };
+    applyLocks();
+  }
+
+  function clearTask(key: string): void {
+    const timer = transitionTimers.get(key);
+    if (timer) clearTimeout(timer);
+    transitionTimers.delete(key);
+    const next = { ...transitionTasks.value };
+    delete next[key];
+    transitionTasks.value = next;
+    applyLocks();
+  }
+
+  /** 切换/新建舞台时放弃正在等待的过渡生成 */
+  function clearTransitions(): void {
+    for (const timer of transitionTimers.values()) clearTimeout(timer);
+    transitionTimers.clear();
+    transitionTasks.value = {};
+    player?.setLocked([], []);
+  }
+
+  /** 把前后段的位移与转向写成 Kimodo 的过渡提示词（文字编码器只认英文） */
+  function transitionPrompt(distance: number, local: { x: number; z: number }, turn: number): string {
+    const parts = ['smooth transition motion'];
+    if (distance > 0.08) {
+      const dirs: string[] = [];
+      if (local.z > 0.2) dirs.push('forward');
+      else if (local.z < -0.2) dirs.push('backward');
+      if (local.x > 0.2) dirs.push('to the right');
+      else if (local.x < -0.2) dirs.push('to the left');
+      parts.push(`move ${distance.toFixed(1)} meters ${dirs.length > 0 ? dirs.join(' and ') : 'forward'}`);
+    }
+    const degrees = Math.round((Math.abs(turn) * 180) / Math.PI);
+    if (degrees >= 10) parts.push(`turn ${turn > 0 ? 'right' : 'left'} ${degrees} degrees`);
+    if (distance <= 0.08 && degrees < 10) parts.push('shift weight naturally in place');
+    parts.push('continuous natural full-body motion, steady balance, no abrupt stop');
+    return `${parts.join(', ')}.`;
+  }
+
+  function failTransition(key: string, message: string): void {
+    const task = transitionTasks.value[key];
+    if (!task) return;
+    putTask({ ...task, status: 'failed', message });
+    toast('error', `过渡动画生成失败：${message}`);
+  }
+
+  function schedulePoll(key: string): void {
+    const existing = transitionTimers.get(key);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      transitionTimers.delete(key);
+      void pollTransition(key);
+    }, 2000);
+    transitionTimers.set(key, timer);
+  }
+
+  async function pollTransition(key: string): Promise<void> {
+    const task = transitionTasks.value[key];
+    if (!task?.jobId) return;
+    try {
+      const list = await kimodoApi.animations();
+      const job = list.find((item) => item.id === task.jobId);
+      if (!job) {
+        failTransition(key, '生成任务已丢失');
+        return;
+      }
+      if (job.status === 'failed') {
+        failTransition(key, job.error || 'Kimodo 生成本身失败');
+        return;
+      }
+      if (job.status === 'ready') {
+        await completeTransition(key, job.id, job.frames);
+        return;
+      }
+      putTask({ ...task, status: job.status });
+      schedulePoll(key);
+    } catch (error) {
+      failTransition(key, (error as Error).message);
+    }
+  }
+
+  /** 生成完成：把过渡段插到两段中间，并让根位移正好落到下一段站位 */
+  async function completeTransition(key: string, animationId: string, frames: number): Promise<void> {
+    const task = transitionTasks.value[key];
+    if (!task || !doc.value) return;
+    const segments = doc.value.segments;
+    const prevIndex = segments.findIndex((item) => item.id === task.prevId);
+    const nextIndex = segments.findIndex((item) => item.id === task.nextId);
+    if (prevIndex < 0 || nextIndex < 0) {
+      failTransition(key, '舞台内容已改变，过渡段未插入');
+      return;
+    }
+    const prev = segments[prevIndex];
+    const next = segments[nextIndex];
+    const startPose = player?.segmentEndPose(task.actorId, task.prevId) ?? {
+      ...(prev.pose ?? { x: 0, z: 0, yaw: 0 }),
+    };
+    const duration = Math.max(0.2, frames / SOMA_FPS);
+    const segment: SegmentDef = {
+      id: createId(),
+      actorId: task.actorId,
+      source: { kind: 'kimodo', animationId },
+      trimStart: 0,
+      trimEnd: duration,
+      blendIn: 0.2,
+      pose: startPose,
+      transition: { prevId: task.prevId, nextId: task.nextId },
+    };
+
+    recordHistory('generate-transition', false);
+    // 过渡段尾帧与下一段首帧用短交叉衔接，避免长窗口里来回滑
+    next.blendIn = Math.min(next.blendIn, 0.2);
+    segments.splice(prevIndex + 1, 0, segment);
+    selectedSegmentId.value = segment.id;
+    syncPlayer();
+    clearTask(key);
+    toast('success', '过渡动画已生成并插入');
+    void loadCatalog();
+  }
+
+  async function generateTransition(prevId: string, nextId: string): Promise<void> {
+    if (!doc.value || !selectedActorId.value) return;
+    const key = taskKey(prevId, nextId);
+    const existing = transitionTasks.value[key];
+    if (existing) {
+      if (existing.status !== 'failed') return;
+      clearTask(key);
+    }
+
+    const prev = doc.value.segments.find((item) => item.id === prevId);
+    const next = doc.value.segments.find((item) => item.id === nextId);
+    if (!prev || !next || prev.actorId !== next.actorId) {
+      toast('error', '只能为同一角色的相邻两段生成过渡');
+      return;
+    }
+    const list = actorSegmentsList.value;
+    const position = list.findIndex((item) => item.id === prevId);
+    if (position < 0 || list[position + 1]?.id !== nextId) {
+      toast('error', '过渡动画只能插在相邻两段之间');
+      return;
+    }
+
+    // 前一段播放到末尾时的真实落点（含片段自身根位移），下一段已经有明确站位
+    const startPose = player?.segmentEndPose(prev.actorId, prevId) ?? {
+      ...(prev.pose ?? { x: 0, z: 0, yaw: 0 }),
+    };
+    const endPose = next.pose ?? { x: 0, z: 0, yaw: 0 };
+    // 位移量（欧氏距离）和转向角（atan2 归一化到 [-π, π]，避免 359°→1° 被误判为大转）
+    const dx = endPose.x - startPose.x;
+    const dz = endPose.z - startPose.z;
+    const distance = Math.hypot(dx, dz);
+    const turn = Math.atan2(Math.sin(endPose.yaw - startPose.yaw), Math.cos(endPose.yaw - startPose.yaw));
+    // 把位移向量旋转到 prev 末帧的局部坐标系（前方为 +Z），用于生成英文方向提示词
+    const local = rotateXZ(dx, dz, -startPose.yaw);
+    // 过渡时长估算：取「位移耗时」和「转向耗时」的较大值，再夹到 [0.8s, 3.2s]
+    //   位移：按 1.25 m/s 步行速度估算，加 0.25s 起手缓冲
+    //   转向：按每秒约 0.9π (162°) 估算，加 0.35s 缓冲
+    const duration = Math.min(
+      3.2,
+      Math.max(0.8, Math.max(distance / 1.25 + 0.25, Math.abs(turn) / (Math.PI * 0.9) + 0.35)),
+    );
+    // 帧数 = duration × 30fps，对齐到偶数（DDIM 采样对偶数帧更友好），夹到 [24, 96]
+    const frames = Math.max(24, Math.min(96, Math.round((duration * SOMA_FPS) / 2) * 2));
+
+    const task: TransitionTask = {
+      key,
+      prevId,
+      nextId,
+      actorId: prev.actorId,
+      status: 'submitting',
+      frames,
+      distance,
+      turnDeg: Math.round((turn * 180) / Math.PI),
+      prompt: transitionPrompt(distance, local, turn),
+    };
+    putTask(task);
+
+    // ---- 决定走哪条生成路径 ----
+    // 判断两段是否都是 Kimodo 生成的片段：只有 source.kind === 'kimodo' 的段才有
+    // animationId，后端才能根据 animationId 切出原始 f32 做真实 pose 约束。
+    // 如果任一段来自 FBX / 新建动画（没有 animationId），只能退回纯文本 prompt。
+    const prevAnimId = prev.source.kind === 'kimodo' ? prev.source.animationId : undefined;
+    const nextAnimId = next.source.kind === 'kimodo' ? next.source.animationId : undefined;
+    const bothKimodo = !!prevAnimId && !!nextAnimId;
+
+    try {
+      let job;
+      if (bothKimodo) {
+        // 真实 pose 约束路径：首尾帧精确对齐 prev 末 / next 首（RMS=0）
+        // 关键参数选择：
+        //   transitionFrames=1 → 只硬约束首尾各 1 帧（prev 末帧 + next 首帧），
+        //                        中间帧完全交给 DDIM 自由生成，保证过渡自然不僵硬
+        //   steps=50           → 条件生成需要更多扩散步收敛，比文本生成的 20 步更稳
+        // API 层收到两个 animationId 后会自动切 f32（prev 尾部 1 帧 + next 头部 1 帧）
+        job = await kimodoApi.generateConditioned({
+          prevAnimationId: prevAnimId,
+          nextAnimationId: nextAnimId,
+          frames,
+          transitionFrames: 1,
+          steps: 50,
+          prompt: task.prompt,
+        });
+      } else {
+        // 纯文本 prompt 回退路径（任一段非 kimodo 源时使用）
+        // 只靠文字描述位移/转向来生成，首尾无法精确对齐，可能有 5–10cm 的跳变
+        // steps=20 足够，文本生成不需要那么多扩散步
+        job = await kimodoApi.generate({ prompt: task.prompt, frames, steps: 20 });
+      }
+
+      const live = transitionTasks.value[key];
+      if (!live) return;
+      if (job.status === 'failed') {
+        failTransition(key, job.error || 'Kimodo 生成本身失败');
+        return;
+      }
+      putTask({ ...live, jobId: job.id, status: job.status === 'ready' ? 'running' : job.status });
+      if (job.status === 'ready') {
+        await completeTransition(key, job.id, job.frames);
+        return;
+      }
+      schedulePoll(key);
+      toast(
+        'info',
+        `已提交过渡动画生成（${frames} 帧，位移 ${distance.toFixed(1)}m / 转向 ${task.turnDeg}°），生成期间相邻两段与角色已冻结`,
+      );
+    } catch (error) {
+      failTransition(key, (error as Error).message);
+    }
+  }
+
   // ===== 文档 =====
 
   function newStage(name = '新舞台'): void {
+    clearTransitions();
     doc.value = {
       id: '',
       name,
@@ -223,6 +532,7 @@ export const useStageStore = defineStore('stage', () => {
   }
 
   async function openStage(id: string): Promise<void> {
+    clearTransitions();
     loading.value = true;
     try {
       const loaded = await stageApi.get(id);
@@ -338,6 +648,7 @@ export const useStageStore = defineStore('stage', () => {
 
   function removeActor(id: string): void {
     if (!doc.value) return;
+    if (guardLockedActor(id)) return;
     const exists = doc.value.actors.some((actor) => actor.id === id);
     if (!exists) return;
     recordHistory('remove-actor', false);
@@ -351,6 +662,7 @@ export const useStageStore = defineStore('stage', () => {
   }
 
   function updateActorTransform(id: string, transform: ActorTransform): void {
+    if (guardLockedActor(id)) return;
     const actor = doc.value?.actors.find((item) => item.id === id);
     if (!actor) return;
     recordHistory(`transform:${id}`);
@@ -359,6 +671,7 @@ export const useStageStore = defineStore('stage', () => {
   }
 
   function updateActorName(id: string, name: string): void {
+    if (guardLockedActor(id)) return;
     const actor = doc.value?.actors.find((item) => item.id === id);
     if (!actor) return;
     const next = name.trim().slice(0, 80);
@@ -368,6 +681,7 @@ export const useStageStore = defineStore('stage', () => {
   }
 
   function updateActorModel(id: string, modelPath: string): void {
+    if (guardLockedActor(id)) return;
     const actor = doc.value?.actors.find((item) => item.id === id);
     if (!actor || actor.kind !== 'fbx' || !modelPath) return;
     recordHistory(`actor-model:${id}`, false);
@@ -378,6 +692,7 @@ export const useStageStore = defineStore('stage', () => {
   }
 
   function toggleActorVisible(id: string): void {
+    if (guardLockedActor(id)) return;
     const actor = doc.value?.actors.find((item) => item.id === id);
     if (!actor) return;
     recordHistory(`actor-visible:${id}`, false);
@@ -405,6 +720,7 @@ export const useStageStore = defineStore('stage', () => {
   }
 
   function updateSegment(id: string, patch: Partial<Pick<SegmentDef, 'trimStart' | 'trimEnd' | 'blendIn'>>): void {
+    if (guardLockedSegment(id)) return;
     const segment = doc.value?.segments.find((item) => item.id === id);
     if (!segment) return;
     recordHistory(`segment:${id}:${Object.keys(patch).join(',')}`);
@@ -416,6 +732,7 @@ export const useStageStore = defineStore('stage', () => {
 
   function removeSegment(id: string): void {
     if (!doc.value) return;
+    if (guardLockedSegment(id)) return;
     const exists = doc.value.segments.some((item) => item.id === id);
     if (!exists) return;
     recordHistory('remove-segment', false);
@@ -426,6 +743,7 @@ export const useStageStore = defineStore('stage', () => {
 
   /** 改某段的独立站位（相对角色摆放的偏移） */
   function updateSegmentPose(id: string, patch: Partial<SegmentPose>): void {
+    if (guardLockedSegment(id)) return;
     const segment = doc.value?.segments.find((item) => item.id === id);
     if (!segment) return;
     recordHistory(`pose:${id}`);
@@ -439,6 +757,7 @@ export const useStageStore = defineStore('stage', () => {
   }
 
   function resetSegmentPose(id: string): void {
+    if (guardLockedSegment(id)) return;
     const segment = doc.value?.segments.find((item) => item.id === id);
     if (!segment) return;
     recordHistory(`pose-reset:${id}`, false);
@@ -449,6 +768,7 @@ export const useStageStore = defineStore('stage', () => {
   /** 在同一角色的序列里移动一段（-1 上移，+1 下移） */
   function moveSegment(id: string, delta: number): void {
     if (!doc.value) return;
+    if (guardLockedSegment(id)) return;
     const segment = doc.value.segments.find((item) => item.id === id);
     if (!segment) return;
     const indexes = doc.value.segments
@@ -657,6 +977,12 @@ export const useStageStore = defineStore('stage', () => {
     canRedo,
     undo,
     redo,
+    transitionTasks,
+    busyGenerating,
+    transitionTaskFor,
+    generateTransition,
+    isSegmentLocked,
+    isActorLocked,
     attachPlayer,
     detachPlayer,
     bootstrap,
