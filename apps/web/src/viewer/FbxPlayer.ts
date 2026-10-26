@@ -144,6 +144,7 @@ export interface ModalTransformState {
 /** 场景节点树的一个节点（对象层级，不含骨骼以外的特殊语义） */
 import { NodeHighlighter, type SceneNode } from './sceneNodes';
 import { AxisIndicator } from './axisIndicator';
+import { buildBoneNameMap, clipsFromAnimationData } from './stage/clipFromAnimationData';
 
 export type { SceneNode };
 
@@ -1166,53 +1167,8 @@ export class FbxPlayer {
   applyAnimationData(data: AnimationData): ClipInfo[] {
     if (!this.model || !this.mixer || !this.skeleton) throw new Error('模型尚未加载完成');
 
-    // 关节名映射：导出 JSON 里的 joint / 轨道节点名可能是清理后的显示名，
-    // 绑定前统一换回模型里真实的骨骼名，避免 THREE 找不到绑定目标。
-    const boneNameMap = new Map<string, string>();
-    for (const bone of this.skeleton.flatBones) {
-      for (const alias of [bone.name, THREE.PropertyBinding.sanitizeNodeName(bone.name), cleanBoneLabel(bone.name)]) {
-        if (!boneNameMap.has(alias)) boneNameMap.set(alias, bone.name);
-      }
-    }
-
-    let matchedTracks = 0;
-    const clips = data.clips.map((clip) => {
-      const tracks: THREE.KeyframeTrack[] = [];
-      for (const track of clip.tracks) {
-        if (!track.name || !Array.isArray(track.times) || !Array.isArray(track.values)) continue;
-        if (track.times.length === 0) continue;
-        if (track.times.length * track.valueSize !== track.values.length) continue;
-
-        const dot = track.name.lastIndexOf('.');
-        const nodeName = dot > 0 ? track.name.slice(0, dot) : track.name;
-        const property = track.property || (dot > 0 ? track.name.slice(dot + 1) : '');
-        const target =
-          (track.joint ? boneNameMap.get(track.joint) : undefined) ??
-          boneNameMap.get(nodeName) ??
-          boneNameMap.get(cleanBoneLabel(nodeName));
-        if (!target) continue;
-        matchedTracks += 1;
-        const trackName = property ? `${target}.${property}` : track.name;
-
-        if (track.valueSize === 4) {
-          tracks.push(new THREE.QuaternionKeyframeTrack(trackName, track.times, track.values));
-        } else if (track.valueSize === 3) {
-          tracks.push(new THREE.VectorKeyframeTrack(trackName, track.times, track.values));
-        } else if (track.valueSize === 1) {
-          tracks.push(new THREE.NumberKeyframeTrack(trackName, track.times, track.values));
-        }
-      }
-      if (tracks.length === 0) {
-        throw new Error(`片段「${clip.name}」没有可用的关键帧（请在导出时包含关键帧数值）`);
-      }
-      const lastTime = tracks.reduce(
-        (max, track) => Math.max(max, track.times[track.times.length - 1] ?? 0),
-        0,
-      );
-      return new THREE.AnimationClip(clip.name || 'imported', Math.max(clip.duration || 0, lastTime), tracks);
-    });
-
-    if (clips.length === 0) throw new Error('JSON 中没有动画片段');
+    const boneNameMap = buildBoneNameMap(this.skeleton.flatBones);
+    const { clips, matchedTracks } = clipsFromAnimationData(data, boneNameMap);
     if (matchedTracks === 0) throw new Error('JSON 中的关节名与当前模型不匹配，无法绑定动画');
 
     this.clearAnimationClips();

@@ -3,8 +3,11 @@ import { computed } from 'vue';
 import Icon from './ui/Icon.vue';
 import { useWorkspaceStore } from '@/stores/workspace';
 
-defineProps<{ settingsOpen: boolean; page: 'workbench' | 'animations' }>();
-const emit = defineEmits<{ 'open-settings': []; 'change-page': [value: 'workbench' | 'animations'] }>();
+defineProps<{ settingsOpen: boolean; page: 'workbench' | 'animations' | 'stage' }>();
+const emit = defineEmits<{
+  'open-settings': [];
+  'change-page': [value: 'workbench' | 'animations' | 'stage'];
+}>();
 
 const store = useWorkspaceStore();
 
@@ -45,6 +48,15 @@ const keyLabel = computed(() => {
       >
         <Icon name="film" :size="13" />
         动画
+      </button>
+      <button
+        class="page-tab"
+        :class="{ active: page === 'stage' }"
+        type="button"
+        @click="emit('change-page', 'stage')"
+      >
+        <Icon name="grid" :size="13" />
+        舞台
       </button>
     </nav>
 

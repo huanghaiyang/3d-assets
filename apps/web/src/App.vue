@@ -12,16 +12,20 @@ import { useWorkspaceStore } from './stores/workspace';
 
 // 动画预览页（FBX 播放器 + 骨骼/节点树）只在真正用时才加载，首屏包体因此小一半
 const AnimationPage = defineAsyncComponent(() => import('./components/animation/AnimationPage.vue'));
+// 3D 舞台（three.js + 多角色序列编排）同理，切到「舞台」页签时才拉取
+const StagePage = defineAsyncComponent(() => import('./components/stage/StagePage.vue'));
 
 const store = useWorkspaceStore();
 const settingsOpen = ref(false);
-const page = ref<'workbench' | 'animations'>('workbench');
+const page = ref<'workbench' | 'animations' | 'stage'>('workbench');
 /** 动画页是异步组件，首次切换时显示占位，避免空白无反馈 */
 const animationLoaded = ref(false);
+const stageLoaded = ref(false);
 
-function changePage(value: 'workbench' | 'animations'): void {
+function changePage(value: 'workbench' | 'animations' | 'stage'): void {
   page.value = value;
   if (value === 'animations') animationLoaded.value = true;
+  if (value === 'stage') stageLoaded.value = true;
 }
 
 onMounted(() => store.startPolling());
@@ -29,7 +33,7 @@ onBeforeUnmount(() => store.stopPolling());
 </script>
 
 <template>
-  <div class="app" :class="page === 'animations' ? 'app-anim' : 'app-workbench'">
+  <div class="app" :class="page === 'animations' ? 'app-anim' : page === 'stage' ? 'app-stage' : 'app-workbench'">
     <TopBar
       :settings-open="settingsOpen"
       :page="page"
@@ -42,8 +46,11 @@ onBeforeUnmount(() => store.stopPolling());
       <ViewportPanel />
       <WorkbenchSidePanel />
     </main>
-    <main v-else class="anim-host">
+    <main v-else-if="page === 'animations'" class="anim-host">
       <AnimationPage v-if="animationLoaded" />
+    </main>
+    <main v-else class="stage-host">
+      <StagePage v-if="stageLoaded" />
     </main>
 
     <TaskBar v-if="page === 'workbench'" />
@@ -68,6 +75,10 @@ onBeforeUnmount(() => store.stopPolling());
   grid-template-rows: 52px minmax(0, 1fr);
 }
 
+.app-stage {
+  grid-template-rows: 52px minmax(0, 1fr);
+}
+
 .workbench {
   display: grid;
   /* 左：生成面板（可压缩）；中：视口（自适应）；右：素材库（固定 300px，两列卡片） */
@@ -77,6 +88,11 @@ onBeforeUnmount(() => store.stopPolling());
 }
 
 .anim-host {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.stage-host {
   min-height: 0;
   overflow: hidden;
 }
