@@ -78,6 +78,14 @@ export interface KimodoConditionedBody {
   seed?: number;
   /** 辅助提示词（英文，描述中间过渡的节奏/风格，如 "smooth walking forward"） */
   prompt: string;
+  /**
+   * 舞台位移（米，prev 局部坐标系），可选。
+   *
+   * 传了它，服务端会把 next 段约束的根位置平移到 `prev 末帧 + rootDelta`，
+   * 于是首尾约束之间就存在真实距离，模型会生成带位移的过渡（走步/转身），
+   * 而不是因为两段局部原点都在 0 附近而退化成原地动作。
+   */
+  rootDelta?: { dx: number; dz: number };
 }
 
 /** 多段生成里的一段提示词 */

@@ -16,6 +16,7 @@
     "dev:web": "npm run dev -w @h3d/web",
     "build": "npm run build -w @h3d/web && npm run build -w @h3d/api",
     "start": "node apps/api/dist/index.js",
+    "stop": "node scripts/stop.mjs",
     "typecheck": "npm run typecheck -w @h3d/api && npm run typecheck -w @h3d/web",
     "test": "npm run test:fuzzy -w @h3d/web && npm run test:state -w @h3d/api && npm run test:cover -w @h3d/api && npm run test:providers -w @h3d/api",
     "test:providers": "npm run test:providers -w @h3d/api",

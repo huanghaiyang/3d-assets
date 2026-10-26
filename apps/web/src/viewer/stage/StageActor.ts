@@ -69,6 +69,14 @@ export interface StageActor {
   sampleHips(clip: THREE.AnimationClip, time: number): HipsSample | null;
   /** 采样某个片段在指定时间双脚中点的水平位置（motion 局部空间） */
   sampleFeetCenter(clip: THREE.AnimationClip, time: number): { x: number; z: number } | null;
+  /**
+   * 动画轨道单位相对舞台单位的倍率：舞台位移 × 该值 = 轨道位移。
+   *
+   * 轨道写的是骨骼在模型局部空间的位移，还要乘上模型自身的缩放才是舞台单位：
+   * Mixamo FBX 模型被归一化到 2.4 高（厘米骨架 → 约 0.0133），
+   * Soma 骨架按身高缩放（约 1.4）。写回根轨前必须用它换算，否则位移会差几十倍。
+   */
+  readonly clipUnitScale: number;
   /** 当前髋部位置，写入 actor 局部坐标；没有髋部返回 false */
   currentHips(out: THREE.Vector3): boolean;
   /** 双脚脚踝位置（actor 局部），供脚步锁定使用 */
@@ -192,6 +200,16 @@ export abstract class MixerActor implements StageActor {
   }
 
   abstract get ready(): boolean;
+
+  /**
+   * 轨道单位 → 舞台单位的换算倍率。
+   * 骨骼位置轨的数值是「模型局部空间」的，渲染时还要乘 model.scale，
+   * 所以 1 舞台单位 = 1/model.scale 个轨道单位。
+   */
+  get clipUnitScale(): number {
+    const scale = this.model?.scale.x ?? 1;
+    return scale > 1e-6 ? 1 / scale : 1;
+  }
 
   protected abstract get hipsNode(): THREE.Object3D | null;
 

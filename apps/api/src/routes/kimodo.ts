@@ -240,11 +240,26 @@ export async function registerKimodoRoutes(app: FastifyInstance): Promise<void> 
       });
     }
 
+    // 舞台位移（米，prev 局部坐标系下的水平向量），可选。
+    // 用于把「这段过渡要跨越多远」编码进 next 的 root 约束，
+    // 否则两段各自的局部原点都在 0 附近，模型只会生成原地动作。
+    const rawDelta = body.rootDelta as { dx?: unknown; dz?: unknown } | undefined;
+    let rootDelta: { dx: number; dz: number } | undefined;
+    if (rawDelta && typeof rawDelta === 'object') {
+      const dx = Number(rawDelta.dx);
+      const dz = Number(rawDelta.dz);
+      // 太小的位移没有意义（<0.1mm），当作没传，避免生成无谓的临时文件
+      if (Number.isFinite(dx) && Number.isFinite(dz) && Math.hypot(dx, dz) > 1e-4) {
+        rootDelta = { dx, dz };
+      }
+    }
+
     try {
       return kimodoService.submitConditioned({
         prevRootPath, prevRotPath, nextRootPath, nextRotPath,
         frames, transitionFrames, steps, seed,
         prompt,
+        rootDelta,
       });
     } catch (err) {
       return reply.code(400).send({ error: (err as Error).message });

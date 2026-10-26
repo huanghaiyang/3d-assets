@@ -47,6 +47,18 @@ export interface KimodoConditionedRequest {
   nextRootPath: string;
   /** next 段头部的 local_rotations_xyzw.f32 绝对路径 */
   nextRotPath: string;
+  /**
+   * 让 next 段约束整体平移的舞台位移（米），可选。
+   *
+   * 为什么需要：prev / next 两段的 root_positions 属于各自 Kimodo job 的局部坐标系，
+   * 每个 job 都从自己的原点出发，所以 prev 末帧与 next 首帧通常都在原点附近。
+   * 直接把这两个点当约束，模型看到的是「起点≈终点」，只会生成原地动作。
+   *
+   * 传入本字段后，服务层会把 next 的 root 整段平移到 `prev 末帧 + rootDelta`，
+   * 于是在 observed 的 body[0..2]（根位置）里就编码了真实的跨越距离，
+   * 模型必须生成带位移的动作才能同时满足首尾约束。
+   */
+  rootDelta?: { dx: number; dz: number };
   /** 过渡段总帧数（首尾帧精确对齐，中间 DDIM 生成） */
   frames: number;
   /** 约束帧数：首尾各约束这么多帧，默认 1（单帧对齐） */
@@ -696,6 +708,51 @@ class KimodoService {
   }
 
   /**
+   * 把 next 段的 root_positions 整段平移，使其首帧正好落在 `prev 末帧 + delta`。
+   *
+   * 为什么是「prev 末帧 + delta」而不是「next 首帧 + delta」：
+   * shim 的约束是「起始位置 = observed 第一帧、结束位置 = observed 最后一帧」，
+   * 过渡段自身的位移量 = 结束位置 - 起始位置。要让这段位移恰好等于 delta，
+   * 就必须把 next 挪到 prev 末帧 + delta，即偏移量 = delta + (prev末 - next首)。
+   * 两段各自都在原点附近时这一项接近 0，但 prev 走得很远时需要它来消除跳变。
+   *
+   * root_positions.f32 布局：每帧 3 个 float32（x, y, z），共 12 字节；
+   * 只平移 x / z（水平面），保留 y（身高），局部旋转不受根平移影响所以无需改动。
+   */
+  private shiftNextRoot(
+    dir: string,
+    prevRootPath: string,
+    nextRootPath: string,
+    delta: { dx: number; dz: number },
+  ): string {
+    const prevBuf = fs.readFileSync(prevRootPath);
+    const nextBuf = fs.readFileSync(nextRootPath);
+    const prevFrames = Math.floor(prevBuf.length / 12);
+    const nextFrames = Math.floor(nextBuf.length / 12);
+    // 文件为空或长度不合法时放弃平移，避免写坏约束
+    if (prevFrames < 1 || nextFrames < 1) return nextRootPath;
+
+    const tail = (prevFrames - 1) * 12;
+    const prevX = prevBuf.readFloatLE(tail);
+    const prevZ = prevBuf.readFloatLE(tail + 8);
+    const nextX = nextBuf.readFloatLE(0);
+    const nextZ = nextBuf.readFloatLE(8);
+
+    const offsetX = delta.dx + (prevX - nextX);
+    const offsetZ = delta.dz + (prevZ - nextZ);
+
+    const shifted = Buffer.from(nextBuf);
+    for (let frame = 0; frame < nextFrames; frame += 1) {
+      const base = frame * 12;
+      shifted.writeFloatLE(shifted.readFloatLE(base) + offsetX, base);
+      shifted.writeFloatLE(shifted.readFloatLE(base + 8) + offsetZ, base + 8);
+    }
+    const out = path.join(dir, 'next_root_shifted.f32');
+    fs.writeFileSync(out, shifted);
+    return out;
+  }
+
+  /**
    * 执行一次 conditioned shim 生成（由队列串行调用）。
    *
    * 协议行（TAB 分隔）：
@@ -726,6 +783,12 @@ class KimodoService {
       const promptPath = path.join(dir, 'prompt.txt');
       fs.writeFileSync(promptPath, req.prompt, 'utf8');
 
+      // 有舞台位移时，把 next 段约束平移到 prev 末帧 + rootDelta，
+      // 让首尾约束本身携带跨越距离，模型才会生成带位移的过渡而不是原地踏步
+      const nextRootPath = req.rootDelta
+        ? this.shiftNextRoot(dir, req.prevRootPath, req.nextRootPath, req.rootDelta)
+        : req.nextRootPath;
+
       // 协议行（TAB 分隔），与 shim main.cpp 解析顺序严格一一对应：
       //   0: CONDITIONED       命令字（shim 用它区分协议分支）
       //   1: steps             DDIM 扩散步数
@@ -745,7 +808,7 @@ class KimodoService {
         dir,
         req.prevRootPath,
         req.prevRotPath,
-        req.nextRootPath,
+        nextRootPath,
         req.nextRotPath,
         req.transitionFrames,
         req.frames,

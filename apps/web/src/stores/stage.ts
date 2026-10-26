@@ -466,7 +466,11 @@ export const useStageStore = defineStore('stage', () => {
         //   transitionFrames=1 → 只硬约束首尾各 1 帧（prev 末帧 + next 首帧），
         //                        中间帧完全交给 DDIM 自由生成，保证过渡自然不僵硬
         //   steps=50           → 条件生成需要更多扩散步收敛，比文本生成的 20 步更稳
-        // API 层收到两个 animationId 后会自动切 f32（prev 尾部 1 帧 + next 头部 1 帧）
+        //   rootDelta=local    → 两段 root 都是各自 Kimodo job 的局部坐标、原点都在 0 附近，
+        //                        直接把 prev 末帧/next 首帧当约束会让模型「看不出距离」而原地踏步。
+        //                        把舞台位移（已旋到 prev 局部系）传下去，服务端将 next 的 root
+        //                        平移到 prev 末帧 + local，首尾约束之间就有了真实间距，
+        //                        模型必须走出这段距离才能同时满足两端。
         job = await kimodoApi.generateConditioned({
           prevAnimationId: prevAnimId,
           nextAnimationId: nextAnimId,
@@ -474,6 +478,7 @@ export const useStageStore = defineStore('stage', () => {
           transitionFrames: 1,
           steps: 50,
           prompt: task.prompt,
+          rootDelta: { dx: local.x, dz: local.z },
         });
       } else {
         // 纯文本 prompt 回退路径（任一段非 kimodo 源时使用）

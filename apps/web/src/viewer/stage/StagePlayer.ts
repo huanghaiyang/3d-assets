@@ -598,14 +598,15 @@ export class StagePlayer {
         const motion = await kimodoApi.motion(source.animationId);
         const clip = somaClipFromMotion(motion, skeleton, source.animationId);
         if (!clip) this.notify('Kimodo 动作数据不完整，无法播放');
-        else if (target) this.stretchRootMotion(clip, segment, target);
+        else if (target) this.stretchRootMotion(clip, segment, target, actor.clipUnitScale);
         return clip;
       }
 
       const imported = await kimodoApi.importAnimation(source.animationId);
       const converted = clipsFromAnimationData(imported.data as AnimationData, (actor as FbxActor).boneNameMap);
       const clip = converted.clips[0] ?? null;
-      if (clip && target) this.stretchRootMotion(clip, segment, target);
+      // FBX 的根轨写的是厘米级模型局部坐标，必须按模型缩放换算成舞台单位
+      if (clip && target) this.stretchRootMotion(clip, segment, target, actor.clipUnitScale);
       return clip;
     })().catch((error: unknown) => {
       this.clipCache.delete(key);
@@ -631,11 +632,16 @@ export class StagePlayer {
    * 把 Kimodo 生成过渡段的根位移缩放到「过渡段站位 → 下一段站位」的实际距离：
    * 保留原动作形态与节奏，只调整根节点的水平位移方向与长度，
    * 让过渡动画正好把角色送到下一段的起始位置。
+   *
+   * unitScale：舞台米 → clip 根轨单位 的换算倍率，取自 actor.clipUnitScale。
+   *   Soma 骨架约 0.7（按身高放大 1.4 倍），Mixamo FBX 约 75（厘米骨架缩到 2.4 高）。
+   *   少了这层换算，FBX 上的位移会被压缩几十倍，看起来就像原地踏步。
    */
   private stretchRootMotion(
     clip: THREE.AnimationClip,
     segment: SegmentDef,
     target: { dx: number; dz: number },
+    unitScale = 1,
   ): void {
     if (target.dx * target.dx + target.dz * target.dz < 1e-6) return;
     const tracks = clip.tracks.filter((track) => track.name.endsWith('.position') && track.values.length >= 6);
@@ -654,9 +660,9 @@ export class StagePlayer {
     const clipDz = z1 - z0;
     const clipLength = Math.hypot(clipDx, clipDz);
 
-    // 目标位移转到片段局部空间（与段站位同一套旋转约定）
+    // 目标位移转到片段局部空间，并换成 clip 自身的长度单位
     const pose = segment.pose ?? ZERO_SEGMENT_POSE;
-    const local = rotateXZ(target.dx, target.dz, -pose.yaw);
+    const local = rotateXZ(target.dx * unitScale, target.dz * unitScale, -pose.yaw);
     const targetLength = Math.hypot(local.x, local.z);
     if (clipLength < 1e-3 || targetLength < 1e-3) return;
 
