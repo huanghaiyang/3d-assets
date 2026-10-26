@@ -303,6 +303,15 @@ export const kimodoApi = {
       `/api/kimodo/animations/${encodeURIComponent(id)}/artifact?key=${encodeURIComponent(key)}`,
     ),
 
+  /** 读取单个 .f32 产物原始数据（骨架 / 轨迹预览） */
+  async artifactF32(id: string, key: string): Promise<Float32Array> {
+    const response = await fetch(
+      `/api/kimodo/animations/${encodeURIComponent(id)}/artifact.f32?key=${encodeURIComponent(key)}`,
+    );
+    if (!response.ok) throw new Error('产物数据读取失败');
+    return new Float32Array(await response.arrayBuffer());
+  },
+
   /** 提示词转译：中文描述 / 参考图片 → 英文动作提示词 */
   enhancePrompt: (body: { prompt: string; image?: string }) =>
     request<EnhancePromptResult>('/api/kimodo/enhance-prompt', {

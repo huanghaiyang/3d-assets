@@ -23,10 +23,6 @@ onBeforeUnmount(() => {
   store.detachPlayer();
 });
 
-function onNameChange(event: Event): void {
-  store.renameStage((event.target as HTMLInputElement).value);
-}
-
 /** 舞台列表就地重命名：双击名字进入编辑 */
 function beginRename(id: string, name: string): void {
   editingId.value = id;
@@ -117,14 +113,6 @@ function confirmRemove(id: string): void {
             </button>
           </div>
         </div>
-
-        <input
-          v-if="store.doc"
-          class="text-input name-input"
-          :value="store.doc.name"
-          placeholder="舞台名称"
-          @change="onNameChange"
-        />
 
         <div class="stage-list">
           <div
@@ -257,11 +245,6 @@ function confirmRemove(id: string): void {
   height: 26px;
   padding: 0 8px;
   font-size: 11.5px;
-}
-
-.name-input {
-  padding: 5px 8px;
-  font-size: 12.5px;
 }
 
 .stage-list {

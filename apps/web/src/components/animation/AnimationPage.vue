@@ -7,6 +7,7 @@ import AnimationInfo from './AnimationInfo.vue';
 import AnimationDataDialog from './AnimationDataDialog.vue';
 import FolderPicker from './FolderPicker.vue';
 import KimodoPanel from './KimodoPanel.vue';
+import TrashDrawer from './TrashDrawer.vue';
 import { useAnimationStore } from '@/stores/animation';
 
 const store = useAnimationStore();
@@ -112,6 +113,8 @@ function labelOf(dir: string): string {
         <AnimationViewport />
         <AnimationInfo />
       </div>
+
+      <TrashDrawer />
     </div>
 
     <FolderPicker :open="pickerOpen" :start-dir="store.dirs[0] ?? ''" @close="pickerOpen = false" @pick="onPick" />
@@ -138,6 +141,7 @@ function labelOf(dir: string): string {
 }
 
 .anim-body {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;

@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue';
+import { computed, ref, shallowRef } from 'vue';
 import { defineStore } from 'pinia';
 
 import {
@@ -7,7 +7,7 @@ import {
   type SavedAnimationProject,
   type SavedAnimationProjectDetail,
 } from '@/api/animation';
-import { kimodoApi, type KimodoAnimation } from '@/api/kimodo';
+import { kimodoApi, type KimodoAnimation, type SomaSkeleton } from '@/api/kimodo';
 import { stageApi } from '@/api/stage';
 import { useAnimationStore } from '@/stores/animation';
 import { useWorkspaceStore } from '@/stores/workspace';
@@ -78,6 +78,8 @@ export const useStageStore = defineStore('stage', () => {
 
   const files = ref<AnimationFile[]>([]);
   const kimodoJobs = ref<KimodoAnimation[]>([]);
+  /** Kimodo 骨架定义：用于给 Kimodo 动作生成静态骨架缩略图 */
+  const somaSkeleton = shallowRef<SomaSkeleton | null>(null);
   const animationProjects = ref<SavedAnimationProject[]>([]);
   const catalogLoading = ref(false);
   const catalogError = ref<string | null>(null);
@@ -830,21 +832,22 @@ export const useStageStore = defineStore('stage', () => {
     }
   }
 
-  function renameStage(name: string): void {
-    if (!doc.value) return;
-    const next = name.trim().slice(0, 80);
-    if (!next || next === doc.value.name) return;
-    recordHistory('rename-stage', false);
-    doc.value.name = next;
-  }
-
   /** 舞台列表里就地重命名已保存的舞台（会直接落盘） */
   async function renameStageById(id: string, name: string): Promise<void> {
     const next = name.trim().slice(0, 80);
-    if (!id || !next) return;
+    if (!id) return;
+    if (!next) {
+      toast('error', '舞台名称不能为空');
+      return;
+    }
     const summary = docs.value.find((item) => item.id === id);
-    if (summary) summary.name = next;
     const isCurrent = doc.value?.id === id;
+    const current = summary?.name ?? (isCurrent ? doc.value!.name : null);
+    if (current !== null && next === current) {
+      toast('info', '名称没有变化，无需保存');
+      return;
+    }
+    if (summary) summary.name = next;
     if (isCurrent) {
       recordHistory('rename-stage', false);
       doc.value!.name = next;
@@ -1292,14 +1295,16 @@ export const useStageStore = defineStore('stage', () => {
     catalogError.value = null;
     projectCache.clear();
     try {
-      const [list, jobs, projects] = await Promise.all([
+      const [list, jobs, projects, skeleton] = await Promise.all([
         animationApi.list().catch(() => null),
         kimodoApi.animations().catch(() => [] as KimodoAnimation[]),
         animationApi.projects().catch(() => null),
+        kimodoApi.skeleton().catch(() => null),
       ]);
       files.value = list?.files ?? [];
       kimodoJobs.value = jobs.filter((job) => job.status === 'ready');
       animationProjects.value = projects?.projects ?? [];
+      somaSkeleton.value = skeleton;
     } catch (error) {
       catalogError.value = (error as Error).message;
     } finally {
@@ -1402,6 +1407,7 @@ export const useStageStore = defineStore('stage', () => {
     actorSegmentsList,
     files,
     kimodoJobs,
+    somaSkeleton,
     animationProjects,
     catalogLoading,
     catalogError,
@@ -1437,7 +1443,6 @@ export const useStageStore = defineStore('stage', () => {
     openStage,
     saveStage,
     removeStage,
-    renameStage,
     renameStageById,
     addActor,
     removeActor,

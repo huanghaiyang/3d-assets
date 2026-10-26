@@ -95,11 +95,6 @@ async function commitRename(project: NewAnimationProject): Promise<void> {
   }
 }
 
-function formatDeleted(value?: string): string {
-  if (!value) return '';
-  return new Date(value).toLocaleString('zh-CN', { hour12: false });
-}
-
 /** 只有新建动画允许删除；原有 FBX 卡片没有删除入口 */
 async function removeProject(project: NewAnimationProject): Promise<void> {
   const detail = project.saved
@@ -113,18 +108,6 @@ async function removeProject(project: NewAnimationProject): Promise<void> {
   });
   if (!ok) return;
   store.deleteNewAnimation(project.id);
-}
-
-/** 彻底删除回收站里的项目（不可恢复） */
-async function purgeProject(project: NewAnimationProject): Promise<void> {
-  const ok = await confirmAction({
-    title: '彻底删除',
-    message: `确定彻底删除「${project.name}」？`,
-    detail: '该项目的数据文件会从回收站中永久移除，无法再恢复。',
-    confirmText: '彻底删除',
-  });
-  if (!ok) return;
-  void store.purgeFromTrash(project.id);
 }
 
 /** 卡片角标：新建 / 未保存 / 已保存 */
@@ -290,60 +273,6 @@ function onPageSize(event: Event): void {
                 <Icon name="trash" :size="12" />
               </button>
             </div>
-          </div>
-        </div>
-      </section>
-
-      <section v-if="store.trashOpen" class="new-section trash-section">
-        <div class="section-head">
-          <Icon name="trash" :size="11" />
-          <span>回收站</span>
-          <span class="chip">{{ store.trashProjects.length }}</span>
-          <span class="section-hint">可只读预览 · 恢复后回到新建动画</span>
-        </div>
-        <p v-if="store.trashLoading" class="state">读取回收站…</p>
-        <p v-else-if="store.trashProjects.length === 0" class="state">回收站是空的</p>
-        <div v-else class="trash-list">
-          <div
-            v-for="item in store.trashProjects"
-            :key="item.id"
-            class="trash-item"
-            :class="{ previewing: store.trashPreviewId === item.id }"
-          >
-            <div class="trash-main">
-              <span class="name" :title="item.name">
-                {{ item.name }}
-                <span v-if="store.trashPreviewId === item.id" class="preview-badge">预览中</span>
-              </span>
-              <span class="name-sub" :title="item.baseName">
-                {{ item.baseName }} · 删除于 {{ formatDeleted(item.deletedAt) }}
-              </span>
-            </div>
-            <button
-              class="btn btn-ghost btn-icon"
-              type="button"
-              title="在 3D 视口中只读预览（不恢复、不可编辑）"
-              :disabled="!item.hasData"
-              @click="store.previewTrashProject(item.id)"
-            >
-              <Icon name="play" :size="12" />
-            </button>
-            <button
-              class="btn btn-ghost btn-icon"
-              type="button"
-              title="恢复到新建动画"
-              @click="store.restoreFromTrash(item.id)"
-            >
-              <Icon name="restore" :size="12" />
-            </button>
-            <button
-              class="btn btn-ghost btn-icon danger"
-              type="button"
-              title="彻底删除（不可恢复）"
-              @click="purgeProject(item)"
-            >
-              <Icon name="trash" :size="12" />
-            </button>
           </div>
         </div>
       </section>
@@ -591,13 +520,6 @@ function onPageSize(event: Event): void {
   color: var(--text-dim);
 }
 
-.section-hint {
-  margin-left: auto;
-  font-size: 10px;
-  font-weight: 400;
-  color: var(--text-faint);
-}
-
 .new-card {
   position: relative;
 }
@@ -635,54 +557,6 @@ function onPageSize(event: Event): void {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.trash-section {
-  border-bottom: none;
-}
-
-.trash-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.trash-item {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 5px 6px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg-panel-2);
-}
-
-/* 正在预览的回收站项目：左侧强调色描边，和普通行区分 */
-.trash-item.previewing {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-}
-
-.preview-badge {
-  margin-left: 4px;
-  padding: 0 4px;
-  border-radius: 4px;
-  background: var(--accent);
-  color: #fff;
-  font-size: 9px;
-}
-
-.trash-main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.trash-item .btn-icon.danger:hover {
-  color: var(--danger);
-  background: var(--danger-soft);
 }
 
 .card-actions {

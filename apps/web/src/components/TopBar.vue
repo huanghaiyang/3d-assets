@@ -3,10 +3,10 @@ import { computed } from 'vue';
 import Icon from './ui/Icon.vue';
 import { useWorkspaceStore } from '@/stores/workspace';
 
-defineProps<{ settingsOpen: boolean; page: 'workbench' | 'animations' | 'stage' }>();
+defineProps<{ settingsOpen: boolean; page: 'workbench' | 'animations' | 'stage' | 'strips' }>();
 const emit = defineEmits<{
   'open-settings': [];
-  'change-page': [value: 'workbench' | 'animations' | 'stage'];
+  'change-page': [value: 'workbench' | 'animations' | 'stage' | 'strips'];
 }>();
 
 const store = useWorkspaceStore();
@@ -57,6 +57,15 @@ const keyLabel = computed(() => {
       >
         <Icon name="grid" :size="13" />
         舞台
+      </button>
+      <button
+        class="page-tab"
+        :class="{ active: page === 'strips' }"
+        type="button"
+        @click="emit('change-page', 'strips')"
+      >
+        <Icon name="flip" :size="13" />
+        拼接
       </button>
     </nav>
 

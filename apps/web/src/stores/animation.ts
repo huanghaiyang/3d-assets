@@ -1690,6 +1690,7 @@ export const useAnimationStore = defineStore('animation', () => {
     refreshingCovers,
     refreshCover,
     projectCoverKey,
+    projectCoverUrl,
     refreshProjectCover,
     isRefreshingCover,
     resetThumbQueue,

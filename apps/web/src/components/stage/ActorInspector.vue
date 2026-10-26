@@ -1,12 +1,34 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import Icon from '../ui/Icon.vue';
 import { useStageStore } from '@/stores/stage';
+import { animationApi } from '@/api/animation';
 import type { ActorKind } from '@/viewer/stage/StageTypes';
 
 const store = useStageStore();
 
-const fbxFiles = computed(() => store.files.slice(0, 400));
+/** 模型选择器：用封面网格代替原生下拉，避免盲选 */
+const modelPickerOpen = ref(false);
+const modelKeyword = ref('');
+const modelOptions = computed(() => {
+  const query = modelKeyword.value.trim().toLowerCase();
+  const list = query
+    ? store.files.filter((file) => file.relative.toLowerCase().includes(query))
+    : store.files;
+  return list.slice(0, 120);
+});
+
+function modelCover(path: string): string {
+  return animationApi.animationCoverUrl(path, 192, 0.35);
+}
+
+function chooseModel(path: string): void {
+  const actor = store.selectedActor;
+  if (!actor) return;
+  modelPickerOpen.value = false;
+  if (actor.modelPath === path) return;
+  store.updateActorModel(actor.id, path);
+}
 
 const actorLocked = computed(() =>
   store.selectedActorId ? store.isActorLocked(store.selectedActorId) : false,
@@ -112,18 +134,26 @@ function onNumberInput(axis: 'x' | 'z' | 'yaw', event: Event): void {
         />
       </label>
 
-      <label v-if="store.selectedActor.kind === 'fbx'" class="field">
-        <span class="field-label">模型 · {{ actorModelName(store.selectedActor.modelPath) }}</span>
-        <select
-          class="select-input"
-          :value="store.selectedActor.modelPath ?? ''"
+      <div v-if="store.selectedActor.kind === 'fbx'" class="field">
+        <span class="field-label">模型</span>
+        <button
+          class="model-current"
+          type="button"
           :disabled="store.catalogLoading || actorLocked"
-          @change="store.updateActorModel(store.selectedActor!.id, ($event.target as HTMLSelectElement).value)"
+          :title="store.catalogLoading ? '动画库加载中…' : '点击选择模型（带封面预览）'"
+          @click="modelPickerOpen = true"
         >
-          <option v-if="store.catalogLoading" value="">动画库加载中…</option>
-          <option v-for="file in fbxFiles" :key="file.path" :value="file.path">{{ file.relative }}</option>
-        </select>
-      </label>
+          <img
+            v-if="store.selectedActor.modelPath"
+            class="model-cover"
+            :src="modelCover(store.selectedActor.modelPath)"
+            :alt="actorModelName(store.selectedActor.modelPath)"
+          />
+          <span v-else class="model-cover placeholder"><Icon name="cube" :size="14" /></span>
+          <span class="model-name">{{ actorModelName(store.selectedActor.modelPath) }}</span>
+          <Icon name="chevronDown" :size="12" />
+        </button>
+      </div>
 
       <div class="grid-3">
         <label class="field">
@@ -142,6 +172,38 @@ function onNumberInput(axis: 'x' | 'z' | 'yaw', event: Event): void {
       <p v-if="actorLocked" class="hint locked">过渡动画生成期间，该角色已锁定：不能删除、移动或换模型</p>
       <p v-else class="hint">也可以在视口里直接拖拽选中的角色（移动 X/Z 或绕 Y 旋转）</p>
     </template>
+
+    <Teleport to="body">
+      <div v-if="modelPickerOpen" class="picker-mask" @click.self="modelPickerOpen = false">
+        <div class="picker panel">
+          <div class="picker-head">
+            <span class="section-title"><Icon name="cube" :size="12" />选择模型</span>
+            <button class="btn btn-icon" type="button" title="关闭" @click="modelPickerOpen = false">
+              <Icon name="close" :size="13" />
+            </button>
+          </div>
+          <input v-model="modelKeyword" class="text-input" type="search" placeholder="搜索模型文件名" />
+          <p v-if="store.catalogLoading" class="hint">动画库加载中…</p>
+          <div v-else class="picker-grid">
+            <button
+              v-for="file in modelOptions"
+              :key="file.path"
+              class="model-card"
+              :class="{ active: file.path === store.selectedActor?.modelPath }"
+              type="button"
+              :title="file.relative"
+              @click="chooseModel(file.path)"
+            >
+              <div class="model-card-cover">
+                <img :src="modelCover(file.path)" :alt="file.name" loading="lazy" />
+              </div>
+              <span class="model-card-name">{{ file.relative }}</span>
+            </button>
+            <p v-if="modelOptions.length === 0" class="hint">没有匹配的模型</p>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -272,6 +334,136 @@ function onNumberInput(axis: 'x' | 'z' | 'yaw', event: Event): void {
 .mini.disabled {
   opacity: 0.3;
   pointer-events: none;
+}
+
+.model-current {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 38px;
+  padding: 3px 8px 3px 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-app);
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: left;
+}
+
+.model-current:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.model-current:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.model-cover {
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+  object-fit: cover;
+  flex: none;
+  background: #171922;
+}
+
+.model-cover.placeholder {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+}
+
+.model-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.picker-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4, 6, 12, 0.62);
+}
+
+.picker {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(720px, 92vw);
+  max-height: 78vh;
+  padding: 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  box-shadow: var(--shadow);
+}
+
+.picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.picker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
+  gap: 8px;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.model-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel-2);
+  text-align: left;
+}
+
+.model-card:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+}
+
+.model-card.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.model-card-cover {
+  aspect-ratio: 1 / 1;
+  border-radius: 4px;
+  overflow: hidden;
+  background: #171922;
+}
+
+.model-card-cover img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.model-card-name {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .field {

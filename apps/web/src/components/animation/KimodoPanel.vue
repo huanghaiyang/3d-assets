@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import VueJsonPretty from 'vue-json-pretty';
 import 'vue-json-pretty/lib/styles.css';
 import Icon from '../ui/Icon.vue';
 import KimodoPreview from './KimodoPreview.vue';
+import MotionThumb from './MotionThumb.vue';
 import {
   kimodoApi,
   type EnhancePromptResult,
@@ -303,6 +304,83 @@ const artifactContent = ref<KimodoArtifactContent | null>(null);
 const artifactContentLoading = ref(false);
 const artifactContentError = ref<string | null>(null);
 
+// ===== .f32 产物可视化：root + rotations 渲染骨架，只有 root 的渲染轨迹 =====
+const f32Root = shallowRef<Float32Array | null>(null);
+const f32Rotations = shallowRef<Float32Array | null>(null);
+const f32Loading = ref(false);
+const f32Error = ref<string | null>(null);
+/** 只有根位置（例如平移后的 next root）时用俯视轨迹图展示 */
+const f32Trajectory = ref(false);
+const f32FrameCount = computed(() => (f32Root.value ? Math.floor(f32Root.value.length / 3) : 0));
+
+/** root 产物配对的旋转产物 key（平移后的 root 没有配对旋转） */
+function pairedRotationKey(key: string): string | null {
+  if (key === 'root') return 'rotations';
+  if (key === 'prev-root') return 'prev-rot';
+  if (key === 'next-root') return 'next-rot';
+  return null;
+}
+
+/** rotations 产物配对的根产物 key */
+function pairedRootKey(key: string): string | null {
+  if (key === 'rotations') return 'root';
+  if (key === 'prev-rot') return 'prev-root';
+  if (key === 'next-rot') return 'next-root';
+  return null;
+}
+
+let f32Token = 0;
+
+/** 读取 f32 产物并把骨架/轨迹数据交给预览组件 */
+async function loadF32Preview(key: string | null): Promise<void> {
+  const id = artifactTaskId.value;
+  const token = ++f32Token;
+  f32Root.value = null;
+  f32Rotations.value = null;
+  f32Error.value = null;
+  f32Loading.value = false;
+  f32Trajectory.value = false;
+  if (!id || !key) return;
+
+  const available = (candidate: string): boolean =>
+    artifactData.value?.artifacts.some(
+      (entry) => entry.key === candidate && entry.exists && entry.format === 'f32',
+    ) ?? false;
+  if (!available(key)) return;
+
+  const rotationKey = pairedRotationKey(key);
+  const rootKey = pairedRootKey(key);
+  f32Loading.value = true;
+  try {
+    if (rootKey) {
+      const [rotations, root] = await Promise.all([
+        kimodoApi.artifactF32(id, key),
+        kimodoApi.artifactF32(id, rootKey),
+      ]);
+      if (token !== f32Token) return;
+      f32Rotations.value = rotations;
+      f32Root.value = root;
+    } else if (rotationKey && available(rotationKey)) {
+      const [root, rotations] = await Promise.all([
+        kimodoApi.artifactF32(id, key),
+        kimodoApi.artifactF32(id, rotationKey),
+      ]);
+      if (token !== f32Token) return;
+      f32Root.value = root;
+      f32Rotations.value = rotations;
+    } else {
+      const root = await kimodoApi.artifactF32(id, key);
+      if (token !== f32Token) return;
+      f32Root.value = root;
+      f32Trajectory.value = true;
+    }
+  } catch (err) {
+    if (token === f32Token) f32Error.value = (err as Error).message;
+  } finally {
+    if (token === f32Token) f32Loading.value = false;
+  }
+}
+
 /** vue-json-pretty 需要可索引对象 */
 const artifactJson = computed<Record<string, unknown> | unknown[] | null>(() => {
   const content = artifactContent.value;
@@ -414,9 +492,11 @@ async function pickArtifact(key: string): Promise<void> {
   }
 }
 
-/** 选中产物：文本类拉取内容；.f32 为二进制，只展示完整元信息 */
+/** 选中产物：文本类拉取内容；.f32 读取二进制做骨架/轨迹预览并展示完整元信息 */
 function selectArtifact(entry: KimodoArtifact): void {
   artifactKey.value = entry.key;
+  if (entry.format === 'f32') void loadF32Preview(entry.key);
+  else void loadF32Preview(null);
   if (entry.exists && entry.viewable) {
     void pickArtifact(entry.key);
     return;
@@ -428,6 +508,7 @@ function selectArtifact(entry: KimodoArtifact): void {
 
 function closeArtifacts(): void {
   artifactOpen.value = false;
+  void loadF32Preview(null);
 }
 
 /** 跳到关联的新建动画（关闭抽屉，直接进入编辑） */
@@ -1299,7 +1380,31 @@ onBeforeUnmount(() => {
               </div>
 
               <div v-if="artifactSelected && !artifactSelected.viewable" class="f32-view">
-                <div class="f32-badge">二进制 .f32 · 不可文本预览</div>
+                <div class="f32-badge">二进制 .f32 · 已渲染为可视化预览</div>
+
+                <div v-if="artifactSelected.format === 'f32'" class="f32-preview">
+                  <p v-if="f32Loading" class="f32-note">读取 .f32 数据…</p>
+                  <p v-else-if="f32Error" class="f32-note err">{{ f32Error }}</p>
+                  <template v-else-if="f32Root">
+                    <div v-if="f32Trajectory" class="f32-trajectory">
+                      <MotionThumb :root="f32Root" mode="trajectory" :size="220" />
+                      <p class="f32-note">根位置轨迹（俯视）：绿点=起始，黄点=结束</p>
+                    </div>
+                    <template v-else>
+                      <div class="f32-stage">
+                        <KimodoPreview
+                          :animation-id="artifactTaskId ?? ''"
+                          :skeleton="skeleton"
+                          :root-data="f32Root"
+                          :rotation-data="f32Rotations"
+                          job-status="ready"
+                          stage="ready"
+                        />
+                      </div>
+                      <p class="f32-note">{{ f32FrameCount }} 帧 · 可拖动旋转视角、播放/拖拽进度</p>
+                    </template>
+                  </template>
+                </div>
                 <dl class="f32-grid">
                   <div>
                     <dt>产物</dt>
@@ -2188,6 +2293,33 @@ onBeforeUnmount(() => {
   font-size: 11px;
   line-height: 1.5;
   color: var(--text-dim);
+}
+
+/* f32 产物的骨架/轨迹预览 */
+.f32-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.f32-stage {
+  display: flex;
+  height: 260px;
+  min-height: 0;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.f32-trajectory {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.f32-note.err {
+  color: var(--danger);
 }
 
 /* 生成进度与状态提示 */

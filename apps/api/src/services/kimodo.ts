@@ -1477,6 +1477,26 @@ class KimodoService {
     return { key, file, format, size, text, truncated };
   }
 
+  /**
+   * 读取 .f32 二进制产物：给前端把中间产物渲染成骨架 / 轨迹预览用。
+   *
+   * 只放行产物清单里 format 为 f32 且存在的产物；absolutePath 可能指向
+   * 其他动画的输出目录（例如 conditioned 的 prev/next 约束切片），因此按清单走。
+   */
+  async readArtifactF32(id: string, key: string): Promise<Buffer | null> {
+    const listing = await this.artifacts(id);
+    if (!listing) return null;
+    const artifact = listing.artifacts.find((item) => item.key === key);
+    if (!artifact || artifact.format !== 'f32' || !artifact.exists || !artifact.absolutePath) return null;
+    const MAX_BYTES = 16 * 1024 * 1024;
+    if (artifact.size <= 0 || artifact.size > MAX_BYTES) return null;
+    try {
+      return fs.readFileSync(artifact.absolutePath);
+    } catch {
+      return null;
+    }
+  }
+
   /** 任务目录里的分段提示词文件，按序号排序 */
   private segmentFiles(dir: string): string[] {
     try {

@@ -157,6 +157,9 @@ export class StagePlayer {
 
   /** 当前 gizmo 拖动的起始帧残影（为 null 时拖动角色摆放） */
   private poseTarget: StartGhostEntry | null = null;
+  /** 左键按下位置：用于区分「点选」与「拖拽旋转视角」 */
+  private pointerDownX = 0;
+  private pointerDownY = 0;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -239,6 +242,7 @@ export class StagePlayer {
     });
     this.scene.add(this.transform.getHelper());
 
+    this.renderer.domElement.addEventListener('pointerdown', this.onPointerDown);
     this.renderer.domElement.addEventListener('pointerup', this.onPointerUp);
 
     this.resizeObserver = new ResizeObserver(() => this.resize());
@@ -497,6 +501,7 @@ export class StagePlayer {
     this.token += 1;
     this.renderer.setAnimationLoop(null);
     this.resizeObserver.disconnect();
+    this.renderer.domElement.removeEventListener('pointerdown', this.onPointerDown);
     this.renderer.domElement.removeEventListener('pointerup', this.onPointerUp);
     this.transform.detach();
     this.transform.dispose();
@@ -1321,8 +1326,17 @@ export class StagePlayer {
     }
   }
 
+  private onPointerDown = (event: PointerEvent): void => {
+    if (event.button !== 0) return;
+    this.pointerDownX = event.clientX;
+    this.pointerDownY = event.clientY;
+  };
+
   private onPointerUp = (event: PointerEvent): void => {
     if (this.transform.dragging) return;
+    // 拖动左键旋转/平移视角后抬起：只结束相机操作，不改变角色、残影或洋葱皮的选中状态
+    const moved = Math.hypot(event.clientX - this.pointerDownX, event.clientY - this.pointerDownY);
+    if (moved > 4) return;
     const rect = this.renderer.domElement.getBoundingClientRect();
     const pointer = new THREE.Vector2(
       ((event.clientX - rect.left) / rect.width) * 2 - 1,

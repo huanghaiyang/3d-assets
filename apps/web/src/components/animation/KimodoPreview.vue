@@ -13,7 +13,17 @@ const props = defineProps<{
   progress?: number;
   /** 阶段文案（例如「扩散采样与动作解码」），排队时是排队提示 */
   stage?: string;
+  /** 中间产物预览：直接给 root / rotations 数据，不再按 animationId 请求 motion 接口 */
+  rootData?: Float32Array | null;
+  rotationData?: Float32Array | null;
 }>();
+
+/** 外部传入的 f32 数据（中间产物面板用） */
+const hasExternal = computed(
+  () =>
+    Boolean(props.rootData && props.rootData.length > 0) &&
+    Boolean(props.rotationData && props.rotationData.length > 0),
+);
 
 /** 任务还在排队/生成中：还没有 .f32 结果，不要去请求 motion 接口 */
 const generating = computed(() => props.jobStatus === 'queued' || props.jobStatus === 'running');
@@ -263,6 +273,21 @@ function clearRig(): void {
 }
 
 async function load(): Promise<void> {
+  // 中间产物预览：数据由外部直接给出，不需要再请求接口
+  if (hasExternal.value) {
+    clearRig();
+    loading.value = false;
+    error.value = null;
+    rotations = props.rotationData ?? null;
+    rootPositions = props.rootData ?? null;
+    totalFrames.value = rootPositions ? Math.floor(rootPositions.length / 3) : 0;
+    if (totalFrames.value > 0 && props.skeleton) {
+      buildRig(props.skeleton);
+      fitCamera();
+    }
+    applyFrame(0);
+    return;
+  }
   if (!props.animationId || !props.skeleton) return;
   // 排队/生成中的任务还没有动作文件，直接展示 loading，不发起请求
   if (generating.value) {
@@ -298,6 +323,8 @@ async function load(): Promise<void> {
 }
 
 watch(() => props.animationId, load);
+// 中间产物面板切换产物时直接换数据源
+watch(() => [props.rootData, props.rotationData], () => void load());
 watch(() => props.skeleton, (value) => {
   if (value) void load();
 });
@@ -383,7 +410,7 @@ function scrub(value: number): void {
       <Icon name="refresh" :size="14" class="spin" /> 读取动作数据…
     </div>
     <div v-else-if="error" class="hint error">{{ error }}</div>
-    <div v-else-if="!animationId" class="hint">从左侧选一条已生成的动画查看预览</div>
+    <div v-else-if="!animationId && !hasExternal" class="hint">从左侧选一条已生成的动画查看预览</div>
 
     <div class="controls">
       <button class="btn btn-ghost btn-icon" type="button" :title="playing ? '暂停' : '播放'" @click="playing = !playing">

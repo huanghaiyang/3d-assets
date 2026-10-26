@@ -273,6 +273,15 @@ export async function registerKimodoRoutes(app: FastifyInstance): Promise<void> 
     }
   });
 
+  /** 读取单个 .f32 产物原始字节：前端据此渲染骨架 / 轨迹预览 */
+  app.get('/api/kimodo/animations/:id/artifact.f32', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const key = (request.query as { key?: string }).key?.trim() ?? '';
+    const buffer = await kimodoService.readArtifactF32(id, key);
+    if (!buffer) return reply.code(404).send({ error: '产物不存在或不可预览' });
+    return reply.type('application/octet-stream').header('cache-control', 'no-store').send(buffer);
+  });
+
   /** 任务列表（含历史任务） */
   app.get('/api/kimodo/animations', async () => kimodoService.list());
 

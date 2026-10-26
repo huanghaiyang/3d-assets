@@ -119,9 +119,9 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const selectedId = ref<string | null>(null);
   const toasts = ref<Toast[]>([]);
   /** 跨页面跳转请求：App 消费后清空（如舞台「去编辑」跳到动画页） */
-  const pageRequest = ref<'workbench' | 'animations' | 'stage' | null>(null);
+  const pageRequest = ref<'workbench' | 'animations' | 'stage' | 'strips' | null>(null);
 
-  function requestPage(next: 'workbench' | 'animations' | 'stage'): void {
+  function requestPage(next: 'workbench' | 'animations' | 'stage' | 'strips'): void {
     pageRequest.value = next;
   }
 

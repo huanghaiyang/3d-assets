@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import Icon from '../ui/Icon.vue';
+import MotionThumb from '../animation/MotionThumb.vue';
 import { useStageStore, type TransitionTask } from '@/stores/stage';
 import { buildTimeline } from '@/viewer/stage/SequenceTimeline';
 import { resolveSegmentColor } from '@/viewer/stage/segmentColors';
-import type { AnimationFile } from '@/api/animation';
+import { animationApi, type AnimationFile, type SavedAnimationProject } from '@/api/animation';
 import type { SegmentDef } from '@/viewer/stage/StageTypes';
 
 const store = useStageStore();
@@ -97,6 +98,19 @@ function projectMeta(projectId: string): string {
   const project = store.animationProjects.find((item) => item.id === projectId);
   if (!project) return '';
   return `${project.clipCount} 段 · ${project.trackCount} 轨`;
+}
+
+/** 动画库 FBX 封面：后端按文件自带动画取帧渲染 */
+function fileCover(path: string): string {
+  return animationApi.animationCoverUrl(path, 192, 0.35);
+}
+
+/** 新建动画项目封面：按项目里保存的动画数据取姿势 */
+function projectCover(project: SavedAnimationProject): string {
+  return animationApi.animationCoverUrl('', 192, 0.35, {
+    project: project.id,
+    version: project.updatedAt,
+  });
 }
 
 /** 逐段行数据：附带与上一段之间的过渡任务、冻结状态 */
@@ -363,13 +377,16 @@ function regenTitle(id: string): string {
           <button
             v-for="file in filteredFiles"
             :key="file.path"
-            class="row"
+            class="row cover-row"
             :class="{ active: openFile?.path === file.path }"
             type="button"
             @click="chooseFile(file)"
           >
-            <Icon name="cube" :size="12" />
-            <span class="row-name">{{ file.relative }}</span>
+            <img class="row-cover" :src="fileCover(file.path)" :alt="file.name" loading="lazy" />
+            <span class="row-main">
+              <span class="row-name">{{ file.relative }}</span>
+            </span>
+            <Icon v-if="openFile?.path === file.path" name="check" :size="12" />
           </button>
           <div v-if="filteredFiles.length === 0" class="empty">
             {{ store.catalogLoading ? '动画库加载中…' : '动画库里没有匹配的 FBX' }}
@@ -397,10 +414,18 @@ function regenTitle(id: string): string {
 
       <template v-else-if="pickerTab === 'kimodo'">
         <div class="list">
-          <button v-for="job in store.kimodoJobs" :key="job.id" class="row" type="button" @click="addKimodo(job.id)">
-            <Icon name="sparkle" :size="12" />
-            <span class="row-name">{{ jobTitle(job.id) }}</span>
-            <span class="faint mono">{{ format(store.kimodoDuration(job.id)) }}s</span>
+          <button
+            v-for="job in store.kimodoJobs"
+            :key="job.id"
+            class="row cover-row"
+            type="button"
+            @click="addKimodo(job.id)"
+          >
+            <MotionThumb class="row-cover" :skeleton="store.somaSkeleton" :animation-id="job.id" :size="40" />
+            <span class="row-main">
+              <span class="row-name">{{ jobTitle(job.id) }}</span>
+              <span class="row-sub faint mono">{{ job.frames }} 帧 · {{ format(store.kimodoDuration(job.id)) }}s</span>
+            </span>
           </button>
           <div v-if="store.kimodoJobs.length === 0" class="empty">还没有生成完成的 Kimodo 动作</div>
         </div>
@@ -414,13 +439,15 @@ function regenTitle(id: string): string {
           <button
             v-for="project in store.animationProjects"
             :key="project.id"
-            class="row"
+            class="row cover-row"
             type="button"
             @click="addAnimationProject(project.id, project.name)"
           >
-            <Icon name="film" :size="12" />
-            <span class="row-name">{{ project.name }}</span>
-            <span class="faint mono">{{ projectMeta(project.id) }}</span>
+            <img class="row-cover" :src="projectCover(project)" :alt="project.name" loading="lazy" />
+            <span class="row-main">
+              <span class="row-name">{{ project.name }}</span>
+              <span class="row-sub faint mono">{{ projectMeta(project.id) }}</span>
+            </span>
           </button>
           <div v-if="store.animationProjects.length === 0" class="empty">「新建动画」工作区里还没有保存的动画</div>
         </div>
@@ -754,6 +781,33 @@ function regenTitle(id: string): string {
   color: var(--text-dim);
   font-size: 12px;
   text-align: left;
+}
+
+/* 带封面的选择行：左侧缩略图 + 名称/元信息两行 */
+.cover-row {
+  gap: 8px;
+  padding: 4px 6px;
+}
+
+.row-cover {
+  width: 40px;
+  height: 40px;
+  flex: none;
+  border-radius: 4px;
+  object-fit: cover;
+  background: #171922;
+}
+
+.row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+
+.row-sub {
+  font-size: 10px;
 }
 
 .row:hover {
