@@ -41,8 +41,10 @@ import {
   importKimodoAnimation,
   kimodoService,
   type KimodoAnimation,
+  type KimodoPromptSegment,
 } from './services/kimodo.js';
-import { enhancePrompt, promptEnhancerReady } from './services/promptEnhance.js';
+import { enhancePrompt, promptEnhancerReady, refinePrompt } from './services/promptEnhance.js';
+import { SOMA_SKELETON } from './services/soma-skeleton.js';
 
 const SERVER_INFO = { name: 'h3d-3d-workbench', version: '1.0.0' };
 const PROTOCOL_VERSION = '2024-11-05';
@@ -68,6 +70,11 @@ function publicJob(job: KimodoAnimation): Record<string, unknown> {
     status: job.status,
     createdAt: job.createdAt,
     durationMs: job.durationMs ?? null,
+    note: job.note ?? null,
+    segments: job.segments ?? null,
+    startedAt: job.startedAt ?? null,
+    etaMs: job.etaMs ?? null,
+    loadMs: job.loadMs ?? null,
     error: job.error ? scrub(job.error) : null,
   };
 }
@@ -118,6 +125,23 @@ function requireString(args: Args, key: string): string {
   const value = readString(args, key)?.trim();
   if (!value) throw new Error(`缺少参数 ${key}`);
   return value;
+}
+
+/** 读取分段提示词数组，过滤非法项；空数组返回 undefined */
+function readSegments(args: Args): KimodoPromptSegment[] | undefined {
+  const raw = args.segments;
+  if (!Array.isArray(raw)) return undefined;
+  const segments = raw
+    .filter(
+      (item): item is { prompt: unknown; frames: unknown } =>
+        !!item && typeof item === 'object' && 'prompt' in item,
+    )
+    .map((item) => ({
+      prompt: typeof item.prompt === 'string' ? item.prompt.trim() : '',
+      frames: typeof item.frames === 'number' ? Math.round(item.frames) : Number(item.frames) || 0,
+    }))
+    .filter((item) => item.prompt.length > 0);
+  return segments.length > 0 ? segments : undefined;
 }
 
 /** 项目 JSON 里记录的基础模型信息（不校验磁盘，MCP 只读写项目数据） */
@@ -329,25 +353,51 @@ const tools: ToolDefinition[] = [
   },
   {
     name: 'kimodo_generate',
-    description: '提交一次文生动作任务（后台串行执行，立即返回排队中的任务）',
+    description:
+      '提交一次文生动作任务（后台串行执行，立即返回排队中的任务）。支持单段 prompt 或多段 segments（至少 2 段，段间自动过渡）',
     inputSchema: objectSchema(
       {
-        prompt: { type: 'string', description: '英文动作提示词' },
+        prompt: { type: 'string', description: '英文动作提示词（单段模式）' },
         frames: { type: 'number', description: '帧数，默认 60（8–300）' },
         steps: { type: 'number', description: '扩散步数，默认 20' },
         seed: { type: 'number', description: '随机种子，<=0 或留空表示随机' },
         transitionFrames: { type: 'number', description: '首尾过渡帧，默认 5' },
+        segments: {
+          type: 'array',
+          description:
+            '复合动作分段：[{ prompt, frames }]，至少 2 段才生效；提供后忽略顶层 prompt',
+          items: {
+            type: 'object',
+            properties: {
+              prompt: { type: 'string', description: '该段英文动作提示词' },
+              frames: { type: 'number', description: '该段帧数' },
+            },
+            required: ['prompt', 'frames'],
+          },
+        },
       },
       ['prompt'],
     ),
     handler: (args) => {
+      const segments = readSegments(args);
       const job = kimodoService.submit({
         prompt: requireString(args, 'prompt'),
         frames: readNumber(args, 'frames') ?? 60,
         steps: readNumber(args, 'steps') ?? 20,
         seed: readNumber(args, 'seed'),
         transitionFrames: readNumber(args, 'transitionFrames'),
+        segments,
       });
+      return { task: publicJob(job) };
+    },
+  },
+  {
+    name: 'kimodo_get_animation',
+    description: '读取单个 Kimodo 生成任务（含状态、进度、注释、分段等）',
+    inputSchema: objectSchema({ id: idProperty }, ['id']),
+    handler: (args) => {
+      const job = kimodoService.get(requireString(args, 'id'));
+      if (!job) throw new Error('任务不存在');
       return { task: publicJob(job) };
     },
   },
@@ -356,6 +406,34 @@ const tools: ToolDefinition[] = [
     description: '列出 Kimodo 生成任务（含历史任务）',
     inputSchema: objectSchema({}),
     handler: () => ({ animations: kimodoService.list().map(publicJob) }),
+  },
+  {
+    name: 'kimodo_update_note',
+    description: '给生成结果添加 / 修改注释（传空字符串表示清除）',
+    inputSchema: objectSchema(
+      {
+        id: idProperty,
+        note: { type: 'string', description: '注释内容（最长 200 字，空串清除）' },
+      },
+      ['id', 'note'],
+    ),
+    handler: (args) => {
+      const id = requireString(args, 'id');
+      const note = readString(args, 'note') ?? '';
+      const updated = kimodoService.updateNote(id, note.slice(0, 200));
+      if (!updated) throw new Error('任务不存在');
+      return { task: publicJob(updated) };
+    },
+  },
+  {
+    name: 'kimodo_delete_animation',
+    description: '删除生成结果（生成中的任务不可删除）',
+    inputSchema: objectSchema({ id: idProperty }, ['id']),
+    handler: (args) => {
+      const ok = kimodoService.remove(requireString(args, 'id'));
+      if (!ok) throw new Error('无法删除该任务（任务不存在或正在生成中）');
+      return { ok: true };
+    },
   },
   {
     name: 'kimodo_import_animation',
@@ -452,16 +530,61 @@ const tools: ToolDefinition[] = [
       image: { type: 'string', description: '可选：参考图片的 data URL（data:image/png;base64,...）' },
     }),
     handler: async (args) => {
+      const prompt = readString(args, 'prompt') ?? '';
+      const image = readString(args, 'image');
+      if (!prompt.trim() && !image) throw new Error('请提供描述文字或参考图片');
       if (!promptEnhancerReady()) {
         throw new Error(
           '服务端未配置提示词模型：请设置 KIMODO_PROMPT_PROVIDER 与对应的 API Key（默认 DeepSeek 用 DEEPSEEK_API_KEY）',
         );
       }
-      return enhancePrompt({
-        prompt: readString(args, 'prompt'),
-        image: readString(args, 'image'),
-      });
+      return enhancePrompt({ prompt, image });
     },
+  },
+  {
+    name: 'kimodo_refine_prompt',
+    description:
+      '按用户修改后的动作拆解步骤重新生成英文提示词与分段。步骤是唯一事实来源，模型只负责转译身体动力学英文',
+    inputSchema: objectSchema(
+      {
+        steps: {
+          type: 'array',
+          description: '按时间顺序的中文动作步骤（至少 1 条）',
+          items: { type: 'string' },
+        },
+        objects: {
+          type: 'array',
+          description: '可选：原描述里的物体名，仅用于提示模型不要写物体接触',
+          items: { type: 'string' },
+        },
+        note: { type: 'string', description: '可选：上次转译的说明，帮助模型保持上下文' },
+      },
+      ['steps'],
+    ),
+    handler: async (args) => {
+      const steps = Array.isArray(args.steps)
+        ? args.steps
+            .filter((step): step is string => typeof step === 'string')
+            .map((step) => step.trim())
+            .filter(Boolean)
+        : [];
+      if (steps.length === 0) throw new Error('请先填写至少一个动作步骤');
+      const objects = Array.isArray(args.objects)
+        ? args.objects.filter((item): item is string => typeof item === 'string')
+        : [];
+      if (!promptEnhancerReady()) {
+        throw new Error(
+          '服务端未配置提示词模型：请设置 KIMODO_PROMPT_PROVIDER 与对应的 API Key',
+        );
+      }
+      return refinePrompt({ steps, objects, note: readString(args, 'note') });
+    },
+  },
+  {
+    name: 'kimodo_skeleton',
+    description: '返回 SOMA RP v1.1 骨架定义（关节名、父子关系、T-pose 偏移）',
+    inputSchema: objectSchema({}),
+    handler: () => SOMA_SKELETON,
   },
 ];
 
