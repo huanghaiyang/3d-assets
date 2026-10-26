@@ -24,6 +24,7 @@ import {
   type TimelinePlan,
 } from './StageTypes';
 import { clipsFromAnimationData } from './clipFromAnimationData';
+import { segmentColorNumber } from './segmentColors';
 
 export type GizmoMode = 'translate' | 'rotate';
 
@@ -58,6 +59,8 @@ interface ActorRuntime {
   poses: SegmentPose[];
   /** 与 plan.timings 同序的段 id */
   segmentIds: string[];
+  /** 与 plan.timings 同序的段标识色（自定义色或按序号生成） */
+  colors: number[];
   footLock: FootLock;
   /** 每段动画起始帧的洋葱皮残影（常驻，不随时间变化） */
   startGhosts: StartGhostEntry[];
@@ -80,7 +83,6 @@ const ONION_OPACITY = [0.18, 0.26, 0.12];
 
 /** 路径曲线：每段采样点数；每段起始帧残影与路径共用同一套分段色 */
 const PATH_SAMPLES = 36;
-const SEGMENT_COLORS = [0x60a5fa, 0xf472b6, 0x34d399, 0xfbbf24, 0xa78bfa, 0x22d3ee];
 
 /** 段间站位差超过该值即视为换位过渡 */
 const TRAVEL_EPSILON = 0.05;
@@ -111,6 +113,8 @@ export class StagePlayer {
   private skeletonCache: Promise<SomaSkeleton | null> | null = null;
 
   private signature = '';
+  /** 只在片段起点变化时更新：时间轴拖动不必重建 action / 残影 */
+  private timingSignature = '';
   private token = 0;
   private selectedId: string | null = null;
   private gizmoMode: GizmoMode | null = null;
@@ -129,9 +133,20 @@ export class StagePlayer {
   /** 结尾帧残影开关：独立于运动残影，默认开启 */
   private showEndGhosts = false;
   private showPath = false;
+  /** 在起始/结尾残影头顶标注动画序号 */
+  private showNumbers = false;
+  /** 渲染骨架连线 */
+  private showSkeleton = false;
+  /** 骨骼连线覆盖层：按角色 id 索引 */
+  private readonly skeletonOverlays = new Map<
+    string,
+    { line: THREE.LineSegments; pairs: { parent: THREE.Object3D; child: THREE.Object3D }[] }
+  >();
   private lastEmit = 0;
   private disposed = false;
   private readonly ikTarget = new THREE.Vector3();
+  /** 骨骼连线采样用的临时点 */
+  private readonly skeletonPoint = new THREE.Vector3();
 
   private frameListeners: ((state: StageFrameState) => void)[] = [];
   private noticeListeners: ((message: string) => void)[] = [];
@@ -291,11 +306,13 @@ export class StagePlayer {
         segment.source,
         segment.trimStart,
         segment.trimEnd,
-        segment.blendIn,
         segment.pose ?? null,
         segment.transition ?? null,
+        segment.color ?? null,
       ]),
     ]);
+    // 起点只影响时序，不触发重建；单独比较即可低成本拖动时间轴
+    const timingSignature = JSON.stringify(doc.segments.map((segment) => segment.start ?? null));
 
     // 摆放与可见性直接生效，不需要重建 action
     for (const def of doc.actors) {
@@ -307,14 +324,28 @@ export class StagePlayer {
     }
 
     if (signature === this.signature) {
+      if (timingSignature !== this.timingSignature) {
+        this.timingSignature = timingSignature;
+        this.refreshTimings(doc);
+      }
       this.apply(this.time);
       this.emit(true);
       return;
     }
     this.signature = signature;
+    this.timingSignature = timingSignature;
 
     const token = (this.token += 1);
     await this.rebuild(doc, token);
+  }
+
+  /** 只重算每段时序与总时长（时间轴拖动/插入对齐后调用），不重建 action 与残影 */
+  private refreshTimings(doc: StageDoc): void {
+    for (const [id, runtime] of this.runtimes) {
+      runtime.plan = buildTimeline(actorSegments(doc, id));
+    }
+    this.durationValue = Math.max(0, ...[...this.runtimes.values()].map((runtime) => runtime.plan.total));
+    this.time = THREE.MathUtils.clamp(this.time, 0, this.durationValue);
   }
 
   setSelectedActor(id: string | null): void {
@@ -349,6 +380,39 @@ export class StagePlayer {
     this.showPath = enabled;
     this.refreshPath();
     this.apply(this.time);
+  }
+
+  /** 残影头顶的动画序号开关：重建残影即可（标签挂在残影根节点上） */
+  setShowNumbers(enabled: boolean): void {
+    if (this.showNumbers === enabled) return;
+    this.showNumbers = enabled;
+    this.refreshGhosts();
+    this.apply(this.time);
+  }
+
+  /** 骨骼连线开关：按当前角色建/销毁覆盖层 */
+  setShowSkeleton(enabled: boolean): void {
+    if (this.showSkeleton === enabled) return;
+    this.showSkeleton = enabled;
+    this.refreshSkeletons();
+    this.apply(this.time);
+  }
+
+  /**
+   * 某段片段自身根运动带来的实际水平位移（米，舞台单位）。
+   * 按裁剪区间首尾各采样一次双脚中点，取两点直线距离。
+   */
+  measureTravel(actorId: string, segmentId: string): number | null {
+    const runtime = this.runtimes.get(actorId);
+    if (!runtime || !runtime.actor.ready) return null;
+    const index = runtime.segmentIds.indexOf(segmentId);
+    const timing = runtime.plan.timings[index];
+    const clip = runtime.clips[index]?.clip;
+    if (index < 0 || !timing || !clip) return null;
+    const start = runtime.actor.sampleFeetCenter(clip, timing.trimStart);
+    const end = runtime.actor.sampleFeetCenter(clip, timing.trimStart + timing.length);
+    if (!start || !end) return null;
+    return Math.hypot(end.x - start.x, end.z - start.z);
   }
 
   setGizmoMode(mode: GizmoMode | null): void {
@@ -438,6 +502,7 @@ export class StagePlayer {
     this.transform.dispose();
     this.controls.dispose();
     this.clearActors();
+    this.disposeSkeletonOverlays();
     this.renderer.dispose();
     this.renderer.domElement.remove();
   }
@@ -451,6 +516,7 @@ export class StagePlayer {
       runtime.actor.dispose();
     }
     this.runtimes.clear();
+    this.disposeSkeletonOverlays();
     this.poseTarget = null;
     this.selectionRing.visible = false;
     this.transform.detach();
@@ -490,6 +556,7 @@ export class StagePlayer {
           clips: [],
           poses: [],
           segmentIds: [],
+          colors: [],
           footLock: new FootLock(),
           startGhosts: [],
           endGhosts: [],
@@ -507,6 +574,8 @@ export class StagePlayer {
       runtime.clips = clips;
       runtime.poses = segments.map((segment) => ({ ...(segment.pose ?? ZERO_SEGMENT_POSE) }));
       runtime.segmentIds = segments.map((segment) => segment.id);
+      // 颜色只跟序号与自定义色有关，重建时一起算好，残影/路径共用
+      runtime.colors = segments.map((segment, index) => segmentColorNumber(index, segment.color));
       runtime.plan = plan;
       runtime.actor.buildSequence(clips);
       // pose 显式设置过 = 用户手动摆过该段站位，位置以 pose 为准，不再累加前序根位移
@@ -520,6 +589,7 @@ export class StagePlayer {
 
     this.durationValue = Math.max(0, ...[...this.runtimes.values()].map((runtime) => runtime.plan.total));
     this.time = THREE.MathUtils.clamp(this.time, 0, this.durationValue);
+    this.refreshSkeletons();
     this.refreshGhosts();
     this.refreshPath();
     this.attachGizmo();
@@ -760,6 +830,7 @@ export class StagePlayer {
       }
 
       runtime.actor.syncVisuals();
+      this.updateSkeletonOverlay(runtime);
       this.applyMotionGhosts(runtime, time);
     }
   }
@@ -800,7 +871,7 @@ export class StagePlayer {
     if (!runtime.actor.ready || runtime.plan.timings.length === 0) return;
     runtime.plan.timings.forEach((timing, index) => {
       const slots = [{ index, clipTime: timing.trimStart, weight: 1 }];
-      const color = SEGMENT_COLORS[index % SEGMENT_COLORS.length] ?? 0x60a5fa;
+      const color = runtime.colors[index] ?? 0x60a5fa;
       const ghost = runtime.actor.createGhost(runtime.clips, {
         opacity: START_GHOST_OPACITY,
         color,
@@ -813,6 +884,7 @@ export class StagePlayer {
       ghost.setFrame(runtime.poses[index] ?? ZERO_SEGMENT_POSE, offset.x, offset.z);
       ghost.updateWorld();
       ghost.updateVisuals();
+      this.addGhostLabel(ghost, index, color);
       // 残影根节点打标记，射线命中后往上找即可知道是哪一段
       ghost.root.name = 'segmentghost';
       ghost.root.userData.segment = { actorId: runtime.def.id, segmentId: runtime.segmentIds[index] ?? '' };
@@ -840,7 +912,7 @@ export class StagePlayer {
     if (!this.showEndGhosts) return;
     if (!runtime.actor.ready || runtime.plan.timings.length === 0) return;
     runtime.plan.timings.forEach((timing, index) => {
-      const color = SEGMENT_COLORS[index % SEGMENT_COLORS.length] ?? 0x60a5fa;
+      const color = runtime.colors[index] ?? 0x60a5fa;
       // 取该段最后一帧，按段站位 + 根对齐偏移摆放，位置即该段结束时刻的真实位置
       const slots = [{ index, clipTime: timing.trimStart + timing.length, weight: 1 }];
       const ghost = runtime.actor.createGhost(runtime.clips, {
@@ -855,6 +927,7 @@ export class StagePlayer {
       ghost.setFrame(runtime.poses[index] ?? ZERO_SEGMENT_POSE, offset.x, offset.z);
       ghost.updateWorld();
       ghost.updateVisuals();
+      this.addGhostLabel(ghost, index, color);
       runtime.actor.placement.add(ghost.root);
       runtime.endGhosts.push(ghost);
     });
@@ -993,7 +1066,7 @@ export class StagePlayer {
       const clip = runtime.clips[index]?.clip;
       if (!clip) return;
       const pose = runtime.poses[index] ?? ZERO_SEGMENT_POSE;
-      const color = SEGMENT_COLORS[index % SEGMENT_COLORS.length] ?? 0x60a5fa;
+      const color = runtime.colors[index] ?? 0x60a5fa;
       // 该段起始帧的脚底正中：后面所有采样都相对它取增量，路径起点正好落在段站位上
       const start = runtime.actor.sampleFeetCenter(clip, timing.trimStart);
       if (!start) return;
@@ -1032,12 +1105,114 @@ export class StagePlayer {
   }
 
   private disposeGhosts(runtime: ActorRuntime): void {
-    for (const entry of runtime.startGhosts) entry.ghost.dispose();
+    for (const entry of runtime.startGhosts) {
+      this.disposeGhostLabel(entry.ghost.root);
+      entry.ghost.dispose();
+    }
     runtime.startGhosts = [];
-    for (const ghost of runtime.endGhosts) ghost.dispose();
+    for (const ghost of runtime.endGhosts) {
+      this.disposeGhostLabel(ghost.root);
+      ghost.dispose();
+    }
     runtime.endGhosts = [];
     for (const ghost of runtime.motionGhosts) ghost.dispose();
     runtime.motionGhosts = [];
+  }
+
+  /** 残影根节点上的序号贴片是 Sprite，材质/贴图需要单独释放 */
+  private disposeGhostLabel(root: THREE.Object3D): void {
+    root.traverse((child) => {
+      const sprite = child as THREE.Sprite;
+      if (!sprite.isSprite) return;
+      sprite.material.map?.dispose();
+      sprite.material.dispose();
+    });
+  }
+
+  /** 在残影头顶挂一个动画序号贴片（显示编号开关打开时） */
+  private addGhostLabel(ghost: ActorGhost, index: number, color: number): void {
+    if (!this.showNumbers) return;
+    const sprite = this.makeGhostLabel(String(index + 1), color);
+    // 角色被归一化到约 2.4 高，抬到头顶上方一点，避免和头发穿插
+    sprite.position.set(0, 2.62, 0);
+    ghost.root.add(sprite);
+  }
+
+  private makeGhostLabel(text: string, color: number): THREE.Sprite {
+    const canvas = document.createElement('canvas');
+    canvas.width = 96;
+    canvas.height = 96;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      const hex = `#${color.toString(16).padStart(6, '0')}`;
+      ctx.beginPath();
+      ctx.arc(48, 48, 34, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(9, 13, 20, 0.84)';
+      ctx.fill();
+      ctx.lineWidth = 5;
+      ctx.strokeStyle = hex;
+      ctx.stroke();
+      ctx.font = 'bold 46px system-ui, -apple-system, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = hex;
+      ctx.fillText(text, 48, 50);
+    }
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    const sprite = new THREE.Sprite(
+      new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false }),
+    );
+    sprite.scale.set(0.46, 0.46, 1);
+    sprite.renderOrder = 6;
+    return sprite;
+  }
+
+  /** 骨骼连线覆盖层：按当前角色重建（开关切换/角色重建时调用） */
+  private refreshSkeletons(): void {
+    this.disposeSkeletonOverlays();
+    if (!this.showSkeleton) return;
+    for (const [id, runtime] of this.runtimes) {
+      if (!runtime.actor.ready) continue;
+      const pairs = runtime.actor.boneSegments();
+      if (pairs.length === 0) continue;
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pairs.length * 6), 3));
+      const line = new THREE.LineSegments(
+        geometry,
+        new THREE.LineBasicMaterial({ color: 0x7dd3fc, transparent: true, opacity: 0.9, depthTest: false }),
+      );
+      line.frustumCulled = false;
+      line.renderOrder = 4;
+      this.scene.add(line);
+      this.skeletonOverlays.set(id, { line, pairs });
+    }
+  }
+
+  private disposeSkeletonOverlays(): void {
+    for (const { line } of this.skeletonOverlays.values()) {
+      this.scene.remove(line);
+      line.geometry.dispose();
+      (line.material as THREE.Material).dispose();
+    }
+    this.skeletonOverlays.clear();
+  }
+
+  /** 每帧把骨骼世界坐标写进连线缓冲（覆盖层挂在场景里，直接用世界坐标即可） */
+  private updateSkeletonOverlay(runtime: ActorRuntime): void {
+    const overlay = this.skeletonOverlays.get(runtime.def.id);
+    if (!overlay) return;
+    overlay.line.visible = runtime.def.visible !== false;
+    if (!overlay.line.visible) return;
+    const attribute = overlay.line.geometry.getAttribute('position') as THREE.BufferAttribute;
+    overlay.pairs.forEach((pair, index) => {
+      pair.parent.getWorldPosition(this.skeletonPoint);
+      attribute.setXYZ(index * 2, this.skeletonPoint.x, this.skeletonPoint.y, this.skeletonPoint.z);
+      pair.child.getWorldPosition(this.skeletonPoint);
+      attribute.setXYZ(index * 2 + 1, this.skeletonPoint.x, this.skeletonPoint.y, this.skeletonPoint.z);
+    });
+    attribute.needsUpdate = true;
   }
 
   /** 重建残影后把 gizmo 目标换到新的残影上；找不到则退回角色摆放 */

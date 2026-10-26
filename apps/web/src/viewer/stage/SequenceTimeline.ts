@@ -3,12 +3,14 @@ import type { ResolvedSlot, SegmentDef, SegmentPose, SegmentTiming, TimelinePlan
 /**
  * 序列时间轴折算（纯函数）。
  *
- * 每段长度 = trimEnd - trimStart；与上一段的重叠量 blendIn 会被两段长度的一半约束，
- * 避免短片段被重叠吃掉。全局时间轴上的位置由 overlap 递推得到：
+ * 每段长度 = trimEnd - trimStart；全局起点优先取段上的显式 `start`（时间轴拖动/插入对齐后写死），
+ * 缺省则紧跟上一段结束，因此新段默认首尾相接、没有额外提前量。
+ * 段与段之间的交叉淡化窗口由「实际重叠」推导：
  *
- *   start[i] = i ? end[i-1] - blend[i] : 0
+ *   start[i] = segment.start ?? end[i-1]
+ *   blend[i] = max(0, min(end[i-1] - start[i], length[i], length[i-1]))
  *   end[i]   = start[i] + length[i]
- *   total    = end[last]
+ *   total    = max(end[*])
  */
 
 const MIN_LENGTH = 0.05;
@@ -25,6 +27,7 @@ export function smoothstep(t: number): number {
 
 export function buildTimeline(segments: readonly SegmentDef[]): TimelinePlan {
   const timings: SegmentTiming[] = [];
+  let previousStart = 0;
   let previousEnd = 0;
   let previousLength = 0;
 
@@ -33,13 +36,18 @@ export function buildTimeline(segments: readonly SegmentDef[]): TimelinePlan {
     const trimStart = Number.isFinite(segment.trimStart) ? Math.max(0, segment.trimStart) : 0;
     const trimEnd = Number.isFinite(segment.trimEnd) ? Math.max(trimStart, segment.trimEnd) : trimStart;
     const length = Math.max(MIN_LENGTH, trimEnd - trimStart);
-    const requested = Number.isFinite(segment.blendIn) ? Math.max(0, segment.blendIn) : 0;
-    const blend = index === 0 ? 0 : Math.min(requested, length / 2, previousLength / 2);
-    const start = index === 0 ? 0 : previousEnd - blend;
+    const explicit = Number.isFinite(segment.start) ? Math.max(0, segment.start as number) : null;
+    const desired = explicit ?? (index === 0 ? 0 : previousEnd);
+    // 时间轴必须单调递增：resolveTimeline 靠「起点 <= 当前时刻」定位片段，
+    // 起点倒序会让定位错位，因此拖动时最左也只能压到上一段的起点。
+    const start = index === 0 ? desired : Math.max(desired, previousStart);
+    // 重叠量完全由实际摆放决定：往左压进上一段才有交叉淡化，默认首尾相接为硬切
+    const blend = index === 0 ? 0 : Math.max(0, Math.min(previousEnd - start, length, previousLength));
     const end = start + length;
 
     timings.push({ start, end, blend, length, trimStart });
-    previousEnd = end;
+    previousStart = start;
+    previousEnd = Math.max(previousEnd, end);
     previousLength = length;
   }
 

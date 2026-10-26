@@ -8,7 +8,10 @@ import {
   kimodoApi,
   type EnhancePromptResult,
   type KimodoAnimation,
+  type KimodoArtifact,
   type KimodoArtifactContent,
+  type KimodoArtifactGroup,
+  type KimodoArtifactSource,
   type KimodoArtifactsResponse,
   type KimodoPromptSegment,
   type KimodoRelation,
@@ -312,6 +315,63 @@ const artifactJson = computed<Record<string, unknown> | unknown[] | null>(() => 
   }
 });
 
+const artifactTask = computed(() => artifactData.value?.task ?? null);
+/** conditioned（f32 约束）任务的完整参数；文本任务为 null */
+const artifactConditioned = computed(() => {
+  const task = artifactTask.value;
+  return task?.mode === 'conditioned' ? task.conditioned ?? null : null;
+});
+
+/** 产物按「任务文本 → 约束输入 → 动作输出 → 导入产物」分组展示 */
+const artifactGroups = computed(() => {
+  const groups: { key: KimodoArtifactGroup; label: string }[] = [
+    { key: 'text', label: '任务文本' },
+    { key: 'constraint', label: '约束输入 f32' },
+    { key: 'motion', label: '动作输出 f32' },
+    { key: 'import', label: '导入产物' },
+  ];
+  const list = artifactData.value?.artifacts ?? [];
+  return groups
+    .map((group) => ({ ...group, items: list.filter((entry) => entry.group === group.key) }))
+    .filter((group) => group.items.length > 0);
+});
+
+/** 当前选中的产物；f32 也允许选中，用来展示完整元信息 */
+const artifactSelected = computed(
+  () => artifactData.value?.artifacts.find((entry) => entry.key === artifactKey.value) ?? null,
+);
+
+/** conditioned 的来源动画列表（兼容旧服务未返回 sources 的情况） */
+const artifactSources = computed(() => artifactData.value?.sources ?? []);
+
+const STATUS_LABELS: Record<string, string> = {
+  queued: '排队',
+  running: '生成中',
+  ready: '已完成',
+  failed: '失败',
+};
+
+function sourceStatusText(status: string | null): string {
+  return status ? STATUS_LABELS[status] ?? status : '未知';
+}
+
+/** 约束来源切出的帧区间（内部 0 起，展示为 1 起） */
+function sliceText(source: KimodoArtifactSource): string {
+  if (source.sliceStart === null || source.sliceEnd === null) return '未知';
+  return `第 ${source.sliceStart + 1}–${source.sliceEnd} 帧`;
+}
+
+function formatDelta(delta: { dx: number; dz: number }): string {
+  return `Δx ${delta.dx.toFixed(3)} m · Δz ${delta.dz.toFixed(3)} m`;
+}
+
+function formatDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const pad = (input: number) => String(input).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 /**
  * 打开某条任务的产物弹窗：先取清单与关联关系，再默认选中第一个「存在且可读」的产物，
  * 避免用户打开后看到一个空白内容区。
@@ -352,6 +412,18 @@ async function pickArtifact(key: string): Promise<void> {
   } finally {
     artifactContentLoading.value = false;
   }
+}
+
+/** 选中产物：文本类拉取内容；.f32 为二进制，只展示完整元信息 */
+function selectArtifact(entry: KimodoArtifact): void {
+  artifactKey.value = entry.key;
+  if (entry.exists && entry.viewable) {
+    void pickArtifact(entry.key);
+    return;
+  }
+  artifactContent.value = null;
+  artifactContentError.value = null;
+  artifactContentLoading.value = false;
 }
 
 function closeArtifacts(): void {
@@ -916,6 +988,7 @@ onBeforeUnmount(() => {
                     <span class="iprompt" :title="item.prompt">{{ item.prompt }}</span>
                     <div class="imeta">
                       <span class="state" :class="item.status">{{ statusText(item) }}</span>
+                      <span v-if="item.mode === 'conditioned'" class="mode-badge">f32 约束过渡</span>
                       <span>{{ item.frames }} 帧 · {{ item.steps }} 步</span>
                       <span>seed {{ item.seed }}</span>
                       <span>{{ formatTime(item.createdAt) }}</span>
@@ -1025,41 +1098,164 @@ onBeforeUnmount(() => {
           </header>
 
           <p class="artifact-chain">
-            <span class="chain-node">提示词</span>
-            <Icon name="chevronRight" :size="10" />
-            <span class="chain-node">生成任务</span>
-            <Icon name="chevronRight" :size="10" />
-            <span class="chain-node">动作数据 .f32</span>
-            <Icon name="chevronRight" :size="10" />
-            <span class="chain-node">Mixamo JSON</span>
-            <Icon name="chevronRight" :size="10" />
-            <span class="chain-node accent">
-              新建动画 {{ artifactData?.relations.length ?? 0 }}
-            </span>
+            <template v-if="artifactTask?.mode === 'conditioned'">
+              <template v-if="artifactConditioned">
+                <span class="chain-node">
+                  prev 动画 <code class="chain-code">{{ artifactConditioned.prevAnimationId ?? '外部约束' }}</code>
+                </span>
+                <Icon name="chevronRight" :size="10" />
+                <span class="chain-node">prev 尾部 f32 · {{ artifactConditioned.transitionFrames }} 帧</span>
+                <Icon name="chevronRight" :size="10" />
+                <span class="chain-node">
+                  next 动画 <code class="chain-code">{{ artifactConditioned.nextAnimationId ?? '外部约束' }}</code>
+                </span>
+                <Icon name="chevronRight" :size="10" />
+                <span class="chain-node">next 头部 f32 · {{ artifactConditioned.transitionFrames }} 帧</span>
+              </template>
+              <span v-else class="chain-node">f32 约束过渡（历史任务，未记录约束来源）</span>
+              <Icon name="chevronRight" :size="10" />
+              <span class="chain-node accent">conditioned 生成 · {{ artifactTask.frames }} 帧</span>
+              <Icon name="chevronRight" :size="10" />
+              <span class="chain-node">输出 root / rot f32</span>
+              <Icon name="chevronRight" :size="10" />
+              <span class="chain-node">Mixamo JSON</span>
+              <Icon name="chevronRight" :size="10" />
+              <span class="chain-node accent">
+                新建动画 {{ artifactData?.relations.length ?? 0 }}
+              </span>
+            </template>
+            <template v-else>
+              <span class="chain-node">提示词</span>
+              <Icon name="chevronRight" :size="10" />
+              <span class="chain-node">生成任务</span>
+              <Icon name="chevronRight" :size="10" />
+              <span class="chain-node">动作数据 .f32</span>
+              <Icon name="chevronRight" :size="10" />
+              <span class="chain-node">Mixamo JSON</span>
+              <Icon name="chevronRight" :size="10" />
+              <span class="chain-node accent">
+                新建动画 {{ artifactData?.relations.length ?? 0 }}
+              </span>
+            </template>
           </p>
 
           <p v-if="artifactLoading" class="artifact-state">读取产物清单…</p>
           <p v-else-if="artifactError" class="artifact-state err">{{ artifactError }}</p>
           <div v-else-if="artifactData" class="artifact-body">
             <div class="artifact-list">
-              <div
-                v-for="entry in artifactData.artifacts"
-                :key="entry.key"
-                class="artifact-item"
-                :class="{
-                  active: artifactKey === entry.key,
-                  muted: !entry.exists,
-                  binary: !entry.viewable,
-                }"
-                :title="entry.viewable && entry.exists ? '点击查看内容' : entry.description"
-                @click="entry.viewable && entry.exists ? pickArtifact(entry.key) : undefined"
-              >
-                <div class="ai-head">
-                  <span class="ai-label">{{ entry.label }}</span>
-                  <span class="ai-size">{{ entry.exists ? formatSize(entry.size) : '未生成' }}</span>
+              <div v-if="artifactConditioned && artifactTask" class="cond-block">
+                <p class="cond-title">f32 约束过渡完整参数</p>
+                <dl class="cond-grid">
+                  <div>
+                    <dt>模式</dt>
+                    <dd>conditioned（真实 pose 约束）</dd>
+                  </div>
+                  <div>
+                    <dt>过渡帧数</dt>
+                    <dd>{{ artifactTask.frames }}</dd>
+                  </div>
+                  <div>
+                    <dt>首尾硬约束</dt>
+                    <dd>各 {{ artifactConditioned.transitionFrames }} 帧</dd>
+                  </div>
+                  <div>
+                    <dt>扩散步数</dt>
+                    <dd>{{ artifactTask.steps }}</dd>
+                  </div>
+                  <div>
+                    <dt>随机种子</dt>
+                    <dd>{{ artifactTask.seed }}</dd>
+                  </div>
+                  <div v-if="artifactConditioned.rootDelta">
+                    <dt>舞台位移</dt>
+                    <dd>{{ formatDelta(artifactConditioned.rootDelta) }}</dd>
+                  </div>
+                  <div v-if="artifactConditioned.constraintTag">
+                    <dt>约束目录</dt>
+                    <dd class="mono">_constraints/{{ artifactConditioned.constraintTag }}</dd>
+                  </div>
+                </dl>
+                <p class="cond-sub">约束文件（绝对路径）</p>
+                <p class="cond-path">
+                  <span>prev root</span>
+                  <code>{{ artifactConditioned.prevRootPath }}</code>
+                </p>
+                <p class="cond-path">
+                  <span>prev rot</span>
+                  <code>{{ artifactConditioned.prevRotPath }}</code>
+                </p>
+                <p class="cond-path">
+                  <span>next root</span>
+                  <code>{{ artifactConditioned.nextRootPath }}</code>
+                </p>
+                <p class="cond-path">
+                  <span>next rot</span>
+                  <code>{{ artifactConditioned.nextRotPath }}</code>
+                </p>
+                <p v-if="artifactConditioned.nextRootShiftedPath" class="cond-path">
+                  <span>next root（平移后）</span>
+                  <code>{{ artifactConditioned.nextRootShiftedPath }}</code>
+                </p>
+              </div>
+
+              <template v-for="group in artifactGroups" :key="group.key">
+                <p class="artifact-group">
+                  {{ group.label }}<span class="faint">（{{ group.items.length }}）</span>
+                </p>
+                <div
+                  v-for="entry in group.items"
+                  :key="entry.key"
+                  class="artifact-item"
+                  :class="{
+                    active: artifactKey === entry.key,
+                    muted: !entry.exists,
+                    binary: !entry.viewable,
+                  }"
+                  :title="entry.exists ? '点击查看完整信息' : entry.description"
+                  @click="selectArtifact(entry)"
+                >
+                  <div class="ai-head">
+                    <span class="ai-label">{{ entry.label }}</span>
+                    <span class="ai-size">{{ entry.exists ? formatSize(entry.size) : '未生成' }}</span>
+                  </div>
+                  <code class="ai-file">{{ entry.file }}</code>
+                  <p v-if="entry.frames !== undefined" class="ai-layout">
+                    {{ entry.frames }} 帧 · {{ entry.bytesPerFrame }} B/帧 · {{ entry.shape }}
+                  </p>
+                  <p v-if="entry.absolutePath" class="ai-path" :title="entry.absolutePath">
+                    {{ entry.absolutePath }}
+                  </p>
+                  <p v-if="entry.source" class="ai-source">来源：{{ entry.source }}</p>
+                  <p class="ai-desc">{{ entry.description }}</p>
                 </div>
-                <code class="ai-file">{{ entry.file }}</code>
-                <p class="ai-desc">{{ entry.description }}</p>
+              </template>
+
+              <div v-if="artifactTask?.mode === 'conditioned'" class="relation-block">
+                <p class="relation-title">f32 约束来源动画（{{ artifactSources.length }}）</p>
+                <p v-if="artifactSources.length === 0" class="relation-empty">
+                  这条历史任务没有记录 f32 约束来源（meta.json 缺少 conditioned 字段）。
+                </p>
+                <div
+                  v-for="source in artifactSources"
+                  :key="`${source.role}-${source.animationId}`"
+                  class="source-item"
+                >
+                  <div class="source-head">
+                    <span class="rel-tag">{{ source.role === 'prev' ? 'prev 尾帧' : 'next 首帧' }}</span>
+                    <code class="source-id">{{ source.animationId }}</code>
+                    <span class="state" :class="source.status ?? ''">
+                      {{ sourceStatusText(source.status) }}
+                    </span>
+                  </div>
+                  <p class="source-prompt" :title="source.prompt ?? ''">
+                    {{ source.prompt ?? '（源任务已删除，无法读取提示词）' }}
+                  </p>
+                  <p class="source-meta">
+                    总 {{ source.frames ?? '?' }} 帧 · 切出 {{ sliceText(source) }}（{{
+                      source.role === 'prev' ? '尾部' : '头部'
+                    }}）
+                  </p>
+                </div>
               </div>
 
               <div class="relation-block">
@@ -1075,9 +1271,15 @@ onBeforeUnmount(() => {
                   @click="gotoRelation(relation)"
                 >
                   <Icon name="film" :size="11" />
-                  <span class="rel-name" :title="relation.name">{{ relation.name }}</span>
-                  <span class="rel-meta">
-                    {{ relation.clipCount }} 片段 · {{ relation.trackCount }} 轨道
+                  <span class="rel-main">
+                    <span class="rel-name" :title="relation.name">{{ relation.name }}</span>
+                    <span class="rel-sub">
+                      {{ relation.clipCount }} 片段 · {{ relation.trackCount }} 轨道 ·
+                      {{ formatDate(relation.updatedAt) }}
+                    </span>
+                    <span v-if="relation.importedName" class="rel-sub">
+                      导入名：{{ relation.importedName }}
+                    </span>
                   </span>
                 </button>
               </div>
@@ -1085,12 +1287,63 @@ onBeforeUnmount(() => {
 
             <div class="artifact-view">
               <div class="view-head">
-                <span class="view-file">{{ artifactContent?.file ?? '选择左侧产物查看内容' }}</span>
-                <span v-if="artifactContent" class="view-size">
-                  {{ formatSize(artifactContent.size) }}
+                <span
+                  class="view-file"
+                  :title="artifactSelected?.absolutePath ?? artifactContent?.file"
+                >
+                  {{ artifactSelected?.file ?? artifactContent?.file ?? '选择左侧产物查看内容' }}
+                </span>
+                <span v-if="artifactSelected" class="view-size">
+                  {{ artifactSelected.exists ? formatSize(artifactSelected.size) : '未生成' }}
                 </span>
               </div>
-              <p v-if="artifactContentLoading" class="view-empty">读取中…</p>
+
+              <div v-if="artifactSelected && !artifactSelected.viewable" class="f32-view">
+                <div class="f32-badge">二进制 .f32 · 不可文本预览</div>
+                <dl class="f32-grid">
+                  <div>
+                    <dt>产物</dt>
+                    <dd>{{ artifactSelected.label }}</dd>
+                  </div>
+                  <div>
+                    <dt>格式</dt>
+                    <dd>{{ artifactSelected.format }}</dd>
+                  </div>
+                  <div>
+                    <dt>大小</dt>
+                    <dd>{{ artifactSelected.exists ? formatSize(artifactSelected.size) : '未生成' }}</dd>
+                  </div>
+                  <div v-if="artifactSelected.frames !== undefined">
+                    <dt>帧数</dt>
+                    <dd>{{ artifactSelected.frames }}</dd>
+                  </div>
+                  <div v-if="artifactSelected.bytesPerFrame">
+                    <dt>每帧</dt>
+                    <dd>{{ artifactSelected.bytesPerFrame }} B</dd>
+                  </div>
+                  <div v-if="artifactSelected.shape">
+                    <dt>形状</dt>
+                    <dd class="mono">{{ artifactSelected.shape }}</dd>
+                  </div>
+                </dl>
+                <p class="f32-section">绝对路径</p>
+                <code class="f32-path">
+                  {{ artifactSelected.absolutePath ?? artifactSelected.file }}
+                </code>
+                <template v-if="artifactSelected.source">
+                  <p class="f32-section">来源</p>
+                  <p class="f32-note">{{ artifactSelected.source }}</p>
+                </template>
+                <p class="f32-section">说明</p>
+                <p class="f32-note">{{ artifactSelected.description }}</p>
+              </div>
+              <p
+                v-else-if="artifactSelected && !artifactSelected.exists"
+                class="view-empty"
+              >
+                该产物尚未生成：{{ artifactSelected.description }}
+              </p>
+              <p v-else-if="artifactContentLoading" class="view-empty">读取中…</p>
               <p v-else-if="artifactContentError" class="view-empty err">{{ artifactContentError }}</p>
               <template v-else-if="artifactContent">
                 <p v-if="artifactContent.truncated" class="view-truncated">文件较大，仅显示前 2MB。</p>
@@ -1105,7 +1358,9 @@ onBeforeUnmount(() => {
                 />
                 <pre v-else class="view-text">{{ artifactContent.text }}</pre>
               </template>
-              <p v-else class="view-empty">点击左侧可查看的产物（提示词 / 元数据 / Mixamo JSON）。</p>
+              <p v-else class="view-empty">
+                点击左侧产物查看完整信息（.f32 展示布局与来源，文本 / JSON 展示内容）。
+              </p>
             </div>
           </div>
         </div>
@@ -1503,8 +1758,8 @@ onBeforeUnmount(() => {
 .artifact-dialog {
   display: flex;
   flex-direction: column;
-  width: min(1040px, 94vw);
-  height: min(680px, 88vh);
+  width: min(1180px, 96vw);
+  height: min(720px, 90vh);
   overflow: hidden;
   border: 1px solid var(--border-strong);
   border-radius: 10px;
@@ -1545,6 +1800,11 @@ onBeforeUnmount(() => {
   border-color: var(--primary);
   color: var(--primary);
 }
+.chain-code {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
 .artifact-state {
   margin: 0;
   padding: 20px 16px;
@@ -1558,7 +1818,7 @@ onBeforeUnmount(() => {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 320px minmax(0, 1fr);
+  grid-template-columns: 400px minmax(0, 1fr);
 }
 .artifact-list {
   display: flex;
@@ -1578,12 +1838,14 @@ onBeforeUnmount(() => {
 .artifact-item.active {
   border-color: var(--primary);
 }
-.artifact-item.muted,
-.artifact-item.binary {
-  cursor: default;
-}
 .artifact-item.muted {
+  cursor: default;
   opacity: 0.55;
+}
+.artifact-item.binary .ai-label::after {
+  content: ' · f32';
+  color: #fbbf24;
+  font-size: 9.5px;
 }
 .ai-head {
   display: flex;
@@ -1608,6 +1870,93 @@ onBeforeUnmount(() => {
   margin: 4px 0 0;
   font-size: 10.5px;
   color: var(--text-faint);
+}
+.artifact-group {
+  margin: 8px 0 0;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+.ai-layout,
+.ai-path,
+.ai-source {
+  margin: 3px 0 0;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-faint);
+}
+.ai-layout {
+  font-family: var(--mono);
+  color: #93c5fd;
+}
+.ai-path {
+  font-family: var(--mono);
+  word-break: break-all;
+}
+.ai-source {
+  color: var(--text-dim);
+}
+
+/* conditioned（f32 约束）任务的完整参数与约束文件 */
+.cond-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(96, 165, 250, 0.06);
+}
+.cond-title {
+  margin: 0 0 2px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #93c5fd;
+}
+.cond-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px 8px;
+  margin: 0;
+}
+.cond-grid > div {
+  min-width: 0;
+  display: flex;
+  gap: 5px;
+  font-size: 10.5px;
+}
+.cond-grid dt {
+  flex: none;
+  color: var(--text-faint);
+}
+.cond-grid dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+.cond-sub {
+  margin: 6px 0 0;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+.cond-path {
+  display: flex;
+  gap: 6px;
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.4;
+}
+.cond-path > span {
+  flex: none;
+  width: 92px;
+  color: var(--text-faint);
+}
+.cond-path code {
+  min-width: 0;
+  font-family: var(--mono);
+  color: var(--text-dim);
+  word-break: break-all;
 }
 .relation-block {
   display: flex;
@@ -1653,6 +2002,76 @@ onBeforeUnmount(() => {
 .rel-meta {
   font-size: 10px;
   color: var(--text-faint);
+}
+.rel-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.rel-sub {
+  font-size: 9.5px;
+  color: var(--text-faint);
+}
+
+/* conditioned 的 prev / next 来源动画 */
+.source-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-panel-2);
+}
+.source-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.rel-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 9.5px;
+}
+.source-id {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.source-head .state {
+  flex: none;
+  font-size: 9.5px;
+}
+.source-prompt {
+  margin: 0;
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--text);
+}
+.source-meta {
+  margin: 0;
+  font-size: 9.5px;
+  color: var(--text-faint);
+}
+.mode-badge {
+  padding: 0 5px;
+  border-radius: 999px;
+  background: rgba(96, 165, 250, 0.14);
+  color: #93c5fd;
+  font-size: 9.5px;
 }
 .artifact-view {
   min-width: 0;
@@ -1707,6 +2126,68 @@ onBeforeUnmount(() => {
   padding: 8px 12px;
   overflow: auto;
   font-size: 11.5px;
+}
+
+/* .f32 二进制产物的信息视图 */
+.f32-view {
+  flex: 1;
+  min-height: 0;
+  padding: 10px 12px;
+  overflow-y: auto;
+}
+.f32-badge {
+  display: inline-block;
+  margin-bottom: 8px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(251, 191, 36, 0.14);
+  color: #fbbf24;
+  font-size: 10px;
+}
+.f32-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 14px;
+  margin: 0;
+}
+.f32-grid > div {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+}
+.f32-grid dt {
+  flex: none;
+  width: 44px;
+  color: var(--text-faint);
+}
+.f32-grid dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+.f32-section {
+  margin: 12px 0 4px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+.f32-path {
+  display: block;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-app);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+.f32-note {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
 }
 
 /* 生成进度与状态提示 */

@@ -59,8 +59,13 @@ export interface SegmentDef {
   trimStart: number;
   /** 片段内裁剪终点（秒） */
   trimEnd: number;
-  /** 与上一段的重叠时长（秒）；第一段忽略 */
-  blendIn: number;
+  /**
+   * 该段在全局时间轴上的起点（秒）。
+   * 缺省表示紧跟上一段结束；拖动时间轴后会写死，插入过渡/新段时由系统先对齐。
+   */
+  start?: number;
+  /** 自定义标识色（#rrggbb）；缺省按序号自动生成 */
+  color?: string;
   /** 该段的独立站位；缺省表示沿用角色的摆放 */
   pose?: SegmentPose;
   /** 由「过渡动画生成」得到的过渡段：记录它连接的前后两段 */
@@ -94,7 +99,7 @@ export interface SegmentTiming {
   start: number;
   /** 全局结束时间（秒） */
   end: number;
-  /** 与上一段的重叠时长（已按两段长度做过上限约束） */
+  /** 与上一段的实际重叠时长（由两段的全局起点推导，已按段长约束） */
   blend: number;
   /** 裁剪后的片段长度 */
   length: number;

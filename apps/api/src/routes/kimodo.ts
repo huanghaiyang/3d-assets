@@ -154,6 +154,8 @@ export async function registerKimodoRoutes(app: FastifyInstance): Promise<void> 
       typeof body.nextRotPath === 'string';
     const hasAnimationIds =
       typeof body.prevAnimationId === 'string' && typeof body.nextAnimationId === 'string';
+    /** 方式 B 的约束切片目录名；方式 A 保持 undefined */
+    let constraintTag: string | undefined;
 
     if (hasDirectPaths) {
       // 方式 A：直接路径，做存在性校验
@@ -212,6 +214,7 @@ export async function registerKimodoRoutes(app: FastifyInstance): Promise<void> 
       // 写临时约束目录（放在输出目录的 _constraints 里，跟 job 并列）
       // tag 格式：prev前6位-next前6位-时间戳(36进制)，既方便排查又避免碰撞
       const tag = `${prevAnimId.slice(0, 6)}-${nextAnimId.slice(0, 6)}-${Date.now().toString(36)}`;
+      constraintTag = tag;
       const tmpDir = path.join(outDir, '_constraints', tag);
       fs.mkdirSync(tmpDir, { recursive: true });
 
@@ -260,6 +263,10 @@ export async function registerKimodoRoutes(app: FastifyInstance): Promise<void> 
         frames, transitionFrames, steps, seed,
         prompt,
         rootDelta,
+        // 走 animationId 快捷方式时记录来源，产物面板据此展示完整 f32 关联链路
+        prevAnimationId: hasAnimationIds ? (body.prevAnimationId as string) : undefined,
+        nextAnimationId: hasAnimationIds ? (body.nextAnimationId as string) : undefined,
+        constraintTag,
       });
     } catch (err) {
       return reply.code(400).send({ error: (err as Error).message });

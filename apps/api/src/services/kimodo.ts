@@ -68,9 +68,45 @@ export interface KimodoConditionedRequest {
   seed?: number;
   /** 辅助提示词（告诉模型中间过渡的节奏/风格） */
   prompt: string;
+  /** prev 约束来源动画 id（路由走 animationId 快捷方式时填入，产物面板据此展示关联关系） */
+  prevAnimationId?: string;
+  /** next 约束来源动画 id */
+  nextAnimationId?: string;
+  /** 约束切片的临时目录名（输出目录下 _constraints/<tag>，走 animationId 快捷方式时由路由填入） */
+  constraintTag?: string;
 }
 
 export type KimodoStatusValue = 'queued' | 'running' | 'ready' | 'failed';
+
+/**
+ * conditioned（真实 pose 约束过渡）任务的约束来源与完整参数。
+ *
+ * 为什么要落盘：过渡段生成后，产物面板需要还原「这段过渡是从哪两段动画的
+ * 哪些帧切出来的、实际喂给 shim 的是哪几个 f32 文件」，否则只剩下一个结果目录，
+ * 中间链路无法追查。写入 meta.json 后，服务重启也能完整展示。
+ */
+export interface KimodoConditionedInfo {
+  /** prev 约束来源动画 id（走 animationId 快捷方式时才有） */
+  prevAnimationId?: string;
+  /** next 约束来源动画 id */
+  nextAnimationId?: string;
+  /** 约束切片的临时目录名（输出目录下 _constraints/<tag>） */
+  constraintTag?: string;
+  /** prev 尾部 root_positions.f32 绝对路径 */
+  prevRootPath: string;
+  /** prev 尾部 local_rotations_xyzw.f32 绝对路径 */
+  prevRotPath: string;
+  /** next 头部 root_positions.f32 绝对路径（平移前的原始约束） */
+  nextRootPath: string;
+  /** next 头部 local_rotations_xyzw.f32 绝对路径 */
+  nextRotPath: string;
+  /** 有 rootDelta 时，实际喂给 shim 的平移后 next root 文件 */
+  nextRootShiftedPath?: string;
+  /** 首尾各硬约束的帧数 */
+  transitionFrames: number;
+  /** 舞台位移（米，prev 局部坐标系） */
+  rootDelta?: { dx: number; dz: number };
+}
 
 /** 一条生成任务（持久化到 <outputDir>/<id>/meta.json） */
 export interface KimodoAnimation {
@@ -84,6 +120,8 @@ export interface KimodoAnimation {
   createdAt: number;
   /** 生成模式：text=纯文本，conditioned=真实 pose 约束过渡 */
   mode?: 'text' | 'conditioned';
+  /** conditioned 任务的约束来源与参数（其他模式不写） */
+  conditioned?: KimodoConditionedInfo;
   /** 多段生成时的分段提示词与各自帧数（单段任务不写） */
   segments?: KimodoPromptSegment[];
   /** 生成耗时（毫秒），完成后写入 */
@@ -130,23 +168,47 @@ export interface KimodoStatus {
   error: string | null;
 }
 
+/** 产物分组：前端按组展示，避免文本 / 约束 / 输出 / 导入混在一起 */
+export type KimodoArtifactGroup = 'text' | 'constraint' | 'motion' | 'import';
+
 /** 一次生成留下的中间产物（保留在输出目录里，可查看） */
 export interface KimodoArtifact {
   key: KimodoArtifactKey;
   label: string;
-  /** 相对输出目录的路径 */
+  /** 相对输出目录的路径（不在输出目录内时退化为绝对路径） */
   file: string;
+  /** 绝对路径：.f32 无法预览，完整路径本身就是排查信息 */
+  absolutePath?: string;
   format: 'text' | 'json' | 'f32';
   size: number;
   exists: boolean;
   /** 是否可当作文本查看（.f32 为二进制） */
   viewable: boolean;
   description: string;
+  group: KimodoArtifactGroup;
+  /** f32 帧数（按文件字节数与每帧布局反推） */
+  frames?: number;
+  /** f32 每帧字节数 */
+  bytesPerFrame?: number;
+  /** f32 数据形状，如 [60, 3] float32 / [60, 30, 4] float32 */
+  shape?: string;
+  /** 来源说明：来自哪个动画、切出哪些帧 */
+  source?: string;
 }
 
-export type KimodoArtifactKey = 'prompt' | 'meta' | 'mixamo' | 'root' | 'rotations';
+export type KimodoArtifactKey =
+  | 'prompt'
+  | 'meta'
+  | 'mixamo'
+  | 'root'
+  | 'rotations'
+  | 'prev-root'
+  | 'prev-rot'
+  | 'next-root'
+  | 'next-rot'
+  | 'next-root-shifted';
 
-/** 产物对应到的项目（关联关系） */
+/** 产物关联到的项目（关联关系） */
 export interface KimodoRelation {
   id: string;
   name: string;
@@ -156,8 +218,24 @@ export interface KimodoRelation {
   trackCount: number;
 }
 
+/** conditioned 过渡的约束来源动画（prev 尾帧 / next 首帧） */
+export interface KimodoArtifactSource {
+  role: 'prev' | 'next';
+  animationId: string;
+  prompt: string | null;
+  status: KimodoStatusValue | null;
+  /** 源动画总帧数（按 root_positions.f32 字节数反推） */
+  frames: number | null;
+  /** 从该动画切出的约束帧区间 [start, end)，0 起 */
+  sliceStart: number | null;
+  sliceEnd: number | null;
+}
+
+/** 可文本查看的产物 key（其余为 .f32 二进制） */
+export type KimodoArtifactTextKey = 'prompt' | 'meta' | 'mixamo';
+
 export interface KimodoArtifactContent {
-  key: Exclude<KimodoArtifactKey, 'root' | 'rotations'>;
+  key: KimodoArtifactTextKey;
   file: string;
   format: 'text' | 'json';
   size: number;
@@ -695,6 +773,17 @@ class KimodoService {
       steps,
       seed,
       mode: 'conditioned',
+      conditioned: {
+        prevAnimationId: req.prevAnimationId,
+        nextAnimationId: req.nextAnimationId,
+        constraintTag: req.constraintTag,
+        prevRootPath: req.prevRootPath,
+        prevRotPath: req.prevRotPath,
+        nextRootPath: req.nextRootPath,
+        nextRotPath: req.nextRotPath,
+        transitionFrames,
+        rootDelta: req.rootDelta,
+      },
       status: 'queued',
       createdAt: Date.now(),
     };
@@ -788,6 +877,10 @@ class KimodoService {
       const nextRootPath = req.rootDelta
         ? this.shiftNextRoot(dir, req.prevRootPath, req.nextRootPath, req.rootDelta)
         : req.nextRootPath;
+      // 落盘实际生效的约束文件：产物面板需要区分「原始 next 约束」与「平移后约束」
+      if (job.conditioned && nextRootPath !== req.nextRootPath) {
+        job.conditioned.nextRootShiftedPath = nextRootPath;
+      }
 
       // 协议行（TAB 分隔），与 shim main.cpp 解析顺序严格一一对应：
       //   0: CONDITIONED       命令字（shim 用它区分协议分支）
@@ -943,98 +1036,342 @@ class KimodoService {
     return path.join(this.outputDir, 'mixamo', `${id}.json`);
   }
 
-  private describe(key: KimodoArtifactKey, id: string): Omit<KimodoArtifact, 'size' | 'exists'> {
-    switch (key) {
-      case 'prompt':
-        return {
-          key,
-          label: '提示词文本',
-          file: 'segment-01.txt',
-          format: 'text',
-          viewable: true,
-          description: '提交给生成器的原始提示词（多段任务依次写入 segment-01.txt、segment-02.txt…，此处按顺序合并展示）',
-        };
-      case 'meta':
-        return {
-          key,
-          label: '任务元数据',
-          file: 'meta.json',
-          format: 'json',
-          viewable: true,
-          description: '任务参数、状态、耗时与进度估算，服务重启后据此恢复列表',
-        };
-      case 'mixamo':
-        return {
-          key,
-          label: 'Mixamo 动画 JSON',
-          file: `mixamo/${id}.json`,
-          format: 'json',
-          viewable: true,
-          description: 'to_mixamo.py 重定向后的 fbx-animation-data，可导入新建动画',
-        };
-      case 'root':
-        return {
-          key,
-          label: '根位移（二进制）',
-          file: 'root_positions.f32',
-          format: 'f32',
-          viewable: false,
-          description: '每帧 3 个 float32（XYZ）根关节世界位置',
-        };
-      case 'rotations':
-        return {
-          key,
-          label: '关节旋转（二进制）',
-          file: 'local_rotations_xyzw.f32',
-          format: 'f32',
-          viewable: false,
-          description: '每帧 30 个关节 × 4 分量（XYZW）局部旋转',
-        };
+  /** 相对输出目录的路径；不在输出目录内时原样返回绝对路径 */
+  private relativeOutputPath(target: string): string {
+    const rel = path.relative(this.outputDir, target);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return target;
+    return rel.split(path.sep).join('/');
+  }
+
+  /** 通用产物：文本 / JSON 只看体积与是否存在 */
+  private baseArtifact(
+    key: KimodoArtifactKey,
+    label: string,
+    target: string,
+    format: 'text' | 'json' | 'f32',
+    description: string,
+    group: KimodoArtifactGroup,
+    extra: Partial<KimodoArtifact> = {},
+  ): KimodoArtifact {
+    let size = 0;
+    try {
+      size = fs.statSync(target).size;
+    } catch {
+      size = 0;
     }
+    return {
+      key,
+      label,
+      file: this.relativeOutputPath(target),
+      absolutePath: target,
+      format,
+      size,
+      exists: size > 0,
+      viewable: format !== 'f32',
+      description,
+      group,
+      ...extra,
+    };
+  }
+
+  /** .f32 二进制产物：体积 + 帧数 + 每帧字节数 + 形状（joints=3 为 root，120 为 30×4 旋转） */
+  private f32Artifact(
+    key: KimodoArtifactKey,
+    label: string,
+    target: string,
+    bytesPerFrame: number,
+    joints: 3 | 120,
+    description: string,
+    group: KimodoArtifactGroup,
+    source?: string,
+  ): KimodoArtifact {
+    let size = 0;
+    try {
+      size = fs.statSync(target).size;
+    } catch {
+      size = 0;
+    }
+    const frames = Math.floor(size / bytesPerFrame);
+    return this.baseArtifact(key, label, target, 'f32', description, group, {
+      frames,
+      bytesPerFrame,
+      shape: joints === 3 ? `[${frames}, 3] float32` : `[${frames}, 30, 4] float32`,
+      source,
+    });
+  }
+
+  /** 某个任务动作 f32 的帧数（root 每帧 12 字节，rotations 每帧 30×4×4=480 字节） */
+  private motionFrameCount(animationId: string, kind: 'root' | 'rotations'): number | null {
+    if (!/^[0-9a-zA-Z._-]+$/.test(animationId)) return null;
+    const file = path.join(
+      this.outputDir,
+      animationId,
+      kind === 'root' ? 'root_positions.f32' : 'local_rotations_xyzw.f32',
+    );
+    try {
+      return Math.floor(fs.statSync(file).size / (kind === 'root' ? 12 : 480));
+    } catch {
+      return null;
+    }
+  }
+
+  /** 还原把 next root 平移到 prev 末帧 + rootDelta 时的实际平移量（产物说明用） */
+  private rootShiftOffset(info: KimodoConditionedInfo): { x: number; z: number } | null {
+    try {
+      const prevBuf = fs.readFileSync(info.prevRootPath);
+      const nextBuf = fs.readFileSync(info.nextRootPath);
+      const prevFrames = Math.floor(prevBuf.length / 12);
+      if (prevFrames < 1 || nextBuf.length < 12) return null;
+      const tail = (prevFrames - 1) * 12;
+      return {
+        x: (info.rootDelta?.dx ?? 0) + prevBuf.readFloatLE(tail) - nextBuf.readFloatLE(0),
+        z: (info.rootDelta?.dz ?? 0) + prevBuf.readFloatLE(tail + 8) - nextBuf.readFloatLE(8),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** 约束来源动画的关联信息（prev / next） */
+  private sourceRelation(
+    role: 'prev' | 'next',
+    animationId: string,
+    transitionFrames: number,
+  ): KimodoArtifactSource {
+    const job = this.get(animationId);
+    const frames = this.motionFrameCount(animationId, 'root') ?? job?.frames ?? null;
+    let sliceStart: number | null = null;
+    let sliceEnd: number | null = null;
+    if (frames !== null) {
+      if (role === 'prev') {
+        sliceStart = Math.max(0, frames - transitionFrames);
+        sliceEnd = frames;
+      } else {
+        sliceStart = 0;
+        sliceEnd = Math.min(transitionFrames, frames);
+      }
+    }
+    return {
+      role,
+      animationId,
+      prompt: job?.prompt ?? null,
+      status: job?.status ?? null,
+      frames,
+      sliceStart,
+      sliceEnd,
+    };
   }
 
   /**
    * 中间产物清单 + 关联关系。
    *
-   * 产物顺序固定为「提示词 → 元数据 → Mixamo JSON → 根位移 → 关节旋转」，
-   * 与前端链路条一致；二进制 .f32 只给体积，不做文本预览。
+   * 文本任务：提示词 → 元数据 → 根位移 → 关节旋转 → Mixamo JSON。
+   * conditioned（f32 约束）任务额外展示完整链路：
+   *   prev 尾部 root/rot f32 → next 头部 root/rot f32（+ 平移后的 next root）
+   *   → 生成输出 root/rot f32 → Mixamo JSON。
+   * 二进制 .f32 只给路径 / 帧数 / 每帧布局 / 形状，不做文本预览。
    *
    * 关联关系没有单独建表：导入时项目里记录的 imported.name 就是 Mixamo 片段名，
-   * 所以用「Mixamo JSON 的 clips[0].name」或「提示词前 40 字」反查项目即可。
+   * 所以用「Mixamo JSON 的 clips[0].name」或「提示词前 40 字」反查项目即可；
+   * conditioned 任务的 prev / next 来源动画直接从 meta.json 的 conditioned 字段还原。
    */
-  async artifacts(
-    id: string,
-  ): Promise<{ task: KimodoAnimation; artifacts: KimodoArtifact[]; relations: KimodoRelation[] } | null> {
+  async artifacts(id: string): Promise<{
+    task: KimodoAnimation;
+    artifacts: KimodoArtifact[];
+    relations: KimodoRelation[];
+    sources: KimodoArtifactSource[];
+  } | null> {
     const dir = this.motionDir(id);
     const task = this.get(id);
     if (!dir || !task) return null;
 
-    const keys: KimodoArtifactKey[] = ['prompt', 'meta', 'mixamo', 'root', 'rotations'];
-    const artifacts = keys.map((key): KimodoArtifact => {
-      const desc = this.describe(key, id);
-      // Mixamo JSON 由导入动作时写到 <outputDir>/mixamo 下，不在任务目录内
-      let size = 0;
-      if (key === 'prompt') {
-        // 多段任务会有 segment-01/02/…，体积按全部段累加
-        for (const name of this.segmentFiles(dir)) {
-          try {
-            size += fs.statSync(path.join(dir, name)).size;
-          } catch {
-            /* 忽略单个文件读取失败 */
-          }
-        }
-      } else {
-        const file = key === 'mixamo' ? this.mixamoFile(id) : path.join(dir, desc.file);
-        try {
-          size = fs.statSync(file).size;
-        } catch {
-          size = 0;
-        }
+    const isConditioned = task.mode === 'conditioned';
+    const conditioned = isConditioned ? task.conditioned : undefined;
+    const artifacts: KimodoArtifact[] = [];
+
+    // ---- 提示词：conditioned 写 prompt.txt，文本生成写 segment-01.txt… ----
+    const promptName = isConditioned ? 'prompt.txt' : 'segment-01.txt';
+    const promptFiles = isConditioned ? ['prompt.txt'] : this.segmentFiles(dir);
+    let promptSize = 0;
+    for (const name of promptFiles) {
+      try {
+        promptSize += fs.statSync(path.join(dir, name)).size;
+      } catch {
+        /* 忽略单个文件读取失败 */
       }
-      return { ...desc, size, exists: size > 0 };
+    }
+    artifacts.push({
+      key: 'prompt',
+      label: isConditioned ? '辅助提示词' : '提示词文本',
+      file: promptName,
+      absolutePath: path.join(dir, promptName),
+      format: 'text',
+      size: promptSize,
+      exists: promptSize > 0,
+      viewable: true,
+      group: 'text',
+      description: isConditioned
+        ? '真实 pose 约束过渡的辅助提示词（prompt.txt），只描述中间过渡的节奏 / 风格'
+        : '提交给生成器的原始提示词（多段任务依次写入 segment-01.txt、segment-02.txt…，此处按顺序合并展示）',
     });
 
-    // 关联关系：Mixamo JSON 的片段名 / 提示词前缀与项目记录的 imported.name 对齐
+    // ---- 任务元数据：conditioned 参数与约束来源都落在这里 ----
+    artifacts.push(
+      this.baseArtifact(
+        'meta',
+        '任务元数据',
+        this.metaPath(id),
+        'json',
+        isConditioned
+          ? '任务参数、状态、耗时与进度估算；conditioned 的 prev/next 来源、transitionFrames、rootDelta 与约束文件路径都在这里'
+          : '任务参数、状态、耗时与进度估算，服务重启后据此恢复列表',
+        'text',
+      ),
+    );
+
+    const sources: KimodoArtifactSource[] = [];
+    const transitionFrames = Math.max(1, Math.round(conditioned?.transitionFrames ?? 1));
+
+    // ---- conditioned：完整展示四个约束切片 + 平移后的 next root ----
+    if (conditioned) {
+      const prevTotal = conditioned.prevAnimationId
+        ? this.motionFrameCount(conditioned.prevAnimationId, 'root')
+        : null;
+      const nextTotal = conditioned.nextAnimationId
+        ? this.motionFrameCount(conditioned.nextAnimationId, 'root')
+        : null;
+      const prevRange =
+        prevTotal !== null
+          ? { start: Math.max(0, prevTotal - transitionFrames), end: prevTotal, total: prevTotal }
+          : null;
+      const nextRange =
+        nextTotal !== null
+          ? { start: 0, end: Math.min(transitionFrames, nextTotal), total: nextTotal }
+          : null;
+      const sliceLabel = (
+        role: 'prev' | 'next',
+        animationId: string | undefined,
+        range: { start: number; end: number; total: number } | null,
+      ): string => {
+        if (!animationId) return `外部 ${role} 约束文件`;
+        const side = role === 'prev' ? '尾部' : '头部';
+        if (!range) return `${role} 动画 ${animationId} 的${side}约束`;
+        return `${role} 动画 ${animationId} 的${side} ${range.end - range.start} 帧（第 ${range.start + 1}–${range.end} 帧 / 共 ${range.total} 帧）`;
+      };
+
+      const prevLabel = sliceLabel('prev', conditioned.prevAnimationId, prevRange);
+      const nextLabel = sliceLabel('next', conditioned.nextAnimationId, nextRange);
+
+      artifacts.push(
+        this.f32Artifact(
+          'prev-root',
+          'prev 约束 · 根位移',
+          conditioned.prevRootPath,
+          12,
+          3,
+          `约束输入：${prevLabel}。每帧 3 个 float32（XYZ），作为过渡段起点的硬约束。`,
+          'constraint',
+          prevLabel,
+        ),
+        this.f32Artifact(
+          'prev-rot',
+          'prev 约束 · 关节旋转',
+          conditioned.prevRotPath,
+          480,
+          120,
+          `约束输入：${prevLabel}。每帧 30 关节 × 4 分量（XYZW），与 prev 根位移成对使用。`,
+          'constraint',
+          prevLabel,
+        ),
+        this.f32Artifact(
+          'next-root',
+          'next 约束 · 根位移（平移前）',
+          conditioned.nextRootPath,
+          12,
+          3,
+          `约束输入：${nextLabel}。每帧 3 个 float32（XYZ），作为过渡段终点的硬约束（原始文件）。`,
+          'constraint',
+          nextLabel,
+        ),
+        this.f32Artifact(
+          'next-rot',
+          'next 约束 · 关节旋转',
+          conditioned.nextRotPath,
+          480,
+          120,
+          `约束输入：${nextLabel}。每帧 30 关节 × 4 分量（XYZW），与 next 根位移成对使用。`,
+          'constraint',
+          nextLabel,
+        ),
+      );
+
+      if (conditioned.nextRootShiftedPath) {
+        const offset = this.rootShiftOffset(conditioned);
+        const delta = conditioned.rootDelta;
+        const deltaText = delta
+          ? `rootDelta = (Δx ${delta.dx.toFixed(3)} m, Δz ${delta.dz.toFixed(3)} m)`
+          : 'rootDelta';
+        const appliedText = offset
+          ? `，实际平移 = (Δx ${offset.x.toFixed(3)} m, Δz ${offset.z.toFixed(3)} m)`
+          : '';
+        artifacts.push(
+          this.f32Artifact(
+            'next-root-shifted',
+            'next 约束 · 平移后的根位移',
+            conditioned.nextRootShiftedPath,
+            12,
+            3,
+            `中间产物：${deltaText}${appliedText}。shim 实际读取的 next 根位置约束，负责把舞台位移编码进首尾约束。`,
+            'constraint',
+            nextLabel,
+          ),
+        );
+      }
+    }
+
+    // ---- 生成输出：root_positions.f32 / local_rotations_xyzw.f32 ----
+    artifacts.push(
+      this.f32Artifact(
+        'root',
+        '输出 · 根位移',
+        path.join(dir, 'root_positions.f32'),
+        12,
+        3,
+        `生成结果：根关节世界位置，每帧 3 个 float32（XYZ）；任务声明 ${task.frames} 帧。`,
+        'motion',
+      ),
+      this.f32Artifact(
+        'rotations',
+        '输出 · 关节旋转',
+        path.join(dir, 'local_rotations_xyzw.f32'),
+        480,
+        120,
+        `生成结果：30 关节局部旋转，每帧 30 × 4 分量（XYZW）；任务声明 ${task.frames} 帧。`,
+        'motion',
+      ),
+    );
+
+    // ---- 导入产物：Mixamo JSON（导入新建动画后才会生成） ----
+    artifacts.push(
+      this.baseArtifact(
+        'mixamo',
+        'Mixamo 动画 JSON',
+        this.mixamoFile(id),
+        'json',
+        'to_mixamo.py 重定向后的 fbx-animation-data，可导入新建动画',
+        'import',
+      ),
+    );
+
+    // ---- 关联关系 1：conditioned 的 prev / next 来源动画 ----
+    if (conditioned?.prevAnimationId) {
+      sources.push(this.sourceRelation('prev', conditioned.prevAnimationId, transitionFrames));
+    }
+    if (conditioned?.nextAnimationId) {
+      sources.push(this.sourceRelation('next', conditioned.nextAnimationId, transitionFrames));
+    }
+
+    // ---- 关联关系 2：Mixamo JSON 片段名 / 提示词前缀与项目 imported.name 对齐 ----
     const clipName = this.mixamoClipName(id);
     const expected = task.prompt.slice(0, 40);
     const projects = await listProjects();
@@ -1053,7 +1390,7 @@ class KimodoService {
         trackCount: project.trackCount,
       }));
 
-    return { task, artifacts, relations };
+    return { task, artifacts, relations, sources };
   }
 
   /** 读取 Mixamo JSON 里的第一个片段名（没有导入过时为 null） */
@@ -1083,9 +1420,10 @@ class KimodoService {
 
     const MAX_BYTES = 2 * 1024 * 1024;
 
-    // 提示词可能有多段（segment-01.txt、segment-02.txt…），按顺序拼起来展示
+    // 文本任务有多段提示词（segment-01.txt…）；conditioned 任务只有 prompt.txt
     if (key === 'prompt') {
       const files = this.segmentFiles(dir);
+      if (files.length === 0 && fs.existsSync(path.join(dir, 'prompt.txt'))) files.push('prompt.txt');
       if (files.length === 0) return null;
       const chunks: string[] = [];
       let size = 0;

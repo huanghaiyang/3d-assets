@@ -30,7 +30,10 @@ export interface StoredSegment {
     | { kind: 'anim-project'; projectId: string; projectName: string };
   trimStart: number;
   trimEnd: number;
-  blendIn: number;
+  /** 该段在全局时间轴上的起点（秒）；缺省表示紧跟上一段结束 */
+  start?: number;
+  /** 自定义标识色（#rrggbb）；缺省按序号自动生成 */
+  color?: string;
   /** 该段的独立站位（相对角色摆放的偏移）；缺省表示沿用角色摆放 */
   pose?: { x: number; z: number; yaw: number };
   /** 由「过渡动画生成」得到的过渡段：记录它连接的前后两段 */
@@ -132,7 +135,10 @@ function normalizeSegment(raw: unknown, index: number): StoredSegment | null {
     source: normalized,
     trimStart: Math.max(0, finite(value.trimStart)),
     trimEnd: Math.max(0, finite(value.trimEnd)),
-    blendIn: Math.max(0, finite(value.blendIn)),
+    ...(typeof value.start === 'number' && Number.isFinite(value.start) ? { start: Math.max(0, value.start) } : {}),
+    ...(typeof value.color === 'string' && /^#[0-9a-f]{6}$/i.test(value.color)
+      ? { color: value.color.toLowerCase() }
+      : {}),
     ...(hasPose ? { pose: { x: finite(pose?.x), z: finite(pose?.z), yaw: finite(pose?.yaw) } } : {}),
     ...(hasLink ? { transition: { prevId: link!.prevId as string, nextId: link!.nextId as string } } : {}),
   };

@@ -19,6 +19,8 @@ onMounted(() => {
     await store.loadInfo();
     await store.loadProjects();
     await store.reload();
+    // 舞台点「去编辑」跳过来时，把对应 FBX 片段建成可编辑项目并打开
+    await store.consumeStageClipEdit();
   })();
 });
 

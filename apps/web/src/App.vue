@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { defineAsyncComponent, onBeforeUnmount, onMounted, ref } from 'vue';
+import { defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import TopBar from './components/TopBar.vue';
 import GeneratePanel from './components/GeneratePanel.vue';
 import ViewportPanel from './components/ViewportPanel.vue';
@@ -30,6 +30,16 @@ function changePage(value: 'workbench' | 'animations' | 'stage'): void {
 
 onMounted(() => store.startPolling());
 onBeforeUnmount(() => store.stopPolling());
+
+// 其它页面（舞台「去编辑」）可以请求跳转；消费后立刻清空，避免重复触发
+watch(
+  () => store.pageRequest,
+  (request) => {
+    if (!request) return;
+    changePage(request);
+    store.pageRequest = null;
+  },
+);
 </script>
 
 <template>

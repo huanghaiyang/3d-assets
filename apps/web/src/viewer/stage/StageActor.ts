@@ -85,6 +85,8 @@ export interface StageActor {
   solveLegIk(side: 'left' | 'right', targetWorld: THREE.Vector3, strength: number): boolean;
   /** 骨架类角色的线/点缓冲刷新；FBX 角色为空实现 */
   syncVisuals(): void;
+  /** 骨架连线用的骨骼对（父→子）；不支持骨骼渲染的角色返回空数组 */
+  boneSegments(): { parent: THREE.Object3D; child: THREE.Object3D }[];
   dispose(): void;
 }
 
@@ -397,6 +399,10 @@ export abstract class MixerActor implements StageActor {
 
   syncVisuals(): void {
     // FBX 角色由网格承载，不需要额外刷新
+  }
+
+  boneSegments(): { parent: THREE.Object3D; child: THREE.Object3D }[] {
+    return [];
   }
 
   dispose(): void {

@@ -3,6 +3,7 @@ import { onBeforeUnmount, onMounted, ref } from 'vue';
 import Icon from '../ui/Icon.vue';
 import ActorInspector from './ActorInspector.vue';
 import SequenceEditor from './SequenceEditor.vue';
+import StageTimeline from './StageTimeline.vue';
 import StageViewport from './StageViewport.vue';
 import { useStageStore } from '@/stores/stage';
 
@@ -12,7 +13,8 @@ const editingId = ref<string | null>(null);
 const draftName = ref('');
 
 onMounted(() => {
-  void store.bootstrap();
+  // 从动画编辑区返回：等文档载入后把刚编辑保存的片段回填到对应段
+  void store.bootstrap().then(() => store.applyStageClipEditResult());
   window.addEventListener('keydown', onKeydown);
 });
 
@@ -167,7 +169,10 @@ function confirmRemove(id: string): void {
     </aside>
 
     <main class="center">
-      <StageViewport />
+      <div class="view">
+        <StageViewport />
+      </div>
+      <StageTimeline />
       <div v-if="store.loading" class="loading panel">载入舞台…</div>
     </main>
 
@@ -203,7 +208,17 @@ function confirmRemove(id: string): void {
 
 .center {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   min-width: 0;
+  min-height: 0;
+}
+
+.view {
+  position: relative;
+  flex: 1;
+  min-height: 0;
   border-radius: var(--radius);
   overflow: hidden;
   border: 1px solid var(--border);

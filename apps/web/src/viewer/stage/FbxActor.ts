@@ -138,6 +138,15 @@ export class FbxActor extends MixerActor {
     return new FbxGhost(this.model, this.hips.name, inputs, options);
   }
 
+  /** 骨骼连线：每根骨骼连到它的父节点（Mixamo 的包裹节点也在同一位置，视觉上等价） */
+  boneSegments(): { parent: THREE.Object3D; child: THREE.Object3D }[] {
+    const pairs: { parent: THREE.Object3D; child: THREE.Object3D }[] = [];
+    for (const bone of this.bones) {
+      if (bone.parent) pairs.push({ parent: bone.parent, child: bone });
+    }
+    return pairs;
+  }
+
   /** FBX 克隆共享几何体与材质，释放会误伤其他角色，交给源缓存统一管理 */
   protected override disposeModel(): void {
     this.motion.remove(this.model as THREE.Object3D);

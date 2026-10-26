@@ -45,6 +45,7 @@ const PATHS: Record<string, string> = {
   play: 'M8 5.2v13.6L19 12 8 5.2z',
   pause: 'M10 4H7v16h3zM17 4h-3v16h3z',
   film: 'M4 4h16v16H4zM4 9h16M4 15h16M9 4v16M15 4v16',
+  hash: 'M10 3L8 21M16 3l-2 18M4 9h16M3 15h16',
   repeat: 'M17 1l4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 23l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3',
   flip: 'M12 3v18M7 8L3 12l4 4M17 8l4 4-4 4',
   lock: 'M19 11H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2zM7 11V7a5 5 0 0 1 10 0v4',

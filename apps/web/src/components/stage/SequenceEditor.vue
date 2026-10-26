@@ -3,6 +3,7 @@ import { computed, ref } from 'vue';
 import Icon from '../ui/Icon.vue';
 import { useStageStore, type TransitionTask } from '@/stores/stage';
 import { buildTimeline } from '@/viewer/stage/SequenceTimeline';
+import { resolveSegmentColor } from '@/viewer/stage/segmentColors';
 import type { AnimationFile } from '@/api/animation';
 import type { SegmentDef } from '@/viewer/stage/StageTypes';
 
@@ -68,8 +69,13 @@ async function addAnimationProject(projectId: string, projectName: string): Prom
   pickerOpen.value = false;
 }
 
-function updateTrim(id: string, key: 'trimStart' | 'trimEnd' | 'blendIn', event: Event): void {
+function updateTrim(id: string, key: 'trimStart' | 'trimEnd', event: Event): void {
   store.updateSegment(id, { [key]: Number((event.target as HTMLInputElement).value) || 0 });
+}
+
+/** 时间轴上的全局起点（与舞台下方的时间轴拖动等价） */
+function updateStart(id: string, event: Event): void {
+  store.setSegmentStart(id, Number((event.target as HTMLInputElement).value) || 0);
 }
 
 function updatePose(id: string, key: 'x' | 'z' | 'yaw', event: Event): void {
@@ -103,9 +109,20 @@ const rows = computed(() =>
       prev,
       task: prev ? store.transitionTaskFor(prev.id, segment.id) : null,
       locked: store.isSegmentLocked(segment.id),
+      color: resolveSegmentColor(index, segment.color),
+      distance: store.travel[segment.id] ?? null,
     };
   }),
 );
+
+/** 实际运动距离：只读，由舞台播放器按裁剪区间首尾采样算出来 */
+function distanceText(distance: number | null): string {
+  return distance === null ? '—' : `${distance.toFixed(2)} m`;
+}
+
+function updateColor(id: string, event: Event): void {
+  store.setSegmentColor(id, (event.target as HTMLInputElement).value);
+}
 
 const STATUS_TEXT: Record<TransitionTask['status'], string> = {
   submitting: '提交中…',
@@ -117,6 +134,18 @@ const STATUS_TEXT: Record<TransitionTask['status'], string> = {
 function transitionMeta(task: TransitionTask): string {
   if (task.status === 'failed') return task.message ?? '';
   return `${task.frames} 帧 · 位移 ${task.distance.toFixed(1)}m · 转向 ${task.turnDeg}°`;
+}
+
+function regenText(id: string): string {
+  const task = store.regenerateTaskFor(id);
+  if (!task || task.status === 'failed') return '重新生成';
+  return STATUS_TEXT[task.status];
+}
+
+function regenTitle(id: string): string {
+  const task = store.regenerateTaskFor(id);
+  if (task?.status === 'failed') return `上次生成失败：${task.message ?? '未知原因'}，点击重试`;
+  return '用 Kimodo 基于前一段末帧和后一段首帧重新生成过渡（要求前后两段都是 Kimodo 动画）';
 }
 </script>
 
@@ -176,7 +205,7 @@ function transitionMeta(task: TransitionTask): string {
             @click="store.selectSegment(row.segment.id)"
           >
             <div class="segment-head">
-              <span class="index mono">{{ row.index + 1 }}</span>
+              <span class="index mono" :style="{ background: row.color, color: '#0b1220' }">{{ row.index + 1 }}</span>
               <span class="segment-name">{{ store.sourceLabel(row.segment.source) }}</span>
               <span v-if="row.segment.transition" class="chip chip-accent">过渡</span>
               <span class="faint mono">
@@ -197,23 +226,23 @@ function transitionMeta(task: TransitionTask): string {
 
             <div class="segment-fields">
               <label class="field">
-                <span class="field-label">起点 s</span>
+                <span class="field-label">裁入 s</span>
                 <input class="text-input" type="number" step="0.05" min="0" :disabled="row.locked" :value="format(row.segment.trimStart)" @change="updateTrim(row.segment.id, 'trimStart', $event)" />
               </label>
               <label class="field">
-                <span class="field-label">终点 s</span>
+                <span class="field-label">裁出 s</span>
                 <input class="text-input" type="number" step="0.05" min="0" :disabled="row.locked" :value="format(row.segment.trimEnd)" @change="updateTrim(row.segment.id, 'trimEnd', $event)" />
               </label>
               <label class="field">
-                <span class="field-label">重叠 s</span>
+                <span class="field-label">轴起点 s</span>
                 <input
                   class="text-input"
                   type="number"
                   step="0.05"
                   min="0"
-                  :value="format(row.segment.blendIn)"
-                  :disabled="row.index === 0 || row.locked"
-                  @change="updateTrim(row.segment.id, 'blendIn', $event)"
+                  :value="format(timeline.timings[row.index]?.start ?? 0)"
+                  :disabled="row.locked"
+                  @change="updateStart(row.segment.id, $event)"
                 />
               </label>
             </div>
@@ -231,6 +260,62 @@ function transitionMeta(task: TransitionTask): string {
                 <span class="field-label">朝向°</span>
                 <input class="text-input" type="number" step="5" :disabled="row.locked" :value="poseText(row.segment, 'yaw')" @change="updatePose(row.segment.id, 'yaw', $event)" />
               </label>
+            </div>
+
+            <div class="segment-metrics">
+              <label class="color-field" title="片段颜色（时间轴与残影同步使用）">
+                <input
+                  class="color-input"
+                  type="color"
+                  :value="row.color"
+                  :disabled="row.locked"
+                  @click.stop
+                  @change.stop="updateColor(row.segment.id, $event)"
+                />
+                <span class="faint">颜色</span>
+              </label>
+              <span
+                v-if="row.segment.color"
+                class="reset-color faint"
+                title="恢复按序号自动配色"
+                @click.stop="store.setSegmentColor(row.segment.id, null)"
+              >
+                自动
+              </span>
+              <span class="metric" title="该段根运动在裁剪区间内的实际水平位移（只读）">
+                实际运动距离 <b class="mono">{{ distanceText(row.distance) }}</b>
+              </span>
+              <span class="grow"></span>
+              <button
+                v-if="row.segment.transition && row.segment.source.kind === 'kimodo'"
+                class="btn btn-sm"
+                type="button"
+                :disabled="row.locked"
+                :title="regenTitle(row.segment.id)"
+                @click.stop="store.regenerateTransition(row.segment.id)"
+              >
+                {{ regenText(row.segment.id) }}
+              </button>
+              <button
+                v-if="row.segment.transition && row.segment.source.kind === 'kimodo' && actor?.kind === 'fbx'"
+                class="btn btn-sm"
+                type="button"
+                :disabled="row.locked || store.convertingSegmentId === row.segment.id"
+                title="把过渡动画重定向并保存为 FBX 动画，替换当前段"
+                @click.stop="store.convertTransitionToFbx(row.segment.id)"
+              >
+                {{ store.convertingSegmentId === row.segment.id ? '转换中…' : '转 FBX' }}
+              </button>
+              <button
+                v-if="row.segment.source.kind === 'fbx-clip' && actor?.kind === 'fbx'"
+                class="btn btn-sm"
+                type="button"
+                :disabled="row.locked"
+                title="把这个 FBX 片段建成可编辑项目，跳到动画编辑区"
+                @click.stop="store.editSegmentInEditor(row.segment.id)"
+              >
+                去编辑
+              </button>
             </div>
 
             <div class="pose-foot">
@@ -537,6 +622,46 @@ function transitionMeta(task: TransitionTask): string {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
   margin-top: 6px;
+}
+
+.segment-metrics {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 11px;
+}
+
+.color-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.color-input {
+  width: 20px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.reset-color {
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.metric b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.grow {
+  flex: 1;
 }
 
 .pose-foot {

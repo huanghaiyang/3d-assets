@@ -9,17 +9,21 @@ import {
 } from '@/api/animation';
 import { kimodoApi, type KimodoAnimation } from '@/api/kimodo';
 import { stageApi } from '@/api/stage';
+import { useAnimationStore } from '@/stores/animation';
+import { useWorkspaceStore } from '@/stores/workspace';
 import { rotateXZ } from '@/viewer/stage/StageActor';
+import { buildTimeline } from '@/viewer/stage/SequenceTimeline';
 import type { StagePlayer } from '@/viewer/stage/StagePlayer';
-import type {
-  ActorKind,
-  ActorTransform,
-  SegmentDef,
-  SegmentPose,
-  SegmentSource,
-  StageActorDef,
-  StageDoc,
-  StageSummary,
+import {
+  actorSegments,
+  type ActorKind,
+  type ActorTransform,
+  type SegmentDef,
+  type SegmentPose,
+  type SegmentSource,
+  type StageActorDef,
+  type StageDoc,
+  type StageSummary,
 } from '@/viewer/stage/StageTypes';
 
 export interface StageToast {
@@ -34,17 +38,33 @@ export interface TransitionTask {
   prevId: string;
   nextId: string;
   actorId: string;
+  /** 重新生成时被替换的过渡段 id；普通插入任务没有 */
+  targetId?: string;
+  /** insert = 在两段之间插入新过渡；regenerate = 原位替换已有过渡 */
+  mode?: 'insert' | 'regenerate';
   status: 'submitting' | 'queued' | 'running' | 'failed';
   jobId?: string;
   frames: number;
   distance: number;
   turnDeg: number;
   prompt: string;
+  /** 重新生成时提交前校准出的起始站位，完成后原样落到过渡段上 */
+  startPose?: SegmentPose;
   message?: string;
 }
 
 function createId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `id-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+/** 时间轴拖动的吸附步长（秒） */
+const TIME_SNAP = 0.05;
+
+/** 片段裁剪后的时长，与 buildTimeline 的最小长度保持一致 */
+function segmentLength(segment: SegmentDef): number {
+  const trimStart = Math.max(0, Number.isFinite(segment.trimStart) ? segment.trimStart : 0);
+  const trimEnd = Math.max(trimStart, Number.isFinite(segment.trimEnd) ? segment.trimEnd : 0);
+  return Math.max(0.05, trimEnd - trimStart);
 }
 
 /** Kimodo 动作按 30fps 生成，用于估算片段时长 */
@@ -66,6 +86,14 @@ export const useStageStore = defineStore('stage', () => {
   /** 结尾帧残影开关：与运动残影(onionSkin)独立，默认开启 */
   const showEndGhosts = ref(false);
   const showPath = ref(false);
+  /** 残影头顶标注动画序号 */
+  const showNumbers = ref(false);
+  /** 渲染角色骨架连线 */
+  const showSkeleton = ref(false);
+  /** 各段自身根运动的实际水平距离（米），按段 id 缓存 */
+  const travel = ref<Record<string, number>>({});
+  /** 正在转 FBX 的过渡段 id（按钮转圈用） */
+  const convertingSegmentId = ref<string | null>(null);
 
   const time = ref(0);
   const duration = ref(0);
@@ -134,9 +162,11 @@ export const useStageStore = defineStore('stage', () => {
     instance.setOnionSkin(onionSkin.value);
     instance.setShowEndGhosts(showEndGhosts.value);
     instance.setShowPath(showPath.value);
+    instance.setShowNumbers(showNumbers.value);
+    instance.setShowSkeleton(showSkeleton.value);
     // 重进舞台页时恢复当前选中角色（选中环与 gizmo 依赖它）
     instance.setSelectedActor(selectedActorId.value);
-    void instance.setDoc(doc.value);
+    void instance.setDoc(doc.value).then(() => refreshTravel());
     // 生成中重进舞台页：恢复冻结状态
     applyLocks();
   }
@@ -146,7 +176,21 @@ export const useStageStore = defineStore('stage', () => {
   }
 
   function syncPlayer(): void {
-    void player?.setDoc(doc.value);
+    void player?.setDoc(doc.value).then(() => refreshTravel());
+  }
+
+  /** 重算各段的实际运动距离：需要片段已加载，所以放在 setDoc 之后 */
+  function refreshTravel(): void {
+    if (!player || !doc.value) {
+      travel.value = {};
+      return;
+    }
+    const next: Record<string, number> = {};
+    for (const segment of doc.value.segments) {
+      const value = player.measureTravel(segment.actorId, segment.id);
+      if (value !== null) next[segment.id] = value;
+    }
+    travel.value = next;
   }
 
   // ===== 撤销 / 重做 =====
@@ -241,7 +285,9 @@ export const useStageStore = defineStore('stage', () => {
   }
 
   function isSegmentLocked(id: string): boolean {
-    return activeTasks().some((task) => task.prevId === id || task.nextId === id);
+    return activeTasks().some(
+      (task) => task.prevId === id || task.nextId === id || task.targetId === id,
+    );
   }
 
   function isActorLocked(id: string): boolean {
@@ -264,11 +310,17 @@ export const useStageStore = defineStore('stage', () => {
     return transitionTasks.value[taskKey(prevId, nextId)] ?? null;
   }
 
+  /** 某个过渡段自己的「重新生成」任务 */
+  function regenerateTaskFor(id: string): TransitionTask | null {
+    return Object.values(transitionTasks.value).find((task) => task.targetId === id) ?? null;
+  }
+
   function applyLocks(): void {
     const segmentIds: string[] = [];
     const actorIds: string[] = [];
     for (const task of activeTasks()) {
       segmentIds.push(task.prevId, task.nextId);
+      if (task.targetId) segmentIds.push(task.targetId);
       actorIds.push(task.actorId);
     }
     player?.setLocked(segmentIds, actorIds);
@@ -347,7 +399,11 @@ export const useStageStore = defineStore('stage', () => {
         return;
       }
       if (job.status === 'ready') {
-        await completeTransition(key, job.id, job.frames);
+        if (task.mode === 'regenerate' && task.targetId) {
+          await completeRegeneration(key, job.id, job.frames);
+        } else {
+          await completeTransition(key, job.id, job.frames);
+        }
         return;
       }
       putTask({ ...task, status: job.status });
@@ -369,26 +425,41 @@ export const useStageStore = defineStore('stage', () => {
       return;
     }
     const prev = segments[prevIndex];
-    const next = segments[nextIndex];
     const startPose = player?.segmentEndPose(task.actorId, task.prevId) ?? {
       ...(prev.pose ?? { x: 0, z: 0, yaw: 0 }),
     };
     const duration = Math.max(0.2, frames / SOMA_FPS);
+    // 过渡段紧接前一段结束（首尾帧已精确对齐，不需要交叉淡化）
+    const ordered = segments.filter((item) => item.actorId === task.actorId);
+    const prevPlan = buildTimeline(ordered);
+    const prevPosition = ordered.findIndex((item) => item.id === prev.id);
+    const start = prevPlan.timings[prevPosition]?.end ?? 0;
     const segment: SegmentDef = {
       id: createId(),
       actorId: task.actorId,
       source: { kind: 'kimodo', animationId },
       trimStart: 0,
       trimEnd: duration,
-      blendIn: 0.2,
+      start,
       pose: startPose,
       transition: { prevId: task.prevId, nextId: task.nextId },
     };
 
     recordHistory('generate-transition', false);
-    // 过渡段尾帧与下一段首帧用短交叉衔接，避免长窗口里来回滑
-    next.blendIn = Math.min(next.blendIn, 0.2);
     segments.splice(prevIndex + 1, 0, segment);
+    // 系统先帮忙对齐：从过渡段之后开始，把被压住的段依次右移，保持首尾相接
+    let cursor = start + duration;
+    let passed = false;
+    for (const item of segments.filter((entry) => entry.actorId === task.actorId)) {
+      if (item.id === segment.id) {
+        passed = true;
+        continue;
+      }
+      if (!passed) continue;
+      const aligned = Math.max(item.start ?? cursor, cursor);
+      item.start = aligned;
+      cursor = aligned + segmentLength(item);
+    }
     selectedSegmentId.value = segment.id;
     syncPlayer();
     clearTask(key);
@@ -411,6 +482,8 @@ export const useStageStore = defineStore('stage', () => {
       toast('error', '只能为同一角色的相邻两段生成过渡');
       return;
     }
+    // 该角色已有过渡生成/重新生成任务时不再并发提交
+    if (guardLockedActor(prev.actorId)) return;
     const list = actorSegmentsList.value;
     const position = list.findIndex((item) => item.id === prevId);
     if (position < 0 || list[position + 1]?.id !== nextId) {
@@ -511,6 +584,164 @@ export const useStageStore = defineStore('stage', () => {
     }
   }
 
+  /** 重新生成完成：原位替换过渡段的动画与时长，并把后面的段整体顺延 */
+  async function completeRegeneration(
+    key: string,
+    animationId: string,
+    frames: number,
+  ): Promise<void> {
+    const task = transitionTasks.value[key];
+    if (!task?.targetId || !doc.value) return;
+    const target = doc.value.segments.find((item) => item.id === task.targetId);
+    if (!target) {
+      failTransition(key, '舞台内容已改变，过渡段未更新');
+      return;
+    }
+    const duration = Math.max(0.2, frames / SOMA_FPS);
+    recordHistory(`regenerate-transition:${target.id}`, false);
+    target.source = { kind: 'kimodo', animationId };
+    target.trimStart = 0;
+    target.trimEnd = duration;
+    if (task.startPose) target.pose = { ...task.startPose };
+
+    // 新过渡的时长可能变了：从它之后开始依次顺延，保持首尾相接
+    const ordered = doc.value.segments.filter((item) => item.actorId === task.actorId);
+    const position = ordered.findIndex((item) => item.id === target.id);
+    let cursor = (target.start ?? 0) + duration;
+    for (let index = position + 1; index < ordered.length; index += 1) {
+      const item = ordered[index];
+      item.start = Math.max(item.start ?? cursor, cursor);
+      cursor = item.start + segmentLength(item);
+    }
+
+    selectedSegmentId.value = target.id;
+    syncPlayer();
+    clearTask(key);
+    toast('success', '过渡动画已重新生成');
+    void loadCatalog();
+  }
+
+  /**
+   * 重新生成已有过渡段：前提是它仍有 prev/next，且前后两段都是 Kimodo 源。
+   * 提交前按当前舞台重新校准 prev 末帧落点、next 站位、位移/转向与帧数，
+   * 完成后原位替换该过渡段。
+   */
+  async function regenerateTransition(id: string): Promise<void> {
+    if (!doc.value) return;
+    if (guardLockedSegment(id)) return;
+    const segment = doc.value.segments.find((item) => item.id === id);
+    if (!segment) return;
+    if (!segment.transition) {
+      toast('error', '该段不是过渡动画');
+      return;
+    }
+    if (guardLockedActor(segment.actorId)) return;
+
+    const { prevId, nextId } = segment.transition;
+    const prev = doc.value.segments.find((item) => item.id === prevId);
+    const next = doc.value.segments.find((item) => item.id === nextId);
+    if (!prev || !next) {
+      toast('error', '缺少前一段或后一段动画，无法重新生成');
+      return;
+    }
+    if (prev.actorId !== segment.actorId || next.actorId !== segment.actorId) {
+      toast('error', '前一段、后一段必须和过渡段属于同一角色');
+      return;
+    }
+    // 缺少任何一侧的 Kimodo 动画都不生成
+    const prevAnimId = prev.source.kind === 'kimodo' ? prev.source.animationId : null;
+    const nextAnimId = next.source.kind === 'kimodo' ? next.source.animationId : null;
+    if (!prevAnimId || !nextAnimId) {
+      toast('error', '前后两段必须都是 Kimodo 动画，才能重新生成过渡');
+      return;
+    }
+    // 顺序必须是 prev → 过渡段 → next
+    const ordered = actorSegments(doc.value, segment.actorId);
+    const position = ordered.findIndex((item) => item.id === id);
+    if (
+      position <= 0 ||
+      ordered[position - 1]?.id !== prevId ||
+      ordered[position + 1]?.id !== nextId
+    ) {
+      toast('error', '过渡段必须紧挨在前后两段之间，才能重新生成');
+      return;
+    }
+
+    const key = `regen:${id}`;
+    const existing = transitionTasks.value[key];
+    if (existing) {
+      if (existing.status !== 'failed') return;
+      clearTask(key);
+    }
+
+    // 提交前重新校准：prev 播放到末帧的真实落点 + next 的当前站位
+    const startPose = player?.segmentEndPose(prev.actorId, prevId) ?? {
+      ...(prev.pose ?? { x: 0, z: 0, yaw: 0 }),
+    };
+    const endPose = next.pose ?? { x: 0, z: 0, yaw: 0 };
+    const dx = endPose.x - startPose.x;
+    const dz = endPose.z - startPose.z;
+    const distance = Math.hypot(dx, dz);
+    const turn = Math.atan2(
+      Math.sin(endPose.yaw - startPose.yaw),
+      Math.cos(endPose.yaw - startPose.yaw),
+    );
+    const local = rotateXZ(dx, dz, -startPose.yaw);
+    const duration = Math.min(
+      3.2,
+      Math.max(0.8, Math.max(distance / 1.25 + 0.25, Math.abs(turn) / (Math.PI * 0.9) + 0.35)),
+    );
+    const frames = Math.max(24, Math.min(96, Math.round((duration * SOMA_FPS) / 2) * 2));
+
+    const task: TransitionTask = {
+      key,
+      prevId,
+      nextId,
+      targetId: id,
+      mode: 'regenerate',
+      actorId: prev.actorId,
+      status: 'submitting',
+      frames,
+      distance,
+      turnDeg: Math.round((turn * 180) / Math.PI),
+      prompt: transitionPrompt(distance, local, turn),
+      startPose: { ...startPose },
+    };
+    putTask(task);
+
+    try {
+      // 两段都有 animationId：走真实 pose 约束（首尾各 1 帧 + 舞台位移 rootDelta）
+      const job = await kimodoApi.generateConditioned({
+        prevAnimationId: prevAnimId,
+        nextAnimationId: nextAnimId,
+        frames,
+        transitionFrames: 1,
+        steps: 50,
+        prompt: task.prompt,
+        rootDelta: { dx: local.x, dz: local.z },
+      });
+
+      const live = transitionTasks.value[key];
+      if (!live) return;
+      if (job.status === 'failed') {
+        failTransition(key, job.error || 'Kimodo 生成本身失败');
+        return;
+      }
+      putTask({ ...live, jobId: job.id, status: job.status === 'ready' ? 'running' : job.status });
+      if (job.status === 'ready') {
+        await completeRegeneration(key, job.id, job.frames);
+        return;
+      }
+      schedulePoll(key);
+      toast(
+        'info',
+        `已提交过渡动画重新生成（${frames} 帧，位移 ${distance.toFixed(1)}m / 转向 ${task.turnDeg}°），生成期间过渡段与前后两段已冻结`,
+      );
+    } catch (error) {
+      failTransition(key, (error as Error).message);
+    }
+  }
+
   // ===== 文档 =====
 
   function newStage(name = '新舞台'): void {
@@ -545,11 +776,21 @@ export const useStageStore = defineStore('stage', () => {
     try {
       const loaded = await stageApi.get(id);
       doc.value = { ...loaded, actors: loaded.actors ?? [], segments: loaded.segments ?? [] };
+      // 旧文档没有显式起点：按顺序折算后写死，之后拖动某一块不会连带后面的块
+      for (const actor of doc.value.actors) {
+        const ordered = actorSegments(doc.value, actor.id);
+        const plan = buildTimeline(ordered);
+        ordered.forEach((segment, index) => {
+          if (segment.start === undefined) segment.start = plan.timings[index]?.start ?? 0;
+        });
+      }
       selectedActorId.value = doc.value.actors[0]?.id ?? null;
       selectedSegmentId.value = null;
       time.value = 0;
       resetHistory();
       await player?.setDoc(doc.value);
+      // 片段加载完后才能采样实际运动距离
+      refreshTravel();
       player?.setSelectedActor(selectedActorId.value);
     } catch (error) {
       toast('error', `打开舞台失败：${(error as Error).message}`);
@@ -714,27 +955,44 @@ export const useStageStore = defineStore('stage', () => {
     if (!doc.value) return;
     recordHistory('add-segment', false);
     const length = Math.max(0.05, clipDuration || 1);
+    // 系统先帮忙对齐：新段排在序列末尾，起点取该角色当前时间轴的结束时刻
+    const ordered = actorSegments(doc.value, actorId);
+    const start = ordered.length > 0 ? buildTimeline(ordered).total : 0;
     const segment: SegmentDef = {
       id: createId(),
       actorId,
       source,
       trimStart: 0,
       trimEnd: length,
-      blendIn: Math.min(0.3, length / 4),
+      start,
     };
     doc.value.segments.push(segment);
     selectedSegmentId.value = segment.id;
     syncPlayer();
   }
 
-  function updateSegment(id: string, patch: Partial<Pick<SegmentDef, 'trimStart' | 'trimEnd' | 'blendIn'>>): void {
+  function updateSegment(id: string, patch: Partial<Pick<SegmentDef, 'trimStart' | 'trimEnd'>>): void {
     if (guardLockedSegment(id)) return;
     const segment = doc.value?.segments.find((item) => item.id === id);
     if (!segment) return;
     recordHistory(`segment:${id}:${Object.keys(patch).join(',')}`);
     if (patch.trimStart !== undefined) segment.trimStart = Math.max(0, patch.trimStart);
     if (patch.trimEnd !== undefined) segment.trimEnd = Math.max(segment.trimStart + 0.05, patch.trimEnd);
-    if (patch.blendIn !== undefined) segment.blendIn = Math.max(0, Math.min(2, patch.blendIn));
+    syncPlayer();
+  }
+
+  /** 时间轴拖动：改某段在全局时间轴上的起点（吸附到 0.05s，最左压到上一段起点） */
+  function setSegmentStart(id: string, start: number): void {
+    if (guardLockedSegment(id)) return;
+    const segment = doc.value?.segments.find((item) => item.id === id);
+    if (!segment || !Number.isFinite(start)) return;
+    const ordered = actorSegments(doc.value!, segment.actorId);
+    const position = ordered.findIndex((item) => item.id === id);
+    const lower = position > 0 ? buildTimeline(ordered).timings[position - 1].start : 0;
+    const next = Math.max(lower, Math.round(Math.max(0, start) / TIME_SNAP) * TIME_SNAP);
+    if (segment.start === next) return;
+    recordHistory(`start:${id}`);
+    segment.start = next;
     syncPlayer();
   }
 
@@ -785,11 +1043,49 @@ export const useStageStore = defineStore('stage', () => {
     const position = indexes.findIndex((entry) => entry.item.id === id);
     const target = indexes[position + delta];
     if (!target) return;
+    const ordered = indexes.map((entry) => entry.item);
+    const plan = buildTimeline(ordered);
+    const fromStart = plan.timings[position]?.start ?? 0;
+    const toStart = plan.timings[position + delta]?.start ?? 0;
     recordHistory('move-segment', false);
     const origin = indexes[position];
     const segments = doc.value.segments;
     [segments[origin.index], segments[target.index]] = [segments[target.index], segments[origin.index]];
+    // 序列顺序变了，时间槽也一并互换，时间轴上的块仍按新顺序排列
+    ordered[position].start = toStart;
+    ordered[position + delta].start = fromStart;
     syncPlayer();
+  }
+
+  /** 一键无缝衔接：当前角色所有段首尾相接（首段从 0 开始，之后紧接上一段结束） */
+  function seamlessAlign(): void {
+    if (!doc.value || !selectedActorId.value) return;
+    const actorId = selectedActorId.value;
+    if (guardLockedActor(actorId)) return;
+    const ordered = actorSegments(doc.value, actorId);
+    if (ordered.length === 0) {
+      toast('info', '当前角色还没有动画片段');
+      return;
+    }
+    const starts: number[] = [];
+    let cursor = 0;
+    for (const segment of ordered) {
+      starts.push(cursor);
+      cursor += segmentLength(segment);
+    }
+    const changed = ordered.some(
+      (segment, index) => Math.abs((segment.start ?? 0) - starts[index]) > 1e-6,
+    );
+    if (!changed) {
+      toast('info', '当前角色的动画已经是首尾相接');
+      return;
+    }
+    recordHistory('seamless-align', false);
+    ordered.forEach((segment, index) => {
+      segment.start = starts[index];
+    });
+    syncPlayer();
+    toast('success', `已对齐 ${ordered.length} 段动画的首尾`);
   }
 
   // ===== 播放控制 =====
@@ -833,6 +1129,139 @@ export const useStageStore = defineStore('stage', () => {
   function setShowEndGhosts(on: boolean): void {
     showEndGhosts.value = on;
     player?.setShowEndGhosts(on);
+  }
+
+  function setShowNumbers(on: boolean): void {
+    showNumbers.value = on;
+    // 编号是画在洋葱皮头顶的：打开编号时把起始/结尾残影一起打开，否则看不到效果
+    if (on) {
+      if (!onionSkin.value) setOnionSkin(true);
+      if (!showEndGhosts.value) setShowEndGhosts(true);
+    }
+    player?.setShowNumbers(on);
+  }
+
+  function setShowSkeleton(on: boolean): void {
+    showSkeleton.value = on;
+    player?.setShowSkeleton(on);
+  }
+
+  /** 改段的标识色；传 null 恢复按序号自动生成 */
+  function setSegmentColor(id: string, color: string | null): void {
+    if (guardLockedSegment(id)) return;
+    const segment = doc.value?.segments.find((item) => item.id === id);
+    if (!segment) return;
+    const next = color && /^#[0-9a-f]{6}$/i.test(color) ? color.toLowerCase() : undefined;
+    if (segment.color === next) return;
+    recordHistory(`color:${id}`);
+    if (next) segment.color = next;
+    else delete segment.color;
+    syncPlayer();
+  }
+
+  /**
+   * 把过渡段转成 FBX 动画（仅 FBX 角色）：
+   * 用 kimodo 的导入接口把 SOMA 动作重定向成 Mixamo JSON，存成新建动画项目，
+   * 再把该段替换成引用这个项目的普通动画段（根运动已经烘焙在数据里，去掉过渡链接）。
+   */
+  async function convertTransitionToFbx(id: string): Promise<boolean> {
+    if (guardLockedSegment(id)) return false;
+    const current = doc.value;
+    const segment = current?.segments.find((item) => item.id === id);
+    if (!current || !segment) return false;
+    const actor = current.actors.find((item) => item.id === segment.actorId);
+    if (!actor || actor.kind !== 'fbx' || !actor.modelPath) {
+      toast('error', '只有 FBX 角色的过渡动画可以转换');
+      return false;
+    }
+    if (segment.source.kind !== 'kimodo') {
+      toast('error', '该段不是过渡动画，无法转换');
+      return false;
+    }
+
+    const position = actorSegments(current, actor.id).findIndex((item) => item.id === id);
+    const projectName = `${current.name} · ${actor.name} 过渡 ${position + 1}`;
+    convertingSegmentId.value = id;
+    try {
+      const imported = await kimodoApi.importAnimation(segment.source.animationId, projectName);
+      const data = imported.data as { clips?: { tracks?: unknown[] }[] };
+      const clipCount = data.clips?.length ?? 1;
+      const trackCount = data.clips?.reduce((sum, clip) => sum + (clip.tracks?.length ?? 0), 0) ?? 0;
+      const projectId = `proj-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      const saved = await animationApi.saveProject({
+        id: projectId,
+        name: projectName,
+        basePath: actor.modelPath,
+        baseName: actor.modelPath.split(/[\\/]/).pop() ?? actor.name,
+        data: imported.data,
+        imported: { name: imported.clipName, clipCount, trackCount },
+      });
+
+      // 保存期间文档可能被切换/撤销，重新定位目标段
+      const target = doc.value?.segments.find((item) => item.id === id);
+      if (!target) return false;
+      recordHistory(`convert:${id}`);
+      target.source = { kind: 'anim-project', projectId, projectName: saved.name };
+      // 转换后是自带根运动的普通动画，不再需要运行时拉伸对齐
+      delete target.transition;
+      animationProjects.value = [saved, ...animationProjects.value];
+      projectCache.delete(projectId);
+      syncPlayer();
+      toast('success', '已转换为 FBX 动画');
+      return true;
+    } catch (error) {
+      toast('error', `转换失败：${(error as Error).message}`);
+      return false;
+    } finally {
+      convertingSegmentId.value = null;
+    }
+  }
+
+  /** 未转换的 FBX 动画段：跳到动画编辑区，把这个片段建成可编辑项目 */
+  function editSegmentInEditor(id: string): void {
+    if (guardLockedSegment(id)) return;
+    const current = doc.value;
+    const segment = current?.segments.find((item) => item.id === id);
+    if (!current || !segment) return;
+    const actor = current.actors.find((item) => item.id === segment.actorId);
+    if (!actor || actor.kind !== 'fbx') {
+      toast('error', '只有 FBX 动画可以进入动画编辑区');
+      return;
+    }
+    if (segment.source.kind !== 'fbx-clip') {
+      toast('error', '该段已经转换过，去「编辑动画」里改即可');
+      return;
+    }
+    const position = actorSegments(current, actor.id).findIndex((item) => item.id === id);
+    useAnimationStore().requestStageClipEdit({
+      segmentId: id,
+      fbxPath: segment.source.fbxPath,
+      clipName: segment.source.clipName,
+      basePath: actor.modelPath ?? '',
+      projectName: `${current.name} · ${actor.name} 片段 ${position + 1}`,
+    });
+    useWorkspaceStore().requestPage('animations');
+  }
+
+  /**
+   * 从动画编辑区返回舞台：把刚编辑保存的项目回填到对应段。
+   * 段的来源从 fbx-clip 换成 anim-project，裁剪区间按新片段时长重新夹紧。
+   */
+  function applyStageClipEditResult(): void {
+    // 文档还没载入时先别消费结果，否则这次回填就丢了
+    if (!doc.value) return;
+    const result = useAnimationStore().consumeStageClipEditResult();
+    if (!result) return;
+    const current = doc.value;
+    const segment = current?.segments.find((item) => item.id === result.segmentId);
+    if (!current || !segment) return;
+    recordHistory(`edit:${segment.id}`);
+    segment.source = { kind: 'anim-project', projectId: result.projectId, projectName: result.projectName };
+    const length = Math.max(0.05, result.duration);
+    segment.trimStart = Math.min(segment.trimStart, length - 0.05);
+    segment.trimEnd = length;
+    syncPlayer();
+    toast('success', `「${result.projectName}」已回填到舞台`);
   }
 
   function selectActor(id: string | null): void {
@@ -994,7 +1423,9 @@ export const useStageStore = defineStore('stage', () => {
     transitionTasks,
     busyGenerating,
     transitionTaskFor,
+    regenerateTaskFor,
     generateTransition,
+    regenerateTransition,
     isSegmentLocked,
     isActorLocked,
     attachPlayer,
@@ -1016,6 +1447,8 @@ export const useStageStore = defineStore('stage', () => {
     toggleActorVisible,
     addSegment,
     updateSegment,
+    setSegmentStart,
+    seamlessAlign,
     updateSegmentPose,
     resetSegmentPose,
     removeSegment,
@@ -1028,6 +1461,16 @@ export const useStageStore = defineStore('stage', () => {
     setOnionSkin,
     setShowEndGhosts,
     setShowPath,
+    setShowNumbers,
+    setShowSkeleton,
+    setSegmentColor,
+    convertTransitionToFbx,
+    editSegmentInEditor,
+    applyStageClipEditResult,
+    showNumbers,
+    showSkeleton,
+    travel,
+    convertingSegmentId,
     selectActor,
     selectSegment,
     sourceLabel,

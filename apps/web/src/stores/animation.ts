@@ -59,6 +59,28 @@ export interface NewAnimationProject {
   deletedAt?: string;
 }
 
+/** 舞台「去编辑」：把一个还没转成项目的 FBX 动画片段拿来编辑 */
+export interface StageClipEditRequest {
+  /** 舞台里的段 id，编辑保存后由舞台按它回填 */
+  segmentId: string;
+  /** 动画库里的 FBX 文件绝对路径 */
+  fbxPath: string;
+  /** 要编辑的动画片段名 */
+  clipName: string;
+  /** 舞台角色的模型路径（优先拿它当编辑基础模型） */
+  basePath: string;
+  /** 新建项目的显示名 */
+  projectName: string;
+}
+
+/** 编辑完成后回传给舞台的信息 */
+export interface StageClipEditResult {
+  segmentId: string;
+  projectId: string;
+  projectName: string;
+  duration: number;
+}
+
 export const useAnimationStore = defineStore('animation', () => {
   const info = ref<AnimationInfoResponse | null>(null);
   const dirs = ref<string[]>([]);
@@ -777,6 +799,99 @@ export const useAnimationStore = defineStore('animation', () => {
     toast('success', `已绑定 kimodo 动画：${clips.length} 个片段、${trackCount} 条轨迹`);
   }
 
+  // ===== 舞台「去编辑」闭环 =====
+
+  const pendingStageClipEdit = ref<StageClipEditRequest | null>(null);
+  const stageClipEditResult = ref<StageClipEditResult | null>(null);
+
+  /** 舞台点击「去编辑」时调用（随后由 App 切到动画页） */
+  function requestStageClipEdit(request: StageClipEditRequest): void {
+    pendingStageClipEdit.value = request;
+    // 上一次没消费掉的结果作废，避免回填到错误的段
+    stageClipEditResult.value = null;
+  }
+
+  /**
+   * 动画页挂载后消费待编辑请求：
+   * 载入该 FBX → 提取指定片段的动画数据 → 建成新建动画项目（只保留这一条片段）并保存。
+   * 保存后舞台才能用 projectId 引用它，所以这里自动落盘一次。
+   */
+  async function consumeStageClipEdit(): Promise<void> {
+    const request = pendingStageClipEdit.value;
+    if (!request) return;
+    pendingStageClipEdit.value = null;
+    if (!player) return;
+
+    const file = files.value.find((item) => item.path === request.fbxPath);
+    if (!file) {
+      toast('error', '动画库里找不到该 FBX 文件，无法去编辑');
+      return;
+    }
+
+    await select(file);
+    if (!player) return;
+    const data = player.extractAnimationData({
+      name: file.name,
+      relative: file.relative,
+      size: file.size,
+      mtime: file.mtime,
+    });
+    if (!data) {
+      toast('error', '模型尚未加载完成，请稍后重试');
+      return;
+    }
+    const clip = data.clips.find((item) => item.name === request.clipName) ?? data.clips[0];
+    if (!clip) {
+      toast('error', '该 FBX 没有可编辑的动画片段');
+      return;
+    }
+    const single = {
+      ...data,
+      clips: [clip],
+      timeline: {
+        ...data.timeline,
+        clipCount: 1,
+        totalDuration: clip.duration,
+        longestDuration: clip.duration,
+      },
+    };
+
+    // 基础模型优先用舞台角色自己的模型；它不在动画库时退回动画片段所在文件
+    const base = files.value.find((item) => item.path === request.basePath) ?? file;
+    const project: NewAnimationProject = {
+      id: `proj-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      name: request.projectName,
+      basePath: base.path,
+      baseName: base.name,
+      data: single,
+      imported: { name: clip.name, clipCount: 1, trackCount: clip.tracks.length },
+      saved: false,
+      dirty: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      hasData: true,
+    };
+    newAnimations.value = [project, ...newAnimations.value];
+    await activateProject(project);
+    await saveNewAnimation();
+    // 保存失败（例如重名）时不回填，否则舞台会引用一个不存在的项目
+    if (!newAnimations.value.find((item) => item.id === project.id)?.saved) return;
+    stageClipEditResult.value = {
+      segmentId: request.segmentId,
+      projectId: project.id,
+      projectName: project.name,
+      duration: clip.duration,
+    };
+    toast('success', '已建好可编辑项目，修改后点保存即可');
+  }
+
+  /** 舞台返回时读取编辑结果（读完即清空） */
+  function consumeStageClipEditResult(): StageClipEditResult | null {
+    const result = stageClipEditResult.value;
+    stageClipEditResult.value = null;
+    return result;
+  }
+
   // ===== 手指形态（仅新建动画）=====
 
   /** 读取手指形态库；已加载时直接复用，refresh=true 让服务端重新采样 */
@@ -1489,6 +1604,9 @@ export const useAnimationStore = defineStore('animation', () => {
     deleteNewAnimation,
     importAnimationJson,
     applyImportedData,
+    requestStageClipEdit,
+    consumeStageClipEdit,
+    consumeStageClipEditResult,
     saveNewAnimation,
     loadProjects,
     renameNewAnimation,

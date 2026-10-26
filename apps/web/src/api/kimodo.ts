@@ -33,6 +33,33 @@ export interface KimodoStatus {
 
 export type KimodoStatusValue = 'queued' | 'running' | 'ready' | 'failed';
 
+/**
+ * conditioned（真实 pose 约束过渡）任务的约束来源与完整参数。
+ * 与后端 meta.json 的 conditioned 字段一致，产物面板据此还原完整 f32 链路。
+ */
+export interface KimodoConditionedInfo {
+  /** prev 约束来源动画 id */
+  prevAnimationId?: string;
+  /** next 约束来源动画 id */
+  nextAnimationId?: string;
+  /** 约束切片临时目录名（输出目录下 _constraints/<tag>） */
+  constraintTag?: string;
+  /** prev 尾部 root_positions.f32 绝对路径 */
+  prevRootPath: string;
+  /** prev 尾部 local_rotations_xyzw.f32 绝对路径 */
+  prevRotPath: string;
+  /** next 头部 root_positions.f32 绝对路径（平移前） */
+  nextRootPath: string;
+  /** next 头部 local_rotations_xyzw.f32 绝对路径 */
+  nextRotPath: string;
+  /** 有 rootDelta 时实际喂给 shim 的平移后 next root 文件 */
+  nextRootShiftedPath?: string;
+  /** 首尾各硬约束的帧数 */
+  transitionFrames: number;
+  /** 舞台位移（米，prev 局部坐标系） */
+  rootDelta?: { dx: number; dz: number };
+}
+
 export interface KimodoAnimation {
   id: string;
   prompt: string;
@@ -44,6 +71,8 @@ export interface KimodoAnimation {
   createdAt: number;
   /** 生成模式：text=纯文本，conditioned=真实 pose 约束过渡 */
   mode?: 'text' | 'conditioned';
+  /** conditioned 任务的约束来源与参数 */
+  conditioned?: KimodoConditionedInfo;
   /** 多段生成时的分段提示词与各自帧数 */
   segments?: KimodoPromptSegment[];
   durationMs?: number;
@@ -117,20 +146,44 @@ export interface KimodoImportResult {
   clipName: string;
 }
 
-export type KimodoArtifactKey = 'prompt' | 'meta' | 'mixamo' | 'root' | 'rotations';
+/** 产物分组：文本 / 约束输入 / 动作输出 / 导入 */
+export type KimodoArtifactGroup = 'text' | 'constraint' | 'motion' | 'import';
+
+export type KimodoArtifactKey =
+  | 'prompt'
+  | 'meta'
+  | 'mixamo'
+  | 'root'
+  | 'rotations'
+  | 'prev-root'
+  | 'prev-rot'
+  | 'next-root'
+  | 'next-rot'
+  | 'next-root-shifted';
 
 /** 一次生成留下的中间产物 */
 export interface KimodoArtifact {
   key: KimodoArtifactKey;
   label: string;
-  /** 相对输出目录的路径 */
+  /** 相对输出目录的路径（不在输出目录内时为绝对路径） */
   file: string;
+  /** 绝对路径：.f32 无法预览，完整路径即排查信息 */
+  absolutePath?: string;
   format: 'text' | 'json' | 'f32';
   size: number;
   exists: boolean;
   /** 二进制产物只展示信息，不可当文本查看 */
   viewable: boolean;
   description: string;
+  group: KimodoArtifactGroup;
+  /** f32 帧数 */
+  frames?: number;
+  /** f32 每帧字节数 */
+  bytesPerFrame?: number;
+  /** f32 数据形状，如 [60, 3] float32 */
+  shape?: string;
+  /** 来源说明：来自哪个动画、切出哪些帧 */
+  source?: string;
 }
 
 /** 产物关联到的新建动画项目 */
@@ -143,10 +196,25 @@ export interface KimodoRelation {
   trackCount: number;
 }
 
+/** conditioned 过渡的约束来源动画（prev 尾帧 / next 首帧） */
+export interface KimodoArtifactSource {
+  role: 'prev' | 'next';
+  animationId: string;
+  prompt: string | null;
+  status: KimodoStatusValue | null;
+  /** 源动画总帧数 */
+  frames: number | null;
+  /** 从该动画切出的约束帧区间 [start, end)，0 起 */
+  sliceStart: number | null;
+  sliceEnd: number | null;
+}
+
 export interface KimodoArtifactsResponse {
   task: KimodoAnimation;
   artifacts: KimodoArtifact[];
   relations: KimodoRelation[];
+  /** conditioned 任务的 prev / next 来源动画；文本任务为空数组 */
+  sources: KimodoArtifactSource[];
 }
 
 export interface KimodoArtifactContent {

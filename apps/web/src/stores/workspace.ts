@@ -118,6 +118,12 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const offline = ref(false);
   const selectedId = ref<string | null>(null);
   const toasts = ref<Toast[]>([]);
+  /** 跨页面跳转请求：App 消费后清空（如舞台「去编辑」跳到动画页） */
+  const pageRequest = ref<'workbench' | 'animations' | 'stage' | null>(null);
+
+  function requestPage(next: 'workbench' | 'animations' | 'stage'): void {
+    pageRequest.value = next;
+  }
 
   // ===== 生成面板草稿 =====
   const mode = ref<InputMode>(draft.mode);
@@ -804,6 +810,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     offline,
     selectedId,
     toasts,
+    pageRequest,
+    requestPage,
     mode,
     prompt,
     image,

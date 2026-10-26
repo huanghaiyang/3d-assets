@@ -89,6 +89,25 @@ onBeforeUnmount(() => {
         <Icon name="pathCurve" :size="14" />
       </button>
       <span class="divider"></span>
+      <button
+        class="btn btn-icon"
+        :class="{ active: store.showNumbers }"
+        type="button"
+        title="显示编号（在起始/结尾残影头顶标注动画序号）"
+        @click="store.setShowNumbers(!store.showNumbers)"
+      >
+        <Icon name="hash" :size="14" />
+      </button>
+      <button
+        class="btn btn-icon"
+        :class="{ active: store.showSkeleton }"
+        type="button"
+        title="显示骨骼（渲染角色的骨架连线）"
+        @click="store.setShowSkeleton(!store.showSkeleton)"
+      >
+        <Icon name="bone" :size="14" />
+      </button>
+      <span class="divider"></span>
       <button class="btn btn-icon" type="button" title="重置视角" @click="player?.resetCamera()">
         <Icon name="refresh" :size="14" />
       </button>
