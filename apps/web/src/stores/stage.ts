@@ -60,6 +60,8 @@ export const useStageStore = defineStore('stage', () => {
 
   let player: StagePlayer | null = null;
   let toastSeq = 0;
+  /** 舞台页初始化只做一次，重进页面时保留当前文档 */
+  let bootstrapped = false;
   /** 新建动画详情缓存：挑选片段时按需拉取，避免每次点选都请求 */
   const projectCache = new Map<string, Promise<SavedAnimationProjectDetail | null>>();
 
@@ -98,8 +100,16 @@ export const useStageStore = defineStore('stage', () => {
       if (changed) instance.setSelectedActor(id);
     });
     instance.onPlacement((event) => updateActorTransform(event.id, event.transform));
+    // 点中起始帧残影：选中该段；拖动结束后回写该段站位
+    instance.onSelectSegment((actorId, segmentId) => {
+      selectedActorId.value = actorId;
+      selectedSegmentId.value = segmentId;
+    });
+    instance.onSegmentPose((segmentId, pose) => updateSegmentPose(segmentId, pose));
     instance.setOnionSkin(onionSkin.value);
     instance.setShowPath(showPath.value);
+    // 重进舞台页时恢复当前选中角色（选中环与 gizmo 依赖它）
+    instance.setSelectedActor(selectedActorId.value);
     void instance.setDoc(doc.value);
   }
 
@@ -399,6 +409,10 @@ export const useStageStore = defineStore('stage', () => {
   }
 
   async function bootstrap(): Promise<void> {
+    // 舞台页每次切回来都会重新挂载，但这里只能初始化一次：
+    // 否则会重新打开第一个已保存舞台，覆盖掉用户刚点「新建」的空白舞台
+    if (bootstrapped) return;
+    bootstrapped = true;
     await Promise.all([loadCatalog(), loadStages()]);
     if (docs.value.length > 0) await openStage(docs.value[0].id);
     else newStage();

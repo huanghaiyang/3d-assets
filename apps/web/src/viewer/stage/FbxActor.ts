@@ -10,6 +10,7 @@ import {
   type ActorClipInput,
   type ActorGhost,
   type GhostActionPool,
+  type GhostOptions,
 } from './StageActor';
 import type { LegChain } from './FootIK';
 import type { ResolvedSlot, SegmentPose, StageActorDef } from './StageTypes';
@@ -132,9 +133,9 @@ export class FbxActor extends MixerActor {
     return loose ?? null;
   }
 
-  createGhost(inputs: readonly ActorClipInput[], opacity: number): ActorGhost | null {
+  createGhost(inputs: readonly ActorClipInput[], options: GhostOptions): ActorGhost | null {
     if (!this.model || !this.hips) return null;
-    return new FbxGhost(this.model, this.hips.name, inputs, opacity);
+    return new FbxGhost(this.model, this.hips.name, inputs, options);
   }
 
   /** FBX 克隆共享几何体与材质，释放会误伤其他角色，交给源缓存统一管理 */
@@ -158,7 +159,7 @@ class FbxGhost implements ActorGhost {
   private readonly pool: GhostActionPool;
   private readonly materials: THREE.Material[] = [];
 
-  constructor(model: THREE.Object3D, hipsName: string, inputs: readonly ActorClipInput[], opacity: number) {
+  constructor(model: THREE.Object3D, hipsName: string, inputs: readonly ActorClipInput[], options: GhostOptions) {
     const clone = cloneSkeleton(model);
     clone.traverse((child) => {
       const mesh = child as THREE.Mesh;
@@ -166,17 +167,29 @@ class FbxGhost implements ActorGhost {
       mesh.castShadow = false;
       mesh.receiveShadow = false;
       mesh.frustumCulled = false;
-      mesh.raycast = () => {};
+      // 运动残影不参与拾取，避免挡住本体；起始帧残影需要可点击选中
+      if (!options.pickable) mesh.raycast = () => {};
       const original = mesh.material;
       const list = Array.isArray(original) ? original : [original];
-      const copies = list.map((material) => {
-        const copy = material.clone();
-        copy.transparent = true;
-        copy.opacity = opacity;
-        copy.depthWrite = false;
-        this.materials.push(copy);
-        return copy;
-      });
+      const copies = options.color
+        ? list.map(() => {
+            const copy = new THREE.MeshBasicMaterial({
+              color: options.color,
+              transparent: true,
+              opacity: options.opacity,
+              depthWrite: false,
+            });
+            this.materials.push(copy);
+            return copy;
+          })
+        : list.map((material) => {
+            const copy = material.clone();
+            copy.transparent = true;
+            copy.opacity = options.opacity;
+            copy.depthWrite = false;
+            this.materials.push(copy);
+            return copy;
+          });
       mesh.material = Array.isArray(original) ? copies : copies[0] ?? original;
     });
 

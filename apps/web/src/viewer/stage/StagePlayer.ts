@@ -38,6 +38,17 @@ export interface StagePlacementEvent {
   transform: ActorTransform;
 }
 
+/** 一段起始帧残影：常驻舞台、带段标识色、可点击拖动改该段站位 */
+interface StartGhostEntry {
+  ghost: ActorGhost;
+  actorId: string;
+  segmentId: string;
+  index: number;
+  /** 该段起始帧的根对齐偏移（段局部空间），拖动后反算 pose 用 */
+  offsetX: number;
+  offsetZ: number;
+}
+
 interface ActorRuntime {
   def: StageActorDef;
   actor: StageActor;
@@ -45,26 +56,29 @@ interface ActorRuntime {
   align: RootAlignPlan;
   clips: ActorClipInput[];
   poses: SegmentPose[];
+  /** 与 plan.timings 同序的段 id */
+  segmentIds: string[];
   footLock: FootLock;
-  ghosts: GhostEntry[];
+  /** 每段动画起始帧的洋葱皮残影（常驻，不随时间变化） */
+  startGhosts: StartGhostEntry[];
+  /** 运动过程残影：随播放时间前后偏移，不可拾取 */
+  motionGhosts: ActorGhost[];
   path: THREE.Group | null;
-}
-
-interface GhostEntry {
-  ghost: ActorGhost;
-  offset: number;
 }
 
 const EMPTY_PLAN: TimelinePlan = { timings: [], total: 0 };
 const EMPTY_ALIGN: RootAlignPlan = { frames: [], starts: [] };
 
-/** 洋葱皮：相对当前时刻的采样偏移与不透明度 */
+/** 起始帧洋葱皮的不透明度 */
+const START_GHOST_OPACITY = 0.42;
+
+/** 运动残影：前后时间偏移（秒）与对应不透明度 */
 const ONION_OFFSETS = [-0.3, -0.15, 0.15];
 const ONION_OPACITY = [0.18, 0.26, 0.12];
 
-/** 路径曲线：每段采样点数与分段的颜色循环 */
+/** 路径曲线：每段采样点数；每段起始帧残影与路径共用同一套分段色 */
 const PATH_SAMPLES = 36;
-const PATH_COLORS = [0x60a5fa, 0xf472b6, 0x34d399, 0xfbbf24, 0xa78bfa, 0x22d3ee];
+const SEGMENT_COLORS = [0x60a5fa, 0xf472b6, 0x34d399, 0xfbbf24, 0xa78bfa, 0x22d3ee];
 
 /** 舞台播放器：场景、多角色调度、手动权重驱动、根位移对齐与脚步锁定 */
 export class StagePlayer {
@@ -102,7 +116,12 @@ export class StagePlayer {
   private frameListeners: ((state: StageFrameState) => void)[] = [];
   private noticeListeners: ((message: string) => void)[] = [];
   private selectListeners: ((id: string | null) => void)[] = [];
+  private segmentListeners: ((actorId: string, segmentId: string) => void)[] = [];
+  private poseListeners: ((segmentId: string, pose: SegmentPose) => void)[] = [];
   private placementListeners: ((event: StagePlacementEvent) => void)[] = [];
+
+  /** 当前 gizmo 拖动的起始帧残影（为 null 时拖动角色摆放） */
+  private poseTarget: StartGhostEntry | null = null;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -173,9 +192,14 @@ export class StagePlayer {
     this.transform = new TransformControls(this.camera, this.renderer.domElement);
     this.transform.setSize(0.85);
     this.transform.addEventListener('dragging-changed', (event) => {
-      this.controls.enabled = !(event as unknown as { value: boolean }).value;
+      const dragging = (event as unknown as { value: boolean }).value;
+      this.controls.enabled = !dragging;
+      if (!dragging) this.commitPoseDrag();
     });
-    this.transform.addEventListener('objectChange', () => this.emitPlacement());
+    this.transform.addEventListener('objectChange', () => {
+      // 起始帧残影拖动只改残影根节点，拖拽结束才回写段站位
+      if (!this.poseTarget) this.emitPlacement();
+    });
     this.scene.add(this.transform.getHelper());
 
     this.renderer.domElement.addEventListener('pointerup', this.onPointerUp);
@@ -199,6 +223,16 @@ export class StagePlayer {
 
   onSelect(listener: (id: string | null) => void): void {
     this.selectListeners.push(listener);
+  }
+
+  /** 点中起始帧残影：选中该段（同时会选中所属角色） */
+  onSelectSegment(listener: (actorId: string, segmentId: string) => void): void {
+    this.segmentListeners.push(listener);
+  }
+
+  /** 拖动起始帧残影结束：回写该段站位 */
+  onSegmentPose(listener: (segmentId: string, pose: SegmentPose) => void): void {
+    this.poseListeners.push(listener);
   }
 
   onPlacement(listener: (event: StagePlacementEvent) => void): void {
@@ -261,24 +295,28 @@ export class StagePlayer {
 
   setSelectedActor(id: string | null): void {
     this.selectedId = id;
-    this.refreshExtras();
+    // 选中角色变化后不再拖动该角色的段残影
+    if (this.poseTarget && this.poseTarget.actorId !== id) this.poseTarget = null;
+    this.refreshPath();
     this.apply(this.time);
     this.attachGizmo();
   }
 
-  /** 洋葱皮开关：只为选中角色生成残影 */
+  /** 起始帧洋葱皮开关：为每个角色的每段动画各生成一个残影 */
   setOnionSkin(enabled: boolean): void {
     if (this.onionSkin === enabled) return;
     this.onionSkin = enabled;
-    this.refreshExtras();
+    this.refreshGhosts();
     this.apply(this.time);
+    // 残影销毁后 gizmo 可能挂在已移除的节点上，重新挂一次
+    this.attachGizmo();
   }
 
   /** 路径曲线开关：只为选中角色绘制整条时间线轨迹 */
   setShowPath(enabled: boolean): void {
     if (this.showPath === enabled) return;
     this.showPath = enabled;
-    this.refreshExtras();
+    this.refreshPath();
     this.apply(this.time);
   }
 
@@ -350,6 +388,7 @@ export class StagePlayer {
       runtime.actor.dispose();
     }
     this.runtimes.clear();
+    this.poseTarget = null;
     this.selectionRing.visible = false;
     this.transform.detach();
   }
@@ -387,8 +426,10 @@ export class StagePlayer {
           align: EMPTY_ALIGN,
           clips: [],
           poses: [],
+          segmentIds: [],
           footLock: new FootLock(),
-          ghosts: [],
+          startGhosts: [],
+          motionGhosts: [],
           path: null,
         };
         this.runtimes.set(def.id, runtime);
@@ -401,6 +442,7 @@ export class StagePlayer {
       const plan = buildTimeline(segments);
       runtime.clips = clips;
       runtime.poses = segments.map((segment) => ({ ...(segment.pose ?? ZERO_SEGMENT_POSE) }));
+      runtime.segmentIds = segments.map((segment) => segment.id);
       runtime.plan = plan;
       runtime.actor.buildSequence(clips);
       runtime.align = buildRootAlign(runtime.actor, plan, clips.map((input) => input.clip));
@@ -408,7 +450,8 @@ export class StagePlayer {
 
     this.durationValue = Math.max(0, ...[...this.runtimes.values()].map((runtime) => runtime.plan.total));
     this.time = THREE.MathUtils.clamp(this.time, 0, this.durationValue);
-    this.refreshExtras();
+    this.refreshGhosts();
+    this.refreshPath(true);
     this.attachGizmo();
     this.apply(this.time);
     this.emit(true);
@@ -578,47 +621,113 @@ export class StagePlayer {
       }
 
       runtime.actor.syncVisuals();
-      this.applyGhosts(runtime, time);
+      this.applyMotionGhosts(runtime, time);
     }
   }
 
-  /** 残影求值：按相邻时刻采样 slot，再写段偏移与根对齐偏移 */
-  private applyGhosts(runtime: ActorRuntime, time: number): void {
-    if (runtime.ghosts.length === 0 || runtime.plan.timings.length === 0) return;
-    const hips = new THREE.Vector3();
-    for (const entry of runtime.ghosts) {
-      const sampleTime = THREE.MathUtils.clamp(time + entry.offset, 0, runtime.plan.total);
-      const slots = resolveTimeline(runtime.plan, sampleTime);
-      entry.ghost.applySlots(slots);
-      entry.ghost.updateWorld();
-      if (!entry.ghost.currentHips(hips)) hips.set(0, 0, 0);
-      const offset = resolveRootOffset(runtime.align, slots, { x: hips.x, z: hips.z });
-      entry.ghost.setFrame(resolveSegmentPose(runtime.poses, slots), offset.x, offset.z);
-      entry.ghost.updateWorld();
-      entry.ghost.updateVisuals();
-    }
-  }
+  // ===== 起始帧洋葱皮与路径 =====
 
-  // ===== 残影与路径 =====
-
-  private refreshExtras(): void {
+  /** 残影只跟文档结构走，切换选中角色不必重建 */
+  private refreshGhosts(): void {
     for (const runtime of this.runtimes.values()) {
-      this.disposeExtras(runtime);
+      this.disposeGhosts(runtime);
+      if (!this.onionSkin) continue;
+      this.buildStartGhosts(runtime);
+      this.buildMotionGhosts(runtime);
     }
-    const runtime = this.selectedId ? this.runtimes.get(this.selectedId) : null;
-    if (!runtime) return;
-    if (this.onionSkin) this.buildGhosts(runtime);
-    if (this.showPath) this.buildPath(runtime);
+    this.remapPoseTarget();
   }
 
-  private buildGhosts(runtime: ActorRuntime): void {
-    if (!runtime.actor.ready || runtime.plan.timings.length === 0) return;
-    for (let index = 0; index < ONION_OFFSETS.length; index += 1) {
-      const ghost = runtime.actor.createGhost(runtime.clips, ONION_OPACITY[index] ?? 0.15);
-      if (!ghost) break;
-      runtime.actor.placement.add(ghost.root);
-      runtime.ghosts.push({ ghost, offset: ONION_OFFSETS[index] });
+  /** 路径只画在选中角色上，切换选中时从其他角色上摘掉；force 用于站位变更后重建 */
+  private refreshPath(force = false): void {
+    const runtime = this.selectedId ? this.runtimes.get(this.selectedId) : null;
+    for (const item of this.runtimes.values()) {
+      if (item === runtime && this.showPath && !force) continue;
+      this.disposePath(item);
     }
+    if (runtime && this.showPath) this.buildPath(runtime);
+  }
+
+  /**
+   * 每段动画的起始帧残影：常驻在舞台上，不随播放时间变化。
+   *
+   * 取该段自身的第一帧（trimStart）按其段站位摆放，并叠加根位移对齐偏移，
+   * 这样一眼就能看出每段从哪个位置、哪个朝向开始。每段用不同的标识色，
+   * 且可被点击选中后拖动改该段站位。只为每个角色的每段各建一个。
+   */
+  private buildStartGhosts(runtime: ActorRuntime): void {
+    if (!runtime.actor.ready || runtime.plan.timings.length === 0) return;
+    const hips = new THREE.Vector3();
+    runtime.plan.timings.forEach((timing, index) => {
+      const slots = [{ index, clipTime: timing.trimStart, weight: 1 }];
+      const color = SEGMENT_COLORS[index % SEGMENT_COLORS.length] ?? 0x60a5fa;
+      const ghost = runtime.actor.createGhost(runtime.clips, {
+        opacity: START_GHOST_OPACITY,
+        color,
+        pickable: true,
+      });
+      if (!ghost) return;
+      ghost.applySlots(slots);
+      ghost.updateWorld();
+      if (!ghost.currentHips(hips)) hips.set(0, 0, 0);
+      const offset = resolveRootOffset(runtime.align, slots, { x: hips.x, z: hips.z });
+      ghost.setFrame(runtime.poses[index] ?? ZERO_SEGMENT_POSE, offset.x, offset.z);
+      ghost.updateWorld();
+      ghost.updateVisuals();
+      // 残影根节点打标记，射线命中后往上找即可知道是哪一段
+      ghost.root.name = 'segmentghost';
+      ghost.root.userData.segment = { actorId: runtime.def.id, segmentId: runtime.segmentIds[index] ?? '' };
+      runtime.actor.placement.add(ghost.root);
+      runtime.startGhosts.push({
+        ghost,
+        actorId: runtime.def.id,
+        segmentId: runtime.segmentIds[index] ?? '',
+        index,
+        offsetX: offset.x,
+        offsetZ: offset.z,
+      });
+    });
+  }
+
+  /** 运动过程残影：前后偏移几帧的残影，随播放时间在 apply 里逐帧求值 */
+  private buildMotionGhosts(runtime: ActorRuntime): void {
+    if (!runtime.actor.ready || runtime.plan.timings.length === 0) return;
+    ONION_OFFSETS.forEach((_, slot) => {
+      const ghost = runtime.actor.createGhost(runtime.clips, { opacity: ONION_OPACITY[slot] ?? 0.18 });
+      if (!ghost) return;
+      ghost.setVisible(false);
+      runtime.actor.placement.add(ghost.root);
+      runtime.motionGhosts.push(ghost);
+    });
+  }
+
+  /** 把每个运动残影求值到 time + 偏移 的时刻；越界时隐藏 */
+  private applyMotionGhosts(runtime: ActorRuntime, time: number): void {
+    if (runtime.motionGhosts.length === 0) return;
+    const hips = new THREE.Vector3();
+    ONION_OFFSETS.forEach((delta, slot) => {
+      const ghost = runtime.motionGhosts[slot];
+      if (!ghost) return;
+      const sampleTime = time + delta;
+      if (sampleTime < 0 || sampleTime > runtime.plan.total) {
+        ghost.setVisible(false);
+        return;
+      }
+      const slots = resolveTimeline(runtime.plan, sampleTime);
+      if (slots.length === 0) {
+        ghost.setVisible(false);
+        return;
+      }
+      const pose = resolveSegmentPose(runtime.poses, slots);
+      ghost.applySlots(slots);
+      ghost.updateWorld();
+      if (!ghost.currentHips(hips)) hips.set(0, 0, 0);
+      const offset = resolveRootOffset(runtime.align, slots, { x: hips.x, z: hips.z });
+      ghost.setFrame(pose, offset.x, offset.z);
+      ghost.updateWorld();
+      ghost.updateVisuals();
+      ghost.setVisible(true);
+    });
   }
 
   /**
@@ -635,7 +744,7 @@ export class StagePlayer {
       const clip = runtime.clips[index]?.clip;
       if (!clip) return;
       const pose = runtime.poses[index] ?? ZERO_SEGMENT_POSE;
-      const color = PATH_COLORS[index % PATH_COLORS.length] ?? 0x60a5fa;
+      const color = SEGMENT_COLORS[index % SEGMENT_COLORS.length] ?? 0x60a5fa;
       const points: THREE.Vector3[] = [];
 
       for (let sample = 0; sample < PATH_SAMPLES; sample += 1) {
@@ -674,20 +783,43 @@ export class StagePlayer {
     runtime.actor.placement.add(group);
   }
 
-  private disposeExtras(runtime: ActorRuntime): void {
-    for (const entry of runtime.ghosts) entry.ghost.dispose();
-    runtime.ghosts = [];
-    if (runtime.path) {
-      runtime.actor.placement.remove(runtime.path);
-      runtime.path.traverse((child) => {
-        const object = child as THREE.Mesh & THREE.Line;
-        if (!object.isMesh && !object.isLine) return;
-        object.geometry?.dispose();
-        const materials = Array.isArray(object.material) ? object.material : [object.material];
-        for (const material of materials) material?.dispose();
-      });
-      runtime.path = null;
+  private disposeGhosts(runtime: ActorRuntime): void {
+    for (const entry of runtime.startGhosts) entry.ghost.dispose();
+    runtime.startGhosts = [];
+    for (const ghost of runtime.motionGhosts) ghost.dispose();
+    runtime.motionGhosts = [];
+  }
+
+  /** 重建残影后把 gizmo 目标换到新的残影上；找不到则退回角色摆放 */
+  private remapPoseTarget(): void {
+    if (!this.poseTarget) return;
+    const { actorId, segmentId } = this.poseTarget;
+    this.poseTarget = this.findStartGhost(actorId, segmentId);
+  }
+
+  private findStartGhost(actorId: string, segmentId: string): StartGhostEntry | null {
+    for (const entry of this.runtimes.get(actorId)?.startGhosts ?? []) {
+      if (entry.segmentId === segmentId) return entry;
     }
+    return null;
+  }
+
+  private disposePath(runtime: ActorRuntime): void {
+    if (!runtime.path) return;
+    runtime.actor.placement.remove(runtime.path);
+    runtime.path.traverse((child) => {
+      const object = child as THREE.Mesh & THREE.Line;
+      if (!object.isMesh && !object.isLine) return;
+      object.geometry?.dispose();
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+      for (const material of materials) material?.dispose();
+    });
+    runtime.path = null;
+  }
+
+  private disposeExtras(runtime: ActorRuntime): void {
+    this.disposeGhosts(runtime);
+    this.disposePath(runtime);
   }
 
   private updateSelectionRing(): void {
@@ -702,8 +834,7 @@ export class StagePlayer {
   }
 
   private attachGizmo(): void {
-    const runtime = this.selectedId ? this.runtimes.get(this.selectedId) : null;
-    if (!runtime || !this.gizmoMode) {
+    if (!this.gizmoMode) {
       this.transform.detach();
       return;
     }
@@ -713,7 +844,30 @@ export class StagePlayer {
     this.transform.showX = mode === 'translate';
     this.transform.showY = mode === 'rotate';
     this.transform.showZ = mode === 'translate';
-    this.transform.attach(runtime.actor.placement);
+    // 选中了起始帧残影时拖动它改该段站位，否则拖动角色摆放
+    const target = this.poseTarget?.ghost.root
+      ?? (this.selectedId ? this.runtimes.get(this.selectedId)?.actor.placement : null)
+      ?? null;
+    if (target) this.transform.attach(target);
+    else this.transform.detach();
+  }
+
+  /** 拖动起始帧残影结束：把残影根节点位置反算成该段站位并回写 */
+  private commitPoseDrag(): void {
+    const entry = this.poseTarget;
+    if (!entry) return;
+    const runtime = this.runtimes.get(entry.actorId);
+    if (!runtime) return;
+    const root = entry.ghost.root;
+    const world = new THREE.Vector3();
+    root.getWorldPosition(world);
+    const local = runtime.actor.placement.worldToLocal(world);
+    const yaw = Math.atan2(Math.sin(root.rotation.y), Math.cos(root.rotation.y));
+    // 残影根节点 = 段站位 + 绕朝向旋转后的根对齐偏移
+    const offset = rotateXZ(entry.offsetX, entry.offsetZ, yaw);
+    const round = (value: number): number => Number(value.toFixed(3));
+    const pose: SegmentPose = { x: round(local.x - offset.x), z: round(local.z - offset.z), yaw: round(yaw) };
+    for (const listener of this.poseListeners) listener(entry.segmentId, pose);
   }
 
   private emitPlacement(): void {
@@ -735,9 +889,19 @@ export class StagePlayer {
     );
     const raycaster = new THREE.Raycaster();
     raycaster.setFromCamera(pointer, this.camera);
+
+    // 优先命中起始帧残影（可点击选中该段站位）
+    const ghostTargets = [...this.runtimes.values()].flatMap((runtime) =>
+      runtime.startGhosts.map((entry) => entry.ghost.root),
+    );
+    const ghostHits = raycaster.intersectObjects(ghostTargets, true);
+    if (ghostHits.length > 0 && this.selectStartGhost(ghostHits[0].object)) return;
+
     const targets = [...this.runtimes.values()].map((runtime) => runtime.actor.placement);
     const hits = raycaster.intersectObjects(targets, true);
     if (hits.length === 0) {
+      this.poseTarget = null;
+      this.attachGizmo();
       for (const listener of this.selectListeners) listener(null);
       return;
     }
@@ -745,7 +909,30 @@ export class StagePlayer {
     let node: THREE.Object3D | null = hits[0].object;
     while (node && !node.name.startsWith('actor:')) node = node.parent;
     const id = node?.name.slice('actor:'.length) ?? null;
+    if (id !== this.selectedId) {
+      this.poseTarget = null;
+      this.attachGizmo();
+    }
     for (const listener of this.selectListeners) listener(id);
+  };
+
+  /** 由射线命中的下层对象向上找起始帧残影；命中则选中该段并把 gizmo 挂到残影上 */
+  private selectStartGhost(object: THREE.Object3D): boolean {
+    let node: THREE.Object3D | null = object;
+    while (node && node.name !== 'segmentghost') node = node.parent;
+    if (!node) return false;
+    const data = node.userData.segment as { actorId: string; segmentId: string } | undefined;
+    if (!data?.segmentId) return false;
+    const entry = this.findStartGhost(data.actorId, data.segmentId);
+    if (!entry) return false;
+
+    this.poseTarget = entry;
+    this.selectedId = data.actorId;
+    this.refreshPath();
+    for (const listener of this.selectListeners) listener(data.actorId);
+    for (const listener of this.segmentListeners) listener(data.actorId, data.segmentId);
+    this.attachGizmo();
+    return true;
   };
 
   private notify(message: string): void {

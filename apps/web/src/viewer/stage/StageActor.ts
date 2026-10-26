@@ -11,6 +11,15 @@ export interface ActorClipInput {
   pose?: SegmentPose;
 }
 
+/** 残影外观选项：起始帧残影带标识色且可点击，运动残影保持中性 */
+export interface GhostOptions {
+  opacity: number;
+  /** 标识色；不给则沿用模型原材质 */
+  color?: number;
+  /** 是否参与射线拾取（起始帧残影需要可点击） */
+  pickable?: boolean;
+}
+
 /** 洋葱皮残影：独立的一副骨架/网格，可求值到任意时刻 */
 export interface ActorGhost {
   /** 挂在 placement 下，局部空间即角色摆放空间 */
@@ -54,7 +63,7 @@ export interface StageActor {
   /** 把运动帧局部坐标（根对齐偏移所在空间）换算到世界坐标 */
   segmentPointToWorld(point: THREE.Vector3): THREE.Vector3;
   /** 创建洋葱皮残影；不支持的角色返回 null */
-  createGhost(inputs: readonly ActorClipInput[], opacity: number): ActorGhost | null;
+  createGhost(inputs: readonly ActorClipInput[], options: GhostOptions): ActorGhost | null;
   updateWorld(): void;
   /** 采样某个片段在指定时间（片段内秒）的髋部根变换 */
   sampleHips(clip: THREE.AnimationClip, time: number): HipsSample | null;
@@ -221,7 +230,7 @@ export abstract class MixerActor implements StageActor {
     return point.applyMatrix4(frame.matrixWorld);
   }
 
-  createGhost(_inputs: readonly ActorClipInput[], _opacity: number): ActorGhost | null {
+  createGhost(_inputs: readonly ActorClipInput[], _options: GhostOptions): ActorGhost | null {
     return null;
   }
 

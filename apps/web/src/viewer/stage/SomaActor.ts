@@ -8,6 +8,7 @@ import {
   type ActorClipInput,
   type ActorGhost,
   type GhostActionPool,
+  type GhostOptions,
 } from './StageActor';
 import type { LegChain } from './FootIK';
 import type { ResolvedSlot, SegmentPose, StageActorDef } from './StageTypes';
@@ -117,14 +118,22 @@ export function buildSomaRig(skeleton: SomaSkeletonData): SomaRig {
   return { group, joints, parentIndices, segmentJoints };
 }
 
-/** 点线缓冲：本体 opcaity=1，残影传小值做半透明 */
-export function createSomaOverlay(rig: SomaRig, opacity: number): SomaOverlay {
+/**
+ * 点线缓冲：本体 opacity=1，残影传小值做半透明。
+ * 传 color 时线段用该标识色，圆点用同色偏白的混合色，保证每段起始帧残影可区分。
+ */
+export function createSomaOverlay(rig: SomaRig, opacity: number, color?: number): SomaOverlay {
   const transparent = opacity < 1;
+  const lineColor = color ?? 0x7dd3fc;
+  const pointColor = color === undefined
+    ? 0xe2e8f0
+    : new THREE.Color(color).lerp(new THREE.Color(0xffffff), 0.45).getHex();
+
   const lineGeometry = new THREE.BufferGeometry();
   lineGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(rig.segmentJoints.length * 6), 3));
   const lines = new THREE.LineSegments(
     lineGeometry,
-    new THREE.LineBasicMaterial({ color: 0x7dd3fc, transparent, opacity }),
+    new THREE.LineBasicMaterial({ color: lineColor, transparent, opacity }),
   );
   lines.frustumCulled = false;
 
@@ -132,7 +141,7 @@ export function createSomaOverlay(rig: SomaRig, opacity: number): SomaOverlay {
   pointGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(rig.joints.length * 3), 3));
   const points = new THREE.Points(
     pointGeometry,
-    new THREE.PointsMaterial({ color: 0xe2e8f0, size: 0.03, sizeAttenuation: true, transparent, opacity }),
+    new THREE.PointsMaterial({ color: pointColor, size: 0.03, sizeAttenuation: true, transparent, opacity }),
   );
   points.frustumCulled = false;
 
@@ -246,9 +255,9 @@ export class SomaActor extends MixerActor {
     updateSomaBuffers(this.rigData, this.overlay, this.motion);
   }
 
-  createGhost(inputs: readonly ActorClipInput[], opacity: number): ActorGhost | null {
+  createGhost(inputs: readonly ActorClipInput[], options: GhostOptions): ActorGhost | null {
     if (!this.rigData) return null;
-    return new SomaGhost(this.skeleton, inputs, opacity);
+    return new SomaGhost(this.skeleton, inputs, options);
   }
 
   protected override disposeModel(): void {
@@ -280,14 +289,33 @@ class SomaGhost implements ActorGhost {
   private readonly overlay: SomaOverlay;
   private readonly mixer: THREE.AnimationMixer;
   private readonly pool: GhostActionPool;
+  private readonly proxy: THREE.Mesh | null;
 
-  constructor(skeleton: SomaSkeletonData, inputs: readonly ActorClipInput[], opacity: number) {
+  constructor(skeleton: SomaSkeletonData, inputs: readonly ActorClipInput[], options: GhostOptions) {
     this.rig = buildSomaRig(skeleton);
-    this.overlay = createSomaOverlay(this.rig, opacity);
+    this.overlay = createSomaOverlay(this.rig, options.opacity, options.color);
+    // 运动残影不参与拾取，避免细线/圆点挡住本体；起始帧残影需要可点击选中
+    if (!options.pickable) {
+      this.overlay.lines.raycast = () => {};
+      this.overlay.points.raycast = () => {};
+    }
 
     this.root.add(this.rig.group);
     this.root.add(this.overlay.lines);
     this.root.add(this.overlay.points);
+
+    // 点线拾取不稳定，给起始帧残影加一个不可见的圆柱命中代理
+    if (options.pickable) {
+      const proxy = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.45, 0.45, 2.2, 12),
+        new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }),
+      );
+      proxy.position.y = 1.1;
+      this.root.add(proxy);
+      this.proxy = proxy;
+    } else {
+      this.proxy = null;
+    }
 
     this.mixer = new THREE.AnimationMixer(this.rig.group);
     this.pool = buildGhostActions(this.mixer, inputs);
@@ -329,6 +357,7 @@ class SomaGhost implements ActorGhost {
     this.mixer.uncacheRoot(this.rig.group);
     disposeObject(this.overlay.lines);
     disposeObject(this.overlay.points);
+    if (this.proxy) disposeObject(this.proxy);
     this.pool.actions.length = 0;
   }
 }

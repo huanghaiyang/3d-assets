@@ -65,7 +65,7 @@ onBeforeUnmount(() => {
         class="btn btn-icon"
         :class="{ active: store.onionSkin }"
         type="button"
-        title="洋葱皮（选中角色的前后帧残影）"
+        title="起始帧洋葱皮（每段动画的第一帧残影，常驻舞台）"
         @click="store.setOnionSkin(!store.onionSkin)"
       >
         <Icon name="layers" :size="14" />
