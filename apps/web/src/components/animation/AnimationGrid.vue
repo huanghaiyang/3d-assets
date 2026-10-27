@@ -1,13 +1,28 @@
 <script setup lang="ts">
+/**
+ * 动画库侧栏（动画工作区左栏）。
+ *
+ * 职责：渲染扫描到的 FBX 动画卡片（分页 + 模糊搜索 + 封面懒加载），
+ * 以及「新建动画 / 拼接动画」两类项目卡片的内联重命名、删除、封面刷新与入口跳转。
+ *
+ * v2 相关：拼接项目由 store 的 `stripsAnimations`（后端派生字段 kind === 'strips'）提供，
+ * 单独渲染成「拼接动画」分区；卡片点击不是预览烘焙结果，而是回到拼接工作区重新编辑编排快照。
+ * 其余逻辑（分页、搜索高亮、封面 IntersectionObserver、回收站预览）与拼接无关，
+ * 仅保留原有说明，不再逐行注释。
+ */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import Icon from '../ui/Icon.vue';
 import { useAnimationStore } from '@/stores/animation';
 import type { NewAnimationProject } from '@/stores/animation';
+import { useStripsStore } from '@/stores/strips';
+import { useWorkspaceStore } from '@/stores/workspace';
 import { highlightSegments } from '@/utils/fuzzy';
 import type { AnimationFile } from '@/api/animation';
 import { confirmAction } from '@/composables/useConfirm';
 
 const store = useAnimationStore();
+const stripsStore = useStripsStore();
+const workspace = useWorkspaceStore();
 const listRef = ref<HTMLDivElement | null>(null);
 let observer: IntersectionObserver | null = null;
 
@@ -116,6 +131,16 @@ function projectStatus(project: NewAnimationProject): string {
   return '已保存';
 }
 
+/** 已保存的拼接动画：回到拼接工作区继续修改 */
+async function editComposition(project: NewAnimationProject): Promise<void> {
+  // 先让拼接 store 把服务端保存的 composition 快照读出来并落成当前编排
+  //（openComposition 内部会 await api.project(id)，失败已 toast 并返回 false）
+  const ok = await stripsStore.openComposition(project.id);
+  if (!ok) return;
+  // 成功后通过 workspace 的跳转请求切页；由 App.vue 的 watch(pageRequest) 消费
+  workspace.requestPage('strips');
+}
+
 function isSelected(file: AnimationFile): boolean {
   return store.selectedPath === file.path;
 }
@@ -202,15 +227,16 @@ function onPageSize(event: Event): void {
     </div>
 
     <div ref="listRef" class="grid-wrap">
-      <section v-if="store.newAnimations.length > 0" class="new-section">
+      <!-- 分区一：普通「新建动画」（store.clipAnimations，即 kind !== 'strips'） -->
+      <section v-if="store.clipAnimations.length > 0" class="new-section">
         <div class="section-head">
           <Icon name="plus" :size="11" />
           <span>新建动画</span>
-          <span class="chip">{{ store.newAnimations.length }}</span>
+          <span class="chip">{{ store.clipAnimations.length }}</span>
         </div>
         <div class="grid">
           <div
-            v-for="project in store.newAnimations"
+            v-for="project in store.clipAnimations"
             :key="project.id"
             class="anim-card new-card"
             :class="{ active: store.activeNewAnimationId === project.id }"
@@ -253,6 +279,96 @@ function onPageSize(event: Event): void {
               </span>
             </template>
             <div class="card-actions">
+              <button
+                class="card-icon"
+                type="button"
+                :disabled="store.isRefreshingCover(store.projectCoverKey(project))"
+                title="重新生成封面（按当前动画数据取姿势）"
+                @click.stop="store.refreshProjectCover(project)"
+              >
+                <Icon
+                  name="refresh"
+                  :size="12"
+                  :class="{ spin: store.isRefreshingCover(store.projectCoverKey(project)) }"
+                />
+              </button>
+              <button class="card-icon" type="button" title="重命名" @click.stop="startRename(project)">
+                <Icon name="edit" :size="12" />
+              </button>
+              <button class="card-icon" type="button" title="移入回收站" @click.stop="removeProject(project)">
+                <Icon name="trash" :size="12" />
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!--
+        分区二：v2 的「拼接动画」（store.stripsAnimations，即 kind === 'strips'）。
+        kind 来自后端项目摘要（projectFromSaved 里 item.kind ?? (composition ? 'strips' : 'clip')），
+        所以分区判定不依赖前端猜测，老数据带 composition 也能正确归类。
+      -->
+      <section v-if="store.stripsAnimations.length > 0" class="new-section strips-section">
+        <div class="section-head">
+          <Icon name="flip" :size="11" />
+          <span>拼接动画</span>
+          <span class="chip">{{ store.stripsAnimations.length }}</span>
+        </div>
+        <div class="grid">
+          <div
+            v-for="project in store.stripsAnimations"
+            :key="project.id"
+            class="anim-card new-card"
+            :data-path="store.projectCoverKey(project)"
+            :title="`拼接动画 · ${project.stripCount ?? 0} 个源动画`"
+          >
+            <!-- 点击整张卡片 = 回到拼接区编辑编排（不是预览烘焙结果）；stripCount 可能缺失，回退为 0 -->
+            <button class="card-select" type="button" @click="editComposition(project)">
+              <div class="thumb">
+                <!--
+                  封面 key 与普通卡片一致：已保存用 project:<id>，后端按项目烘培数据取姿势。
+                  这里没有 <span> 角标区分的 active 态，因为拼接线不使用 activeNewAnimationId。
+                -->
+                <img
+                  v-if="store.thumbnails[store.projectCoverKey(project)]"
+                  :src="store.thumbnails[store.projectCoverKey(project)]"
+                  :alt="project.name"
+                />
+                <div v-else class="thumb-placeholder">
+                  <Icon name="flip" :size="18" />
+                </div>
+                <span class="new-badge strips">{{ projectStatus(project) }}</span>
+              </div>
+            </button>
+            <form
+              v-if="renamingId === project.id"
+              class="rename-form"
+              @submit.prevent="commitRename(project)"
+            >
+              <input
+                :ref="focusRenameInput"
+                v-model="renameDraft"
+                class="rename-input"
+                type="text"
+                maxlength="80"
+                placeholder="输入新名称"
+                @keydown.esc.stop.prevent="cancelRename"
+                @blur="commitRename(project)"
+              />
+            </form>
+            <template v-else>
+              <span class="name" :title="project.name">{{ project.name }}</span>
+              <span class="name-sub">{{ project.stripCount ?? 0 }} 个源动画 · 拼接</span>
+            </template>
+            <!--
+              悬浮操作区（不透明度由 CSS 控制，仅 hover/active 时显示）：
+              拼接项目比普通项目多一个前置的「编辑拼接」入口；
+              重命名复用同一套逻辑；删除对已保存项目是移入回收站（confirmAction 二次确认）。
+            -->
+            <div class="card-actions">
+              <button class="card-icon" type="button" title="编辑拼接" @click.stop="editComposition(project)">
+                <Icon name="flip" :size="12" />
+              </button>
               <button
                 class="card-icon"
                 type="button"
@@ -549,6 +665,11 @@ function onPageSize(event: Event): void {
 
 .new-badge.dirty {
   background: rgba(217, 119, 6, 0.85);
+}
+
+.new-badge.strips {
+  background: rgba(56, 189, 248, 0.85);
+  color: #062033;
 }
 
 .name-sub {

@@ -13,6 +13,7 @@ import {
   listProjects,
   listTrash,
   normalizeName,
+  normalizeComposition,
   projectId,
   purgeProject,
   readProject,
@@ -429,16 +430,32 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
     }
   });
 
-  // ===== 新建动画：保存 / 读取 / 删除 =====
+  // ===== 新建动画 / 拼接动画：保存 / 读取 / 删除 =====
   //
   // 新建动画由前端用内置白模创建，导入的动画 JSON 与项目名保存到项目自己的
   // data/anim-projects 目录（gitignore），不会写入任何 FBX 源文件夹。
+  //
+  // 本轮新增：「拼接工作区」的产物与普通新建动画共用同一套项目接口，区别只在
+  // 请求体是否带 composition 字段——带上即为拼接动画（读回后前端按 kind === 'strips'
+  // 分类，并在拼接工作区里继续编辑）；不带或传 null 则是普通新建动画。
+  // 项目记录的统一形状与 normalize 规则见 services/animProjects.ts。
 
-  /** 项目列表：只返回摘要，动画数据按 id 单独取，避免一次传输几百 MB */
+  /**
+   * 项目列表。
+   * 只返回摘要（ProjectSummary，不含 data），动画数据按 id 单独取，避免一次传输几百 MB。
+   * 每项含服务端派生的 kind（'clip' | 'strips'）与 stripCount（拼接轨道数，0–5）。
+   * @returns 200 `{ projects: ProjectSummary[] }`，按 createdAt 升序
+   */
   app.get('/api/anim/projects', async () => {
     return { projects: await listProjects() };
   });
 
+  /**
+   * 读取单个项目详情。
+   * @param params.id 项目 id，需匹配 [A-Za-z0-9_-]{1,80}
+   * @returns 200 `{ ...ProjectSummary, data }`（含烘焙动画数据本体，拼接项目另含 composition）；
+   *          400 id 非法；404 项目不存在（含文件损坏被 normalize 判为无效的情况）
+   */
   app.get('/api/anim/projects/:id', async (request, reply) => {
     const id = projectId((request.params as { id?: string }).id);
     if (!id) return reply.code(400).send({ error: '无效的项目 id' });
@@ -447,6 +464,26 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
     return { ...summaryOf(record), data: record.data };
   });
 
+  /**
+   * 新建或更新项目（同一个 id 再次 PUT 即为更新，语义是整体覆盖）。
+   *
+   * 请求体（PUT /api/anim/projects/:id）：
+   *  - name?: string         展示名；缺省 / 空白时沿用原项目的名称，新项目回落「新建动画」
+   *  - basePath?: string     基础模型 FBX 绝对路径；缺省沿用旧值
+   *  - baseName?: string     基础模型展示名；缺省沿用旧值
+   *  - data?: unknown | null 烘焙动画数据；非 null 时必须形如
+   *                          `{ format: 'fbx-animation-data', clips: [...] }`，否则 400
+   *  - imported?: unknown    导入摘要（name / clipCount / trackCount）；非法或缺失时沿用旧值
+   *  - composition?: unknown 拼接编排（tracks 数组 + basePath / baseName / duration）。
+   *                          不传＝保持旧 composition 不变；传 null＝清除（改回普通新建动画）；
+   *                          传对象＝经 normalizeComposition 校验后覆盖
+   *
+   * createdAt 保留原值，updatedAt 每次写入刷新；clipCount / trackCount / hasData 由 data 推导。
+   *
+   * @param params.id 项目 id
+   * @returns 200 ProjectSummary（不含 data）；400 id 非法或动画数据格式不符；
+   *          409 名称与本项目外的未删除项目重名；500 磁盘写入失败
+   */
   app.put('/api/anim/projects/:id', async (request, reply) => {
     const id = projectId((request.params as { id?: string }).id);
     if (!id) return reply.code(400).send({ error: '无效的项目 id' });
@@ -457,6 +494,8 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
       baseName?: unknown;
       data?: unknown;
       imported?: unknown;
+      /** 拼接工作区的编排；传 null 表示把项目改回普通新建动画 */
+      composition?: unknown;
     };
     const data = body.data ?? null;
     if (data !== null) {
@@ -497,6 +536,7 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
       trackCount,
       hasData: data !== null,
       data,
+      composition: normalizeComposition(body.composition, existing?.composition ?? null),
     };
 
     try {
@@ -508,7 +548,13 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
     return summaryOf(record);
   });
 
-  /** 重命名（只改名称，不动动画数据） */
+  /**
+   * 重命名（只改名称，不动动画数据与拼接编排）。
+   * @param params.id 项目 id
+   * @body name: string 新名称（必填字符串，服务端再规范化）
+   * @returns 200 ProjectSummary；400 id 非法或 name 不是字符串 / 为空；
+   *          404 项目不存在；409 与本项目外的未删除项目重名
+   */
   app.patch('/api/anim/projects/:id', async (request, reply) => {
     const id = projectId((request.params as { id?: string }).id);
     if (!id) return reply.code(400).send({ error: '无效的项目 id' });
@@ -520,7 +566,13 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
     return result.project;
   });
 
-  /** 删除 = 移入回收站（软删除），可在回收站恢复 */
+  /**
+   * 删除 = 移入回收站（软删除），可在回收站恢复。
+   * 幂等：项目不存在时也返回 200，只是 ok / trashed 为 false。
+   * @param params.id 项目 id
+   * @returns 200 `{ ok, trashed }`（两者同值，trashed 表示是否确实移入了回收站）；
+   *          400 id 非法
+   */
   app.delete('/api/anim/projects/:id', async (request, reply) => {
     const id = projectId((request.params as { id?: string }).id);
     if (!id) return reply.code(400).send({ error: '无效的项目 id' });
@@ -528,12 +580,16 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
     return { ok: trashed, trashed };
   });
 
-  /** 回收站列表 */
+  /** 回收站列表：返回摘要（含 kind / stripCount），按删除时间倒序 */
   app.get('/api/anim/trash', async () => {
     return { projects: await listTrash() };
   });
 
-  /** 回收站项目详情（含动画数据，只读预览用） */
+  /**
+   * 回收站项目详情（含动画数据，只读预览用）。
+   * @param params.id 项目 id
+   * @returns 200 `{ ...ProjectSummary, data }`；400 id 非法；404 回收站里没有该项目
+   */
   app.get('/api/anim/trash/:id', async (request, reply) => {
     const id = projectId((request.params as { id?: string }).id);
     if (!id) return reply.code(400).send({ error: '无效的项目 id' });
@@ -542,7 +598,12 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
     return { ...summaryOf(record), data: record.data };
   });
 
-  /** 从回收站恢复 */
+  /**
+   * 从回收站恢复（清空 deletedAt、刷新 updatedAt、写回主目录）。
+   * @param params.id 项目 id
+   * @returns 200 `{ ok: true, renamed, project }`，renamed 为 true 表示重名已自动改名；
+   *          400 id 非法；404 回收站里没有该项目
+   */
   app.post('/api/anim/projects/:id/restore', async (request, reply) => {
     const id = projectId((request.params as { id?: string }).id);
     if (!id) return reply.code(400).send({ error: '无效的项目 id' });
@@ -552,7 +613,11 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
     return { ok: true, renamed: result.renamed, project: result.project };
   });
 
-  /** 彻底删除回收站项目 */
+  /**
+   * 彻底删除回收站项目（不可恢复）。
+   * @param params.id 项目 id
+   * @returns 200 `{ ok }`，ok 为 false 表示回收站里没有该项目；400 id 非法
+   */
   app.delete('/api/anim/trash/:id', async (request, reply) => {
     const id = projectId((request.params as { id?: string }).id);
     if (!id) return reply.code(400).send({ error: '无效的项目 id' });

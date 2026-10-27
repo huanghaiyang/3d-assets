@@ -1,29 +1,58 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+/**
+ * StripsPage —— 「拼接动画」工作区 v2 的页面骨架。
+ *
+ * 在整个拼接流程中的位置：这里是编排入口与总布局，本身不参与 Three.js 渲染，
+ * 只负责把左栏素材库、中间 3D 预览、右侧 Strip 检查器、底部时间轴拼成一个整体，
+ * 并在进入/离开时协调 Pinia store（useStripsStore）。
+ *
+ * 布局：左侧基础模型 + 三种来源（FBX / Kimodo / 已保存项目）列表；
+ * 中间是 StripsViewport；右侧是 StripInspector；底部 StripTimeline 横跨整行、铺满工作栏。
+ *
+ * 数据来源与去向：
+ *  - `store.files` / `store.projects` / `store.kimodoJobs` 由 store.bootstrap() 拉取；
+ *  - 用户点「+」后调用 store.addStrip(source)，由 store 负责 5 个源动画上限、
+ *    重复来源拦截、部位冲突校验，并把结果推给 StripsPlayer 渲染；
+ *  - 子组件均直接读写 store，本页只通过 store 与它们共享状态，不额外传 props；
+ *  - toast 由 store.toasts 统一渲染，保存/冲突/失败提示都经由 store.toast()。
+ *
+ * 关键交互：切换基础模型、搜索与展开 FBX 片段、快捷加入最长片段、
+ * 新建/再次编辑已保存的拼接动画、有未保存改动时离开页面的拦截提示。
+ */
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import Icon from '../ui/Icon.vue';
 import MotionThumb from '../animation/MotionThumb.vue';
 import StripInspector from './StripInspector.vue';
 import StripTimeline from './StripTimeline.vue';
 import StripsViewport from './StripsViewport.vue';
-import { useStripsStore } from '@/stores/strips';
+import { useStripsStore, MAX_STRIP_TRACKS } from '@/stores/strips';
 import { animationApi, type AnimationFile, type SavedAnimationProject } from '@/api/animation';
-import { BODY_PARTS } from '@/viewer/strips/StripParts';
-import type { BodyPart } from '@/viewer/strips/StripTypes';
+import type { StripSource } from '@/viewer/strips/StripTypes';
 
 const store = useStripsStore();
 
+/** 左栏来源列表的当前分类：FBX 片段 / Kimodo 生成结果 / 已保存动画项目（含拼接动画） */
 const tab = ref<'fbx' | 'kimodo' | 'anim'>('fbx');
-/** 新增 Strip 默认应用的部位，加完可按需在检查器里改 */
-const defaultPart = ref<BodyPart>('full');
 
+/** FBX 分类下的搜索关键词（匹配相对路径，大小写不敏感） */
 const keyword = ref('');
+/** 点击展开的 FBX 文件；为 null 表示收起片段面板 */
 const openFile = ref<AnimationFile | null>(null);
+/** 当前展开文件的内嵌片段，由 store.listFbxClips() 按需读取，读完后参与列表渲染 */
 const clipOptions = ref<{ name: string; duration: number }[]>([]);
 const loadingClips = ref(false);
+/** 正在为了快速加入而读取片段时，标记住那一行 */
+const quickLoading = ref<string | null>(null);
 
+/** 基础模型选择弹窗的开关（弹窗内容也复用 store.files） */
 const basePickerOpen = ref(false);
 const baseKeyword = ref('');
 
+/**
+ * FBX 分类过滤后的列表。
+ * 只截取前 80 条，避免一次性渲染整个动画库导致首屏卡顿；
+ * 关键词为空时直接沿用 store.files（自身已是响应式数组）。
+ */
 const filteredFiles = computed(() => {
   const query = keyword.value.trim().toLowerCase();
   const list = query
@@ -32,6 +61,7 @@ const filteredFiles = computed(() => {
   return list.slice(0, 80);
 });
 
+/** 基础模型弹窗的过滤结果；封面卡片更小，所以上限放宽到 120 条 */
 const baseFiles = computed(() => {
   const query = baseKeyword.value.trim().toLowerCase();
   const list = query
@@ -40,10 +70,20 @@ const baseFiles = computed(() => {
   return list.slice(0, 120);
 });
 
+/**
+ * FBX 文件封面地址（缩略图由后端按 `path` 渲染）。
+ * @param path 动画库内的相对/绝对路径
+ * @param size 期望的方形边长，单位像素；0.35 是取帧位置（视频时长的 35% 处）
+ */
 function fileCover(path: string, size = 64): string {
   return animationApi.animationCoverUrl(path, size, 0.35);
 }
 
+/**
+ * 已保存动画项目的封面地址。
+ * 项目没有磁盘上的 path，因此传空字符串并附带 projectId + updatedAt，
+ * 后者作为 version 参数用于让浏览器在项目更新后重新拉取封面。
+ */
 function projectCover(project: SavedAnimationProject, size = 64): string {
   return animationApi.animationCoverUrl('', size, 0.35, {
     project: project.id,
@@ -51,6 +91,11 @@ function projectCover(project: SavedAnimationProject, size = 64): string {
   });
 }
 
+/**
+ * 点击 FBX 行：再次点击同一文件则收起；否则异步读取该文件的内嵌片段。
+ * 片段读取失败时 store.listFbxClips 内部会把错误转成 toast 并返回空数组，
+ * 所以这里不需要额外的 try/catch。
+ */
 async function chooseFile(file: AnimationFile): Promise<void> {
   if (openFile.value?.path === file.path) {
     openFile.value = null;
@@ -64,41 +109,136 @@ async function chooseFile(file: AnimationFile): Promise<void> {
   loadingClips.value = false;
 }
 
+/**
+ * 加入 FBX 的某个具名片段。
+ * 同一文件可添加多个不同片段，但同一 (fbxPath, clipName) 只会占用一个源动画槽位，
+ * 重复添加由 store.addStrip 拦截并提示。
+ */
 function addFbxClip(name: string): void {
   if (!openFile.value) return;
-  store.addStrip(
-    { kind: 'fbx-clip', fbxPath: openFile.value.path, clipName: name },
-    defaultPart.value,
-  );
+  store.addStrip({ kind: 'fbx-clip', fbxPath: openFile.value.path, clipName: name });
 }
 
+/**
+ * 文件行右侧加号：读取片段并加入其中最长的一段。
+ * v2 要求三种来源行右侧都提供快捷加号；FBX 一行可能含多个片段，
+ * 这里取 duration 最大者作为默认选择（用户仍可展开后逐个挑选）。
+ * `quickLoading` 同时充当并发锁：读取期间忽略后续点击，避免重复入队。
+ */
+async function addFbxFileQuick(file: AnimationFile): Promise<void> {
+  if (quickLoading.value) return;
+  quickLoading.value = file.path;
+  try {
+    const clips = await store.listFbxClips(file.path);
+    if (clips.length === 0) {
+      store.toast('info', '这个 FBX 没有内嵌动画，展开后可查看片段');
+      return;
+    }
+    const longest = clips.reduce((best, clip) => (clip.duration > best.duration ? clip : best), clips[0]!);
+    store.addStrip({ kind: 'fbx-clip', fbxPath: file.path, clipName: longest.name });
+  } finally {
+    quickLoading.value = null;
+  }
+}
+
+/** 加入一条 Kimodo 生成动画；时长由 store.kimodoDuration() 按 30fps 帧数换算 */
 function addKimodo(animationId: string): void {
-  store.addStrip({ kind: 'kimodo', animationId }, defaultPart.value);
+  store.addStrip({ kind: 'kimodo', animationId });
 }
 
+/**
+ * 加入一个已保存的动画项目（v2 起项目按「拼接动画」等分类区分）。
+ * 保存时写入的 composition 会在动画工作区点「编辑拼接」时再次送回本页。
+ */
 function addProject(project: SavedAnimationProject): void {
-  store.addStrip(
-    { kind: 'anim-project', projectId: project.id, projectName: project.name },
-    defaultPart.value,
-  );
+  store.addStrip({ kind: 'anim-project', projectId: project.id, projectName: project.name });
 }
 
+/** Kimodo 作业的显示名：优先用提示词，没有提示词则截取 id 前 6 位兜底 */
 function jobTitle(prompt: string | undefined, id: string): string {
   return prompt?.trim() || `Kimodo ${id.slice(0, 6)}`;
 }
 
+/**
+ * 这个 FBX 文件里是否有任何片段已加入时间轴。
+ * v2 要求被使用的来源在左栏高亮，因此只按 fbxPath 匹配，
+ * 不关心具体是哪个 clipName（同一文件的不同片段也算「该来源已被使用」）。
+ */
+function fileAdded(file: AnimationFile): boolean {
+  return store.strips.some(
+    (strip) => strip.source.kind === 'fbx-clip' && strip.source.fbxPath === file.path,
+  );
+}
+
+/** 具体某个 (文件, 片段) 是否已加入时间轴，用于片段按钮打勾 */
+function clipAdded(name: string): boolean {
+  if (!openFile.value) return false;
+  return store.strips.some(
+    (strip) =>
+      strip.source.kind === 'fbx-clip' &&
+      strip.source.fbxPath === openFile.value!.path &&
+      strip.source.clipName === name,
+  );
+}
+
+/** Kimodo 来源是否已在时间轴上（按 animationId 判重） */
+function kimodoAdded(id: string): boolean {
+  return store.isSourceAdded({ kind: 'kimodo', animationId: id });
+}
+
+/** 已保存项目是否已在时间轴上（按 projectId 判重） */
+function projectAdded(project: SavedAnimationProject): boolean {
+  return store.isSourceAdded({ kind: 'anim-project', projectId: project.id, projectName: project.name });
+}
+
+/**
+ * 生成「+」按钮的 title 文案，三种状态：
+ *  - 已加入：提示去右侧检查器多选部位（同一动画可占用多个部位）；
+ *  - 已达上限：身体部位只有 MAX_STRIP_TRACKS 个，因此最多该数量的源动画；
+ *  - 可加入：展示来源名称。
+ */
+function addTitle(source: StripSource, added: boolean): string {
+  if (added) return '已在时间轴上（可去右侧检查器多选部位）';
+  if (!store.canAddSource) return `最多从 ${MAX_STRIP_TRACKS} 个源动画拼接，已达上限`;
+  return `加入时间轴 · ${store.sourceLabel(source)}`;
+}
+
+/** 选中基础模型：先关闭弹窗，再交给 store.selectBase() 真正加载 FBX */
 async function pickBase(path: string): Promise<void> {
   basePickerOpen.value = false;
   await store.selectBase(path);
 }
 
+/**
+ * 离开页面/关闭浏览器时提示未保存的拼接修改。
+ * 浏览器只允许同步拦截，因此不弹自定义确认框，而是走标准 beforeunload：
+ * `returnValue = ''` 触发宿主浏览器的「离开此网站？」提示。
+ */
+function onBeforeUnload(event: BeforeUnloadEvent): void {
+  if (!store.hasUnsavedChanges) return;
+  event.preventDefault();
+  event.returnValue = '';
+}
+
+/**
+ * 挂载时注册离开拦截并启动 store.bootstrap()：
+ * bootstrap 会加载素材目录、选中默认基础模型，或应用从动画工作区
+ * 「编辑拼接」暂存过来的编排（pendingComposition）。
+ */
 onMounted(() => {
+  window.addEventListener('beforeunload', onBeforeUnload);
   void store.bootstrap();
+});
+
+/** 卸载时必须解除全局监听，否则组件销毁后仍会拦截跳转 */
+onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', onBeforeUnload);
 });
 </script>
 
 <template>
   <div class="strips-page">
+    <!-- 左栏：基础模型卡片 + 三种来源库；所有「+」最终都汇入 store.strips -->
     <aside class="panel left">
       <div class="base">
         <div class="base-head">
@@ -109,11 +249,12 @@ onMounted(() => {
         </div>
 
         <button v-if="store.baseFile" class="base-card" type="button" @click="basePickerOpen = true">
+          <!-- 已选基础模型：封面 + 名称 + 相对路径 + 当前占用槽位（n/5） -->
           <img class="base-cover" :src="fileCover(store.baseFile.path, 96)" :alt="store.baseFile.name" />
           <span class="base-info">
             <span class="base-name">{{ store.baseFile.name }}</span>
             <span class="faint mono">{{ store.baseFile.relative }}</span>
-            <span class="faint mono">{{ store.strips.length }} 个 Strip</span>
+            <span class="faint mono">{{ store.strips.length }}/{{ MAX_STRIP_TRACKS }} 个源动画</span>
           </span>
         </button>
         <button v-else class="base-empty" type="button" @click="basePickerOpen = true">
@@ -124,6 +265,7 @@ onMounted(() => {
       </div>
 
       <div class="library">
+        <!-- 三个分类共用 store 的同一份素材目录，只是过滤方式不同 -->
         <div class="tabs">
           <button class="tab" :class="{ active: tab === 'fbx' }" type="button" @click="tab = 'fbx'">
             FBX
@@ -136,11 +278,11 @@ onMounted(() => {
           </button>
         </div>
 
-        <div class="part-row">
-          <span class="field-label">新增到</span>
-          <select v-model="defaultPart" class="select-input">
-            <option v-for="part in BODY_PARTS" :key="part.id" :value="part.id">{{ part.label }}</option>
-          </select>
+        <div class="usage" :class="{ full: !store.canAddSource }">
+          <!-- 槽位用量条：5 个身体部位 = 最多 5 个源动画，满额时整条变红 -->
+          <Icon name="layers" :size="11" />
+          <span>已用 {{ store.strips.length }}/{{ MAX_STRIP_TRACKS }} 个源动画</span>
+          <span class="faint">点 + 加入，重复源不会重复添加</span>
         </div>
 
         <template v-if="tab === 'fbx'">
@@ -149,24 +291,39 @@ onMounted(() => {
             <input v-model="keyword" class="search-input" placeholder="搜索 FBX 文件" />
           </div>
           <div class="list">
-            <button
+            <!-- 每行同时具备两个入口：点行展开片段；点右侧加号快捷加入最长片段 -->
+            <div
               v-for="file in filteredFiles"
               :key="file.path"
               class="row"
-              :class="{ active: openFile?.path === file.path }"
-              type="button"
+              :class="{ active: openFile?.path === file.path, added: fileAdded(file) }"
+              role="button"
+              tabindex="0"
               @click="chooseFile(file)"
+              @keydown.enter.prevent="chooseFile(file)"
             >
               <img class="row-cover" :src="fileCover(file.path, 64)" :alt="file.name" loading="lazy" />
               <span class="row-text">
                 <span class="row-name">{{ file.name }}</span>
                 <span class="faint mono row-sub">{{ file.relative }}</span>
               </span>
-            </button>
+              <!-- .stop 阻止冒泡，避免加号同时触发展开片段 -->
+              <button
+                class="row-add"
+                :class="{ added: fileAdded(file) }"
+                type="button"
+                :title="addTitle({ kind: 'fbx-clip', fbxPath: file.path, clipName: '' }, fileAdded(file))"
+                :disabled="quickLoading === file.path"
+                @click.stop="addFbxFileQuick(file)"
+              >
+                <Icon :name="fileAdded(file) ? 'check' : 'plus'" :size="12" />
+              </button>
+            </div>
             <div v-if="filteredFiles.length === 0" class="empty">
               {{ store.catalogLoading ? '正在加载…' : '没有匹配的 FBX' }}
             </div>
           </div>
+          <!-- 展开某文件后逐个挑选内嵌片段；同一片段只能加一次，已加入的打勾 -->
           <div v-if="openFile" class="clips">
             <div class="clips-head">
               <span class="section-title"><Icon name="film" :size="11" />{{ openFile.name }}</span>
@@ -177,11 +334,12 @@ onMounted(() => {
                 v-for="clip in clipOptions"
                 :key="clip.name"
                 class="clip"
+                :class="{ added: clipAdded(clip.name) }"
                 type="button"
                 :title="`加入时间轴 · ${clip.duration.toFixed(2)}s`"
                 @click="addFbxClip(clip.name)"
               >
-                <Icon name="plus" :size="10" />
+                <Icon :name="clipAdded(clip.name) ? 'check' : 'plus'" :size="10" />
                 <span class="clip-name">{{ clip.name }}</span>
                 <span class="faint mono">{{ clip.duration.toFixed(2) }}s</span>
               </button>
@@ -192,13 +350,17 @@ onMounted(() => {
 
         <template v-else-if="tab === 'kimodo'">
           <div class="list">
-            <button
+            <!-- Kimodo 条目：整行可点即加入；缩略图用骨架预览（store.somaSkeleton） -->
+            <div
               v-for="job in store.kimodoJobs"
               :key="job.id"
               class="row"
-              type="button"
-              title="加入时间轴"
+              :class="{ added: kimodoAdded(job.id) }"
+              role="button"
+              tabindex="0"
+              :title="addTitle({ kind: 'kimodo', animationId: job.id }, kimodoAdded(job.id))"
               @click="addKimodo(job.id)"
+              @keydown.enter.prevent="addKimodo(job.id)"
             >
               <MotionThumb
                 class="row-thumb"
@@ -211,44 +373,57 @@ onMounted(() => {
                 <span class="row-name">{{ jobTitle(job.prompt, job.id) }}</span>
                 <span class="faint mono row-sub">{{ store.kimodoDuration(job.id).toFixed(2) }}s · {{ job.frames }} 帧</span>
               </span>
-              <Icon name="plus" :size="12" />
-            </button>
+              <button class="row-add" :class="{ added: kimodoAdded(job.id) }" type="button" @click.stop="addKimodo(job.id)">
+                <Icon :name="kimodoAdded(job.id) ? 'check' : 'plus'" :size="12" />
+              </button>
+            </div>
             <div v-if="store.kimodoJobs.length === 0" class="empty">还没有生成完成的 Kimodo 动画</div>
           </div>
         </template>
 
         <template v-else>
           <div class="list">
-            <button
+            <!-- 已保存项目（含「拼接动画」分类出来的条目）也可以作为源动画再次拼接 -->
+            <div
               v-for="project in store.projects"
               :key="project.id"
               class="row"
-              type="button"
-              title="加入时间轴"
+              :class="{ added: projectAdded(project) }"
+              role="button"
+              tabindex="0"
+              :title="addTitle({ kind: 'anim-project', projectId: project.id, projectName: project.name }, projectAdded(project))"
               @click="addProject(project)"
+              @keydown.enter.prevent="addProject(project)"
             >
               <img class="row-cover" :src="projectCover(project, 64)" :alt="project.name" loading="lazy" />
               <span class="row-text">
                 <span class="row-name">{{ project.name }}</span>
                 <span class="faint mono row-sub">{{ project.clipCount }} 段 · {{ project.trackCount }} 轨</span>
               </span>
-              <Icon name="plus" :size="12" />
-            </button>
+              <button class="row-add" :class="{ added: projectAdded(project) }" type="button" @click.stop="addProject(project)">
+                <Icon :name="projectAdded(project) ? 'check' : 'plus'" :size="12" />
+              </button>
+            </div>
             <div v-if="store.projects.length === 0" class="empty">还没有保存过新建动画</div>
           </div>
         </template>
       </div>
     </aside>
 
+    <!-- 中栏：Three.js 预览（实时混合 / 烘焙结果、部位高亮、骨骼与下肢轨迹都在这里呈现） -->
     <div class="center">
       <div class="view">
         <StripsViewport />
       </div>
-      <StripTimeline />
     </div>
 
+    <!-- 右栏：当前选中 Strip 的属性编辑与烘焙/保存入口 -->
     <StripInspector class="right" />
 
+    <!-- 时间轴铺满整个底部工作栏（grid-column: 1 / -1），因此跨度等于左中右三栏之和 -->
+    <StripTimeline class="bottom" />
+
+    <!-- 基础模型选择弹窗；Teleport 到 body 以脱离左右栏的 overflow 裁剪 -->
     <Teleport to="body">
       <div v-if="basePickerOpen" class="modal-backdrop" @click.self="basePickerOpen = false">
         <div class="modal panel">
@@ -280,6 +455,7 @@ onMounted(() => {
       </div>
     </Teleport>
 
+    <!-- 全局轻提示：由 store.toast() 压入，3.2 秒后自动移除（成功/失败/冲突提示共用） -->
     <div class="toasts">
       <div v-for="toast in store.toasts" :key="toast.id" class="toast" :class="toast.kind">
         {{ toast.text }}
@@ -292,8 +468,9 @@ onMounted(() => {
 .strips-page {
   position: relative;
   display: grid;
-  /* 左：基础模型与来源库；中：视口 + 时间轴；右：Strip 检查器 */
+  /* 左：基础模型与来源库；中：视口；右：Strip 检查器；底部整行：时间轴 */
   grid-template-columns: 300px minmax(0, 1fr) 340px;
+  grid-template-rows: minmax(0, 1fr) auto;
   height: 100%;
   min-height: 0;
   gap: 8px;
@@ -302,6 +479,8 @@ onMounted(() => {
 }
 
 .left {
+  grid-column: 1;
+  grid-row: 1;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -431,24 +610,27 @@ onMounted(() => {
   color: var(--accent-hover);
 }
 
-.part-row {
+.usage {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex: none;
-}
-
-.field-label {
-  font-size: 11.5px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-app);
+  font-size: 11px;
   color: var(--text-dim);
-  white-space: nowrap;
 }
 
-.part-row .select-input {
-  flex: 1;
-  height: 26px;
-  padding: 0 6px;
-  font-size: 11.5px;
+.usage.full {
+  border-color: rgba(248, 113, 113, 0.35);
+  color: var(--danger);
+}
+
+.usage .faint {
+  margin-left: auto;
+  font-size: 10px;
 }
 
 .search {
@@ -484,6 +666,7 @@ onMounted(() => {
 }
 
 .row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -494,15 +677,37 @@ onMounted(() => {
   background: var(--bg-app);
   color: var(--text);
   text-align: left;
+  cursor: pointer;
 }
 
 .row:hover {
   background: var(--bg-hover);
 }
 
+.row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .row.active {
   border-color: var(--accent);
   background: var(--accent-soft);
+}
+
+.row.added {
+  border-color: rgba(52, 211, 153, 0.4);
+  background: rgba(52, 211, 153, 0.08);
+}
+
+.row.added::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--success, #34d399);
 }
 
 .row-cover {
@@ -540,6 +745,29 @@ onMounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.row-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-panel);
+  color: var(--text-dim);
+}
+
+.row-add:hover {
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+
+.row-add.added {
+  border-color: rgba(52, 211, 153, 0.45);
+  color: var(--success, #34d399);
 }
 
 .clips {
@@ -588,6 +816,11 @@ onMounted(() => {
   color: var(--text);
 }
 
+.clip.added {
+  border-color: rgba(52, 211, 153, 0.4);
+  color: var(--success, #34d399);
+}
+
 .clip-name {
   flex: 1;
   min-width: 0;
@@ -606,6 +839,8 @@ onMounted(() => {
 }
 
 .center {
+  grid-column: 2;
+  grid-row: 1;
   position: relative;
   display: flex;
   flex-direction: column;
@@ -624,7 +859,14 @@ onMounted(() => {
 }
 
 .right {
+  grid-column: 3;
+  grid-row: 1;
   min-height: 0;
+}
+
+.bottom {
+  grid-column: 1 / -1;
+  grid-row: 2;
 }
 
 /* ===== 基础模型选择弹窗 ===== */

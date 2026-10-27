@@ -1,4 +1,6 @@
 import { request } from './client';
+/** 拼接编排的类型定义在 viewer/strips/StripTypes 里（与时间轴/渲染层共享，避免循环依赖） */
+import type { StripsComposition } from '@/viewer/strips/StripTypes';
 
 export interface AnimationFile {
   name: string;
@@ -62,23 +64,49 @@ export interface AnimationImportSummary {
   trackCount: number;
 }
 
-/** 已保存的新建动画（列表项，不含动画数据本体） */
+/**
+ * 已保存的动画项目（列表项 / 保存响应，不含动画数据本体）。
+ *
+ * 两种项目共用这一结构，靠 `kind` 区分：
+ *  - `'clip'`  普通新建动画（只有烘焙数据 data）；
+ *  - `'strips'`拼接工作区的产物（额外带 composition，可再次打开继续编辑）。
+ * kind / stripCount 由后端 summaryOf() 派生，旧项目缺 composition 时即为 'clip'。
+ */
 export interface SavedAnimationProject {
+  /** 项目 id，同时是服务端文件名 `<id>.json`；保存时同一 id 再次提交即为更新 */
   id: string;
+  /** 展示名（服务端规范化，最长 80 字符，不可与其它未删除项目重名） */
   name: string;
   /** 基础模型（动画库里的 Mixamo FBX 绝对路径） */
   basePath: string;
+  /** 基础模型展示名（仅 UI） */
   baseName: string;
+  /** 创建时间，ISO 8601 字符串 */
   createdAt: string;
+  /** 最后修改时间，ISO 8601 字符串；封面缓存失效也看它 */
   updatedAt: string;
+  /** 导入动画 JSON 得到的摘要；非导入来源的项目为 null */
   imported: AnimationImportSummary | null;
+  /** data 里的片段数量（服务端派生） */
   clipCount: number;
+  /** 所有片段的轨道总数（服务端派生） */
   trackCount: number;
+  /** 是否已有烘焙动画数据 */
   hasData: boolean;
+  /** 项目类别：带拼接编排的项目为 strips，动画工作区里单独分类 */
+  kind?: 'clip' | 'strips';
+  /** 拼接编排里的源动画数量（最多 5，对应 5 个身体部位）；普通项目为 0 */
+  stripCount?: number;
+  /**
+   * 拼接工作区的编排快照；普通新建动画为 null。
+   * 读取时可能缺失（旧项目），已由后端 normalizeComposition 补齐默认值。
+   */
+  composition?: StripsComposition | null;
   /** 进入回收站的时间（只有回收站里的项目才有） */
   deletedAt?: string;
 }
 
+/** 项目详情：在列表项基础上带上烘焙动画数据本体（取单个项目时才传输） */
 export interface SavedAnimationProjectDetail extends SavedAnimationProject {
   /** 原始动画数据；由 store 侧校验格式后再使用 */
   data: unknown;
@@ -135,17 +163,44 @@ export const animationApi = {
   browse: (dir?: string) =>
     request<AnimationBrowseResponse>(`/api/anim/browse${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`),
 
-  // ===== 新建动画（内置白模 + 导入的动画 JSON） =====
+  // ===== 新建动画 / 拼接动画（内置白模 + 导入/烘焙的动画数据） =====
 
   /** 手指形态库（从现有 Mixamo 动画采样去重；refresh 时后台重建） */
   fingerPoses: (refresh = false) =>
     request<FingerPoseLibrary>(`/api/anim/finger-poses${refresh ? '?refresh=1' : ''}`),
 
+  /**
+   * 项目列表（摘要，不含动画数据本体，避免一次传输几百 MB）。
+   * @returns `{ projects }`，按创建时间升序；每项含后端派生的 kind 与 stripCount，
+   *          前端据此把「拼接动画」与普通新建动画分开归类
+   */
   projects: () => request<{ projects: SavedAnimationProject[] }>('/api/anim/projects'),
 
+  /**
+   * 读取单个项目详情（含 data）。
+   * @param id 项目 id；会被 encodeURIComponent，非法 id 由服务端回 400
+   * @returns 项目详情；项目不存在 / 文件损坏时服务端回 404（由 request 转成异常）
+   */
   project: (id: string) =>
     request<SavedAnimationProjectDetail>(`/api/anim/projects/${encodeURIComponent(id)}`),
 
+  /**
+   * 新建或更新项目：对同一个 id 再次调用即为「更新」，服务端整体覆盖并刷新 updatedAt。
+   *
+   * 拼接工作区保存时同时提交两份数据：
+   *  - `data`：烘焙后的关键帧数据（供动画工作区播放 / 导出）；
+   *  - `composition`：可再编辑的编排快照（基础模型 + 最多 5 条 Strip 轨道）。
+   *
+   * @param project.id 项目 id（新建时由前端生成，需满足 [A-Za-z0-9_-]{1,80}）
+   * @param project.name 展示名；与其它未删除项目重名时服务端回 409
+   * @param project.basePath 基础模型 FBX 绝对路径
+   * @param project.baseName 基础模型展示名
+   * @param project.data 形如 `{ format: 'fbx-animation-data', clips: [...] }`，格式不符回 400
+   * @param project.imported 导入摘要；非导入来源传 null
+   * @param project.composition 拼接编排。不传＝保持旧编排不变；传 null＝清除（改回普通项目）；
+   *                            传对象＝覆盖。轨道内部字段由前端定义，服务端只校验外层结构
+   * @returns 保存后的项目摘要（不含 data）；磁盘写入失败时服务端回 500
+   */
   saveProject: (project: {
     id: string;
     name: string;
@@ -153,6 +208,8 @@ export const animationApi = {
     baseName: string;
     data: unknown;
     imported: AnimationImportSummary | null;
+    /** 拼接编排；不传表示不修改，null 表示清除 */
+    composition?: StripsComposition | null;
   }) =>
     request<SavedAnimationProject>(`/api/anim/projects/${encodeURIComponent(project.id)}`, {
       method: 'PUT',
@@ -188,7 +245,13 @@ export const animationApi = {
   purgeProject: (id: string) =>
     request<{ ok: boolean }>(`/api/anim/trash/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
-  /** 只取流，不进 HTTP 缓存（服务端 no-store，客户端只在内存里留一份） */
+  /**
+   * 生成 FBX 取流地址（给 GLTFLoader / 自定义 loader 直接当 URL 用）。
+   * 只取流，不进 HTTP 缓存（服务端 Cache-Control: no-store，客户端只在内存里留一份）；
+   * 服务端只允许读 .fbx，且对 dir+name 形式会做目录穿越校验。
+   * @param filePath 动画库扫描结果里的绝对路径（AnimationFile.path）
+   * @returns 形如 `/api/anim/file?path=<encoded>` 的地址
+   */
   fileUrl: (filePath: string) => `/api/anim/file?path=${encodeURIComponent(filePath)}`,
 
   /**

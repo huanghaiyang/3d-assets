@@ -1,3 +1,18 @@
+/**
+ * 动画工作区 store。
+ *
+ * 职责：
+ * - 动画库扫描与展示：文件夹记录、列表、模糊搜索、分页、封面 URL 缓存（均由后端渲染）；
+ * - 编辑器状态：选中 FBX / 新建动画项目、播放与姿态、骨骼与节点树、手型、数据 JSON 预览；
+ * - 新建动画项目的增删改查（保存 / 重命名 / 回收站 / 舞台「去编辑」闭环）。
+ *
+ * 与拼接工作区（stores/strips.ts）的关系：
+ * - 拼接区保存的项目本质上也是「新建动画项目」，只是额外带了可再编辑的编排快照 composition；
+ *   本 store 通过后端派生字段 `kind === 'strips'` 把它们单独归类为「拼接动画」；
+ * - 编排数据本身不在这里保存：`openComposition(id)` 属于 strips store，由动画库的「编辑拼接」
+ *   调用，读取服务端 composition 后接管，再用 workspace.requestPage('strips') 完成跳转；
+ * - 拼接区保存成功后会反过来调用本 store 的 `loadProjects()`，让动画库列表立即出现新条目。
+ */
 import { computed, ref, shallowRef, watch } from 'vue';
 import { defineStore } from 'pinia';
 import {
@@ -55,6 +70,13 @@ export interface NewAnimationProject {
   updatedAt: string | null;
   /** 服务端存有动画数据，但本地还没取回来 */
   hasData: boolean;
+  /**
+   * 项目类别：拼接工作区保存的动画在动画工作区里单独分类。
+   * 由后端项目元数据派生（见 projectFromSaved），本地新建的项目不带该字段。
+   */
+  kind?: 'clip' | 'strips';
+  /** 拼接编排里的源动画数量（最多 5），仅用于卡片副标题；编辑时以服务端 composition 为准 */
+  stripCount?: number;
   /** 进入回收站的时间（只有回收站里的项目才有） */
   deletedAt?: string;
 }
@@ -121,6 +143,14 @@ export const useAnimationStore = defineStore('animation', () => {
   const newAnimations = shallowRef<NewAnimationProject[]>([]);
   const activeNewAnimationId = ref<string | null>(null);
   const newAnimationMode = computed(() => activeNewAnimationId.value !== null);
+  /** 普通新建动画（动画工作区「新建动画」分类）；kind 缺失（旧数据）时按非拼接处理 */
+  const clipAnimations = computed(() => newAnimations.value.filter((item) => item.kind !== 'strips'));
+  /**
+   * 拼接工作区保存的动画（「拼接动画」分类，可再次打开编辑）。
+   * 判定只看后端派生的 kind 字段：它由服务端写入项目元数据，前端不在列表接口里反推编排，
+   * 因此这里不需要（也不应该）去读 composition——列表接口本来就不返回它。
+   */
+  const stripsAnimations = computed(() => newAnimations.value.filter((item) => item.kind === 'strips'));
   const activeNewAnimation = computed(
     () => newAnimations.value.find((item) => item.id === activeNewAnimationId.value) ?? null,
   );
@@ -1003,7 +1033,15 @@ export const useAnimationStore = defineStore('animation', () => {
     return true;
   }
 
-  /** 把当前新建动画保存到服务端（写入项目自己的数据目录，不碰 FBX 源文件夹） */
+  /**
+   * 把当前新建动画保存到服务端（写入项目自己的数据目录，不碰 FBX 源文件夹）。
+   *
+   * 只提交 data 与 imported 摘要、不带 composition：
+   * - 本方法服务的是动画工作区的普通新建动画；
+   * - 拼接项目「烘焙数据 + 编排快照」由 strips store 的 saveBaked 一次写入；
+   * - 由于 saveProject 的语义是「不传 composition 表示不修改」，这里的写入不会清掉
+   *   已保存拼接项目的编排，因此从动画工作区改名/保存不会破坏「编辑拼接」入口。
+   */
   async function saveNewAnimation(): Promise<void> {
     const project = activeNewAnimation.value;
     if (!project) {
@@ -1040,7 +1078,15 @@ export const useAnimationStore = defineStore('animation', () => {
     }
   }
 
-  /** 服务端摘要 → 本地项目（动画数据选中时再按需拉取） */
+  /**
+   * 服务端摘要 → 本地项目（动画数据选中时再按需拉取）。
+   *
+   * 拼接相关字段的取值策略：
+   * - `kind`：优先用服务端返回的 kind；老数据没有该字段时，退化为「有 composition 快照就算 strips」，
+   *   保证历史项目也能归到「拼接动画」分类；
+   * - `stripCount`：优先用服务端派生的数量；没有时退化为 composition.tracks.length（最多 5 个源动画）；
+   *   都没有则为 0，仅用于卡片副标题展示，不影响编辑（真正的编排由 strips store 打开时读取）。
+   */
   function projectFromSaved(item: SavedAnimationProject): NewAnimationProject {
     return {
       id: item.id,
@@ -1054,6 +1100,8 @@ export const useAnimationStore = defineStore('animation', () => {
       createdAt: item.createdAt,
       updatedAt: item.updatedAt,
       hasData: item.hasData,
+      kind: item.kind ?? (item.composition ? 'strips' : 'clip'),
+      stripCount: item.stripCount ?? item.composition?.tracks.length ?? 0,
       deletedAt: item.deletedAt,
     };
   }
@@ -1109,7 +1157,11 @@ export const useAnimationStore = defineStore('animation', () => {
     if (trashOpen.value) await loadTrash();
   }
 
-  /** 从回收站恢复；重名时服务端会自动加后缀 */
+  /**
+   * 从回收站恢复；重名时服务端会自动加后缀。
+   * 恢复时同样走 projectFromSaved，kind / stripCount 一并保留：
+   * 拼接项目恢复后仍回到「拼接动画」分区，不会退化成普通新建动画。
+   */
   async function restoreFromTrash(id: string): Promise<void> {
     try {
       const result = await animationApi.restoreProject(id);
@@ -1210,7 +1262,17 @@ export const useAnimationStore = defineStore('animation', () => {
     toast('info', `只读预览回收站中的「${item.name}」`);
   }
 
-  /** 读取服务端已保存的新建动画（只取摘要，选中时再拉动画数据） */
+  /**
+   * 读取服务端已保存的新建动画（只取摘要，选中时再拉动画数据）。
+   *
+   * 拼接动画就是靠这条路径进入动画库的：拼接区保存后调用本函数，服务端在摘要里给出
+   * `kind='strips'` 与 `stripCount`，projectFromSaved 把二者映射到本地项目，
+   * 于是列表的「拼接动画」分区（stripsAnimations）自动出现新条目——无需前端手工插入。
+   *
+   * 去重：已在 newAnimations 里的 id 跳过，避免与正在编辑的本地项目（例如刚保存过的）重复。
+   * 副作用：顺带刷新回收站（仅在回收站未打开时），让左栏回收站入口的数量保持最新。
+   * 失败路径：接口异常只 toast，不动现有列表（保持用户当前看到的数据）。
+   */
   async function loadProjects(): Promise<void> {
     projectsLoading.value = true;
     try {
@@ -1587,6 +1649,8 @@ export const useAnimationStore = defineStore('animation', () => {
     closeAnimationData,
     newAnimationMode,
     newAnimations,
+    clipAnimations,
+    stripsAnimations,
     activeNewAnimationId,
     activeNewAnimation,
     importingAnimation,
