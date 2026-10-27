@@ -6,8 +6,17 @@ import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import { AxisIndicator } from './axisIndicator';
 import { NodeHighlighter, type SceneNode } from './sceneNodes';
+import {
+  autoRigHumanoid,
+  detectOrientation,
+  rootHasSkeleton,
+  type AutoRigProgress,
+  type AutoRigResult,
+  type OrientationFix,
+} from './autorig/autoRig';
 
 export type { SceneNode };
 
@@ -57,6 +66,12 @@ export class ModelViewer {
   private disposed = false;
   private wireframeOn = false;
   private gridOn = true;
+
+  // ===== 自动绑骨（T-pose 人形） =====
+  /** 骨骼可视化助手；挂在场景而不是 modelRoot 上，避免被 GLTF 导出带出去 */
+  private skeletonHelper: THREE.SkeletonHelper | null = null;
+  /** 当前模型是否已通过 autoRig() 绑定骨架 */
+  private rigged = false;
 
   // ===== 场景节点树（与动画页共用 NodeHighlighter）=====
   private sceneTree: SceneNode[] = [];
@@ -296,6 +311,11 @@ export class ModelViewer {
   clear(): void {
     this.clearNodeSelection();
     this.sceneTree = [];
+    if (this.skeletonHelper) {
+      this.scene.remove(this.skeletonHelper);
+      this.skeletonHelper.dispose();
+      this.skeletonHelper = null;
+    }
     if (this.wireOverlay) {
       this.scene.remove(this.wireOverlay);
       disposeObject(this.wireOverlay);
@@ -307,6 +327,116 @@ export class ModelViewer {
       this.modelRoot = null;
     }
     this.stats = null;
+    this.rigged = false;
+  }
+
+  // ===== 自动绑骨 =====
+
+  /** 模型是否自带骨架（含已蒙皮的 SkinnedMesh） */
+  get hasSkeleton(): boolean {
+    return this.modelRoot ? rootHasSkeleton(this.modelRoot) : false;
+  }
+
+  /** 是否已通过 autoRig() 完成自动绑骨 */
+  get isRigged(): boolean {
+    return this.rigged;
+  }
+
+  get isSkeletonVisible(): boolean {
+    return this.skeletonHelper?.visible ?? false;
+  }
+
+  /** 当前模型是否已被手动或绑骨流程纠正过朝向（modelRoot.rotation.y 不为 0） */
+  get isOrientationCorrected(): boolean {
+    return this.modelRoot !== null && Math.abs(this.modelRoot.rotation.y) > 1e-4;
+  }
+
+  /**
+   * 单独纠正模型朝向（不依赖绑骨）。
+   * 检测当前模型的水平朝向，若偏离 glTF 约定的 +Z 正面，把 modelRoot 绕 Y 轴旋转回来。
+   * 已纠正时再点一次会还原到原始朝向（toggle），方便对比效果。
+   *
+   * @returns 实际施加的旋转量；yaw 为 0 表示无需纠正
+   */
+  correctOrientation(): OrientationFix {
+    if (!this.modelRoot) throw new Error('当前没有已加载的模型');
+
+    // 如果已经纠正过，先还原到 0 再重新检测，避免 detectOrientation 在旋转后的模型上再转一遍
+    if (this.isOrientationCorrected) {
+      this.modelRoot.rotation.y = 0;
+      this.modelRoot.updateMatrixWorld(true);
+      if (this.rigged) {
+        // 已绑骨时，骨架层是 modelRoot 的子节点，还原旋转后也要把 skeletonHelper 刷新一下
+        if (this.skeletonHelper) this.skeletonHelper.update();
+      }
+      return { yaw: 0, note: '已还原模型原始朝向' };
+    }
+
+    const meshes: THREE.Mesh[] = [];
+    this.modelRoot.traverse((child) => {
+      const mesh = child as THREE.Mesh;
+      if (mesh.isMesh && mesh.geometry?.getAttribute('position')) meshes.push(mesh);
+    });
+    if (meshes.length === 0) return { yaw: 0, note: '' };
+
+    const fix = detectOrientation(this.modelRoot, meshes);
+    if (fix.yaw !== 0) {
+      this.modelRoot.rotation.y += fix.yaw;
+      this.modelRoot.updateMatrixWorld(true);
+      if (this.rigged && this.skeletonHelper) this.skeletonHelper.update();
+    }
+    return fix;
+  }
+
+  /**
+   * 对当前模型做人形 T-pose 自动绑骨（模板骨架拟合 + 胶囊距离蒙皮）。
+   * 绑定后模型外观不变，但每个网格变成 SkinnedMesh，可显示骨骼并导出 GLB。
+   */
+  async autoRig(onProgress?: AutoRigProgress): Promise<AutoRigResult> {
+    if (!this.modelRoot) throw new Error('当前没有已加载的模型');
+    if (this.hasSkeleton) throw new Error('模型已包含骨架，无需自动绑定');
+    const result = await autoRigHumanoid(this.modelRoot, onProgress);
+    this.rigged = true;
+    // 节点树与线框叠加都按绑骨后的新结构重建
+    if (this.nodeHighlighter) this.sceneTree = this.nodeHighlighter.reset(this.modelRoot);
+    this.applyWireframeState();
+    this.setSkeletonVisible(true);
+    return result;
+  }
+
+  /** 骨骼连线显示开关（对绑骨后的模型或自带骨架的模型都有效） */
+  setSkeletonVisible(on: boolean): void {
+    if (!this.modelRoot || !this.hasSkeleton) {
+      this.skeletonHelper?.dispose();
+      if (this.skeletonHelper) this.scene.remove(this.skeletonHelper);
+      this.skeletonHelper = null;
+      return;
+    }
+    if (!this.skeletonHelper) {
+      const helper = new THREE.SkeletonHelper(this.modelRoot);
+      (helper.material as THREE.LineBasicMaterial).depthTest = false;
+      helper.renderOrder = 999;
+      this.skeletonHelper = helper;
+      this.scene.add(helper);
+    }
+    this.skeletonHelper.visible = on;
+  }
+
+  /** 把当前模型（含绑骨结果）导出为 GLB 并触发浏览器下载 */
+  async exportGlb(filename: string): Promise<void> {
+    if (!this.modelRoot) throw new Error('当前没有已加载的模型');
+    const exporter = new GLTFExporter();
+    const result = await exporter.parseAsync(this.modelRoot, { binary: true });
+    const blob =
+      result instanceof ArrayBuffer
+        ? new Blob([result], { type: 'model/gltf-binary' })
+        : new Blob([JSON.stringify(result)], { type: 'model/gltf+json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename.endsWith('.glb') ? filename : `${filename}.glb`;
+    anchor.click();
+    URL.revokeObjectURL(url);
   }
 
   setWireframe(on: boolean): void {

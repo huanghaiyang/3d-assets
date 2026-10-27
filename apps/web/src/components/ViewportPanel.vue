@@ -5,6 +5,7 @@ import { ModelViewer, type MeshStats } from '@/viewer/ModelViewer';
 import { pickPreviewTarget } from '@/viewer/assetTarget';
 import { useWorkspaceStore, isActive } from '@/stores/workspace';
 import { useNow } from '@/composables/useNow';
+import { confirmAction } from '@/composables/useConfirm';
 import { formatDuration } from '@/utils/image';
 import type { Asset, Job } from '@/api/types';
 
@@ -16,6 +17,17 @@ const viewer = shallowRef<ModelViewer | null>(null);
 const loading = ref(false);
 const loadError = ref<string | null>(null);
 const stats = ref<MeshStats | null>(null);
+
+// ===== 自动绑骨（人形 T-pose） =====
+/** 当前模型是否自带骨架（已含骨架的模型隐藏绑骨按钮，只保留骨骼显示开关） */
+const hasSkeleton = ref(false);
+/** 是否已通过 autoRig 完成绑定（决定是否显示「导出 GLB」） */
+const rigged = ref(false);
+const skeletonOn = ref(false);
+const rigging = ref(false);
+const rigProgress = ref(0);
+/** 模型是否已手动/绑骨流程纠正过朝向（用于按钮 active 状态） */
+const orientationCorrected = ref(false);
 
 const asset = computed<Asset | null>(() => store.selectedAsset);
 const job = computed<Job | null>(() => store.selectedJob);
@@ -63,11 +75,18 @@ async function loadAsset(target: Asset | null): Promise<void> {
   }
 
   loading.value = true;
+  // 切换素材时重置绑骨状态（骨架绑定不跨素材保留）
+  hasSkeleton.value = false;
+  rigged.value = false;
+  skeletonOn.value = false;
+  orientationCorrected.value = false;
   try {
     stats.value = await instance.load(loadTarget);
     instance.setWireframe(store.wireframe);
     instance.setGrid(store.showGrid);
     instance.setAutoRotate(store.autoRotate);
+    hasSkeleton.value = instance.hasSkeleton;
+    rigged.value = instance.isRigged;
     // 回填节点树，并按当前选择恢复高亮
     store.setNodeTree(instance.sceneNodes);
     instance.setNodeSelection(store.selectedNodeIds);
@@ -123,6 +142,82 @@ function toggleFullscreen(): void {
 
 function retry(): void {
   if (activeJob.value) void store.retry(activeJob.value.id);
+}
+
+/**
+ * 自动绑骨：模板骨架按模型高度拟合，胶囊距离蒙皮。
+ * 先弹确认（提示适用条件），确认后分块计算并通过 rigProgress 更新进度条。
+ */
+async function autoRig(): Promise<void> {
+  const instance = viewer.value;
+  if (!instance || rigging.value || !stats.value) return;
+  const confirmed = await confirmAction({
+    title: '自动绑骨（实验）',
+    message: '将按 T-pose 人形比例自动拟合 19 根骨骼并计算蒙皮权重。',
+    detail:
+      '适用于四肢水平伸展（T 字）的人形模型；A-pose / 非人形模型绑骨效果较差。' +
+      '绑定不改变当前外观，可导出 GLB；切换素材后失效。',
+    confirmText: '开始绑定',
+    danger: false,
+  });
+  if (!confirmed) return;
+
+  rigging.value = true;
+  rigProgress.value = 0;
+  try {
+    const result = await instance.autoRig((done, total) => {
+      rigProgress.value = total > 0 ? Math.round((done / total) * 100) : 0;
+    });
+    hasSkeleton.value = true;
+    rigged.value = true;
+    skeletonOn.value = instance.isSkeletonVisible;
+    orientationCorrected.value = instance.isOrientationCorrected;
+    // 骨骼已进场景，刷新节点树
+    store.setNodeTree(instance.sceneNodes);
+    store.toast(
+      'success',
+      `绑骨完成：${result.bones} 根骨骼 · ${result.vertices.toLocaleString('en-US')} 个顶点` +
+        (result.orientation.note ? ` · ${result.orientation.note}` : ''),
+    );
+  } catch (err) {
+    store.toast('error', err instanceof Error ? err.message : '自动绑骨失败');
+  } finally {
+    rigging.value = false;
+  }
+}
+
+/** 单独纠正模型朝向（不依赖绑骨；已纠正时再点一次还原） */
+function correctOrientation(): void {
+  const instance = viewer.value;
+  if (!instance || !stats.value) return;
+  try {
+    const fix = instance.correctOrientation();
+    orientationCorrected.value = instance.isOrientationCorrected;
+    if (fix.note) store.toast('success', fix.note);
+    else if (fix.yaw === 0) store.toast('info', '模型朝向看起来就对了，无需调整');
+  } catch (err) {
+    store.toast('error', err instanceof Error ? err.message : '纠正朝向失败');
+  }
+}
+
+/** 骨骼连线显示开关（绑骨后或自带骨架的模型可用） */
+function toggleSkeleton(): void {
+  const instance = viewer.value;
+  if (!instance) return;
+  instance.setSkeletonVisible(!skeletonOn.value);
+  skeletonOn.value = instance.isSkeletonVisible;
+}
+
+/** 导出绑定后的模型为 GLB（含骨架与蒙皮权重） */
+async function exportRigged(): Promise<void> {
+  const instance = viewer.value;
+  if (!instance) return;
+  try {
+    const baseName = (job.value?.name ?? 'model').replace(/[\\/:*?"<>|]/g, '_');
+    await instance.exportGlb(`${baseName}-rigged.glb`);
+  } catch (err) {
+    store.toast('error', err instanceof Error ? err.message : '导出 GLB 失败');
+  }
 }
 </script>
 
@@ -184,6 +279,49 @@ function retry(): void {
       <button class="tool" type="button" title="全屏" @click="toggleFullscreen">
         <Icon name="maximize" :size="15" />
       </button>
+
+      <!-- 绑骨相关：只在已加载模型时出现 -->
+      <template v-if="stats">
+        <div class="tool-divider" />
+        <button
+          class="tool"
+          :class="{ active: orientationCorrected }"
+          type="button"
+          :title="orientationCorrected ? '还原模型原始朝向' : '自动纠正模型朝向（贴合人形 +Z 正面）'"
+          @click="correctOrientation"
+        >
+          <Icon name="flip" :size="15" />
+        </button>
+        <button
+          v-if="!hasSkeleton"
+          class="tool"
+          type="button"
+          title="自动绑骨（T-pose 人形，实验）"
+          :disabled="rigging"
+          @click="autoRig"
+        >
+          <Icon name="bone" :size="15" />
+        </button>
+        <button
+          v-if="hasSkeleton"
+          class="tool"
+          :class="{ active: skeletonOn }"
+          type="button"
+          title="显示 / 隐藏骨骼"
+          @click="toggleSkeleton"
+        >
+          <Icon name="bone" :size="15" />
+        </button>
+        <button
+          v-if="rigged"
+          class="tool"
+          type="button"
+          title="导出绑定后的 GLB（含骨架与蒙皮）"
+          @click="exportRigged"
+        >
+          <Icon name="download" :size="15" />
+        </button>
+      </template>
     </div>
 
     <!-- 生成中 / 失败提示 -->
@@ -216,6 +354,23 @@ function retry(): void {
           <Icon name="refresh" :size="13" />
           重试
         </button>
+      </div>
+    </div>
+
+    <!-- 自动绑骨进度（放顶部，避开底部生成状态卡） -->
+    <div v-if="rigging" class="overlay overlay-rigging">
+      <div class="status-card">
+        <div class="status-row">
+          <Icon name="bone" :size="14" />
+          <span class="status-text">正在自动绑骨</span>
+          <span class="mono faint">{{ rigProgress }}%</span>
+        </div>
+        <div class="progress">
+          <div class="progress-bar" :style="{ width: `${rigProgress}%` }" />
+        </div>
+        <div class="status-meta">
+          <span>拟合 T-pose 骨架并计算蒙皮权重…</span>
+        </div>
       </div>
     </div>
 
@@ -347,6 +502,21 @@ function retry(): void {
 .tool:disabled {
   opacity: 0.32;
   cursor: not-allowed;
+}
+
+/* 视图工具与绑骨工具之间的分隔线 */
+.tool-divider {
+  height: 1px;
+  margin: 2px 4px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* 绑骨进度放顶部居中，避开 bottom: 46px 的生成状态卡 */
+.overlay-rigging {
+  left: 50%;
+  top: 64px;
+  transform: translateX(-50%);
+  width: min(360px, calc(100% - 40px));
 }
 
 .overlay-status {
