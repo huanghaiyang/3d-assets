@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "h3d-3d-workbench": {
+      "command": "node",
+      "args": ["d:\\sgames\\3d-desing\\apps\\api\\dist\\mcp.js"]
+    }
+  }
+}

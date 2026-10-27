@@ -11,6 +11,7 @@ import { registerAnimationRoutes } from './routes/animation.js';
 import { registerFileRoutes } from './routes/files.js';
 import { registerKimodoRoutes } from './routes/kimodo.js';
 import { registerLibraryRoutes } from './routes/library.js';
+import { registerMcpRoutes } from './routes/mcp.js';
 import { registerStageRoutes } from './routes/stage.js';
 import { sweepStorage } from './services/assets.js';
 import { sweepCoverCache } from './services/covers.js';
@@ -106,6 +107,7 @@ export async function buildApp(): Promise<AppContext> {
   await app.register(registerFileRoutes);
   await app.register(registerKimodoRoutes);
   await app.register(registerStageRoutes);
+  await app.register(registerMcpRoutes);
 
   // 生产模式下由同一个服务托管构建好的前端
   const indexPath = path.join(config.webDistDir, 'index.html');

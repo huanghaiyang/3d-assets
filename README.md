@@ -467,6 +467,81 @@ Content-Type:  application/json
 
 > 文档截图（`docs/`）里的账号区域（并发状态与 API Key 标签）已做留白处理。
 
+---
+
+## 9. MCP 接入（可选）
+
+项目同时支持 MCP 的两个方向：**本工作台作为服务器**（给 Trae / Cursor / Claude 调用）和
+**本工作台作为客户端**（在设置里接入外部 MCP 服务）。
+
+### 9.1 作为 MCP 服务器（stdio）
+
+实现位于 `apps/api/src/mcp.ts`，直接调用服务层，不经过 HTTP。
+
+```bash
+npm run build -w @h3d/api      # 生成 apps/api/dist/mcp.js
+npm run mcp -w @h3d/api        # 生产：node dist/mcp.js
+npm run mcp:dev -w @h3d/api    # 开发：tsx src/mcp.ts（无需构建）
+```
+
+stdio 模式下 stdout 只输出 JSON-RPC，日志全部走 stderr，因此不要在该进程里打印调试信息。
+
+**Trae / Cursor**：仓库已提供 `.trae/mcp.json`（使用绝对路径，换机器/目录后需改）：
+
+```json
+{
+  "mcpServers": {
+    "h3d-3d-workbench": {
+      "command": "node",
+      "args": ["d:\\sgames\\3d-desing\\apps\\api\\dist\\mcp.js"]
+    }
+  }
+}
+```
+
+**Claude Desktop**（`claude_desktop_config.json`）：
+
+```json
+{
+  "mcpServers": {
+    "h3d-3d-workbench": {
+      "command": "node",
+      "args": ["<仓库绝对路径>/apps/api/dist/mcp.js"]
+    }
+  }
+}
+```
+
+工具分组（共 36 个）：
+
+| 前缀 | 数量 | 覆盖能力 |
+| --- | --- | --- |
+| `animation_*` | 9 | 新建动画项目增删改查 + 回收站（list/get/create/save/rename/delete/list_trash/restore/purge） |
+| `kimodo_*` | 12 | 文生动作：提交、查询、导入、产物读取、提示词优化、骨架 |
+| `stage_*` | 5 | 舞台编排：list/get/create/save/delete（移入回收站） |
+| `strips_*` | 4 | 拼接项目：list/get/create/save（`composition.tracks` 最多 5 条，对应 5 个身体部位） |
+| `model_*` | 6 | 3D 生成：providers / list_jobs / get_job / create_job / cancel_job / delete_job |
+
+`model_*` 转发到本地 HTTP 服务（任务运行态由 worker 持有），因此调用前需先启动
+`npm run dev:api` 或 `npm start`；服务未启动时会返回明确的启动提示。其余工具直接读写
+`data/` 下的文件，可以与 HTTP 服务同时使用。
+
+安全：工具不会返回 `.env` 里的路径与密钥；错误文本中的 Windows 绝对路径、
+`api_key` / `token` / `secret` / `password` 会被抹掉。
+
+### 9.2 作为 MCP 客户端（设置弹窗）
+
+「设置 → MCP 客户端」可以连接任意外部 stdio MCP 服务，用来浏览并调试它们暴露的工具。
+
+- 配置持久化在 `data/mcp-servers.json`（已 gitignore），只在点击「连接」或展开工具时
+  才启动子进程，不会随应用启动拉起任意命令。
+- 环境变量只回传键名，值不会下发到浏览器；列表里显示「已连接 · N 个工具」。
+- 展开后可按 `inputSchema` 自动生成参数骨架并直接调用，返回的 JSON 原样展示（超长截断）。
+- 「填入内置 MCP 服务」可一键把本工作台自己的 stdio 服务配进来做联调。
+
+后端接口：`/api/mcp/servers`（GET/POST/DELETE）、`/:id/connect`、`/:id/disconnect`、
+`/:id/tools`、`/:id/tool`。服务退出时会回收所有 MCP 子进程。
+
 参考文档：[HY-3D 调用指南](https://cloud.tencent.com/document/product/1823/137181) ·
 [OpenAI 兼容接口调用示例](https://cloud.tencent.com/document/product/1804/126189) ·
 [提交混元生3D专业版任务](https://cloud.tencent.com/document/product/1804/123447) ·

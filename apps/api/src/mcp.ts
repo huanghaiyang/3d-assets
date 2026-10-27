@@ -2,8 +2,9 @@
 /**
  * MCP（Model Context Protocol）stdio 服务。
  *
- * 直接在进程内调用服务层，不经过 HTTP：动画项目（含回收站）与 Kimodo 生成/导入/
- * 中间产物都能被 MCP 客户端调用。
+ * 直接在进程内调用服务层，不经过 HTTP：动画项目（含回收站）、拼接编排、舞台文档
+ * 与 Kimodo 生成/导入/中间产物都能被 MCP 客户端调用；3D 生成任务因为依赖 HTTP
+ * 服务的 worker 与内存态，改为转发到本地 API（详见 model_* 工具组）。
  *
  * 安全约定：任何工具都不会返回 .env 里的路径与密钥。返回状态时只给出布尔值与
  * 非敏感字段，错误文本里的绝对路径也会被抹掉。
@@ -26,6 +27,7 @@ import {
   isNameTaken,
   listProjects,
   listTrash,
+  normalizeComposition,
   normalizeName,
   normalizeRecord,
   purgeProject,
@@ -45,6 +47,16 @@ import {
 } from './services/kimodo.js';
 import { enhancePrompt, promptEnhancerReady, refinePrompt } from './services/promptEnhance.js';
 import { SOMA_SKELETON } from './services/soma-skeleton.js';
+import {
+  listStages,
+  normalizeStage,
+  readStage,
+  stageId,
+  summaryOf as stageSummaryOf,
+  trashStage,
+  writeStage,
+} from './services/stages.js';
+import { config } from './config.js';
 
 const SERVER_INFO = { name: 'h3d-3d-workbench', version: '1.0.0' };
 const PROTOCOL_VERSION = '2024-11-05';
@@ -223,6 +235,151 @@ function renameProjectTool(args: Args): Promise<Record<string, unknown>> {
     if ('error' in result) throw new Error(result.error);
     return { project: result.project };
   });
+}
+
+// ------------------------------------------------------------------ 舞台 / 拼接 / 3D 任务
+
+/** 舞台 ID 与路由层同一套规则（1–80 位 [A-Za-z0-9_-]），避免拼出目录穿越路径 */
+function requireStageId(args: Args): string {
+  const id = stageId(requireString(args, 'id'));
+  if (!id) throw new Error('无效的舞台 ID');
+  return id;
+}
+
+/** 从参数里挑出可写入舞台文档的字段；未提供的字段保持原值（save 时用于合并） */
+function stageFields(args: Args): Record<string, unknown> {
+  const fields: Record<string, unknown> = {};
+  const name = readString(args, 'name');
+  if (name !== undefined) fields.name = name;
+  if (args.actors !== undefined) fields.actors = args.actors;
+  if (args.segments !== undefined) fields.segments = args.segments;
+  const loop = readBoolean(args, 'loop');
+  if (loop !== undefined) fields.loop = loop;
+  return fields;
+}
+
+function createStage(args: Args): Promise<Record<string, unknown>> {
+  return serializeWrite(async () => {
+    const stage = normalizeStage(stageFields(args), randomUUID());
+    if (!stage) throw new Error('舞台文档格式不正确');
+    await writeStage(stage);
+    return { stage: stageSummaryOf(stage) };
+  });
+}
+
+function saveStage(args: Args): Promise<Record<string, unknown>> {
+  const id = requireStageId(args);
+  return serializeWrite(async () => {
+    const existing = await readStage(id);
+    if (!existing) throw new Error(`舞台 ${id} 不存在`);
+    // 合并而不是整体替换：调用方只想改角色/片段里的一项时不必回传完整文档
+    const stage = normalizeStage({ ...existing, ...stageFields(args) }, id);
+    if (!stage) throw new Error('舞台文档格式不正确');
+    stage.createdAt = existing.createdAt;
+    await writeStage(stage);
+    return { stage: stageSummaryOf(stage) };
+  });
+}
+
+/** 拼接编排校验：tracks 必须是数组，否则视为脏数据（与后端 compositionOf 一致） */
+function requireComposition(raw: unknown): NonNullable<SavedProject['composition']> {
+  const composition = normalizeComposition(raw, null);
+  if (!composition) throw new Error('composition 不合法：必须包含 tracks 数组');
+  return composition;
+}
+
+function createStripsProject(args: Args): Promise<Record<string, unknown>> {
+  return serializeWrite(async () => {
+    const name = normalizeName(requireString(args, 'name'));
+    if (await isNameTaken(name)) throw new Error(`名称「${name}」已被使用`);
+    const composition = requireComposition(args.composition);
+    const now = new Date().toISOString();
+    const record = normalizeRecord(
+      {
+        name,
+        basePath: readString(args, 'basePath') ?? composition.basePath ?? '',
+        baseName: readString(args, 'baseName') ?? composition.baseName ?? '',
+        data: args.data ?? null,
+        composition,
+        createdAt: now,
+        updatedAt: now,
+      },
+      randomUUID(),
+    );
+    if (!record) throw new Error('项目数据不合法');
+    await writeProject(record);
+    return { project: summaryOf(record) };
+  });
+}
+
+function saveStripsProject(args: Args): Promise<Record<string, unknown>> {
+  const id = requireString(args, 'id');
+  return serializeWrite(async () => {
+    const record = await readProject(id);
+    if (!record) throw new Error(`项目 ${id} 不存在`);
+
+    if (args.composition !== undefined) {
+      record.composition = requireComposition(args.composition);
+    } else if (!record.composition) {
+      throw new Error('该项目不是拼接动画（没有 composition）；请改用 animation_save_project');
+    }
+    if (args.data !== undefined) record.data = args.data;
+    if (args.basePath !== undefined) record.basePath = readString(args, 'basePath') ?? '';
+    if (args.baseName !== undefined) record.baseName = readString(args, 'baseName') ?? '';
+
+    const name = readString(args, 'name');
+    if (name !== undefined) {
+      const normalized = normalizeName(name);
+      if (!normalized) throw new Error('名称不能为空');
+      if (await isNameTaken(normalized, id)) throw new Error(`名称「${normalized}」已被使用`);
+      record.name = normalized;
+    }
+    record.updatedAt = new Date().toISOString();
+
+    const next = normalizeRecord(record, id);
+    if (!next) throw new Error('项目数据不合法');
+    await writeProject(next);
+    return { project: summaryOf(next) };
+  });
+}
+
+/**
+ * 3D 生成任务属于 HTTP 服务的运行态（state.json + worker），
+ * MCP 独立进程直接写会与正在运行的服务互相覆盖，因此这里统一转发到本地 API。
+ */
+const API_BASE = `http://${config.host === '0.0.0.0' ? '127.0.0.1' : config.host}:${config.port}`;
+
+async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      ...init,
+      headers: {
+        accept: 'application/json',
+        ...(init?.body ? { 'content-type': 'application/json' } : {}),
+        ...init?.headers,
+      },
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (err) {
+    throw new Error(
+      `无法连接本地 API（${API_BASE}）：${(err as Error).message}。请先运行 npm run dev:api 或 npm start`,
+    );
+  }
+  const text = await response.text();
+  let payload: unknown = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { error: text.slice(0, 300) };
+    }
+  }
+  if (!response.ok) {
+    const message = (payload as { error?: unknown }).error;
+    throw new Error(typeof message === 'string' ? message : `请求失败（HTTP ${response.status}）`);
+  }
+  return payload as T;
 }
 
 // ------------------------------------------------------------------ 工具定义
@@ -586,6 +743,218 @@ const tools: ToolDefinition[] = [
     inputSchema: objectSchema({}),
     handler: () => SOMA_SKELETON,
   },
+  // ---------------------------------------------------------------- 舞台工具组
+  // 舞台是纯编排文档（角色 + 片段序列），磁盘读写走 stages.ts 的原子写入，
+  // 因此可以和运行中的 HTTP 服务共用同一份数据，不需要额外转一层 HTTP。
+  {
+    name: 'stage_list',
+    description: '列出舞台项目摘要（角色数 / 片段数，不含完整文档）',
+    inputSchema: objectSchema({}),
+    handler: async () => ({ stages: await listStages() }),
+  },
+  {
+    name: 'stage_get',
+    description: '读取一份完整舞台文档（角色、片段序列、循环设置）',
+    inputSchema: objectSchema({ id: idProperty }, ['id']),
+    handler: async (args) => {
+      const stage = await readStage(requireStageId(args));
+      if (!stage) throw new Error('舞台不存在');
+      return { stage };
+    },
+  },
+  {
+    name: 'stage_create',
+    description:
+      '创建舞台。片段来源支持 fbx-clip / kimodo / anim-project；结构非法（缺 actorId 对应角色等）的条目会被后端丢弃',
+    inputSchema: objectSchema({
+      name: { type: 'string', description: '舞台名称，默认「未命名舞台」' },
+      actors: {
+        type: 'array',
+        description: '角色 [{ id, name, kind: fbx|soma, modelPath?, transform: { x, z, yaw }, visible }]',
+        items: { type: 'object' },
+      },
+      segments: {
+        type: 'array',
+        description:
+          '片段 [{ id, actorId, source, trimStart, trimEnd, start?, color?, pose?, transition? }]',
+        items: { type: 'object' },
+      },
+      loop: { type: 'boolean', description: '是否循环播放，默认 true' },
+    }),
+    handler: createStage,
+  },
+  {
+    name: 'stage_save',
+    description: '更新舞台：只传要修改的字段（actors / segments 整组替换），其余保持原值',
+    inputSchema: objectSchema(
+      {
+        id: idProperty,
+        name: { type: 'string', description: '新名称（≤ 80 字）' },
+        actors: { type: 'array', items: { type: 'object' }, description: '完整角色数组（整组替换）' },
+        segments: { type: 'array', items: { type: 'object' }, description: '完整片段数组（整组替换）' },
+        loop: { type: 'boolean', description: '是否循环播放' },
+      },
+      ['id'],
+    ),
+    handler: saveStage,
+  },
+  {
+    name: 'stage_delete',
+    description: '把舞台移入回收站（data/stages-trash，暂未提供恢复工具）',
+    inputSchema: objectSchema({ id: idProperty }, ['id']),
+    handler: (args) => {
+      const id = requireStageId(args);
+      return serializeWrite(async () => {
+        const ok = await trashStage(id);
+        if (!ok) throw new Error('舞台不存在');
+        return { ok: true };
+      });
+    },
+  },
+  // ---------------------------------------------------------------- 拼接工作区工具组
+  // 拼接项目 = 普通动画项目 + composition（基础模型 + 最多 5 条 Strip 轨道）。
+  // 这里复用 animProjects 的写入队列与查重规则，避免绕过名称唯一性约束。
+  {
+    name: 'strips_list_projects',
+    description: '列出拼接动画项目（带 composition 的项目，最多 5 条 Strip）',
+    inputSchema: objectSchema({}),
+    handler: async () => ({
+      projects: (await listProjects()).filter((item) => item.kind === 'strips'),
+    }),
+  },
+  {
+    name: 'strips_get_project',
+    description: '读取拼接项目；includeData 为 true 时同时返回烘焙后的动画数据',
+    inputSchema: objectSchema(
+      { id: idProperty, includeData: { type: 'boolean', description: '是否返回完整动画数据' } },
+      ['id'],
+    ),
+    handler: async (args) => {
+      const record = await readProject(requireString(args, 'id'));
+      if (!record) throw new Error('项目不存在');
+      if (!record.composition) throw new Error('该项目不是拼接动画（没有 composition）');
+      return readBoolean(args, 'includeData') ? { project: record } : { project: summaryOf(record) };
+    },
+  },
+  {
+    name: 'strips_create_project',
+    description:
+      '创建拼接动画项目：composition 必须包含 tracks 数组（前端 StripDef 数组，最多 5 条，对应 5 个身体部位）',
+    inputSchema: objectSchema(
+      {
+        name: nameProperty,
+        composition: {
+          type: 'object',
+          description: '拼接编排 { version?, basePath, baseName, tracks: [], duration }',
+        },
+        basePath: { type: 'string', description: '基础模型 FBX 绝对路径（缺省取 composition.basePath）' },
+        baseName: { type: 'string', description: '基础模型文件名' },
+        data: { type: 'object', description: '已烘焙的 fbx-animation-data（可选）' },
+      },
+      ['name', 'composition'],
+    ),
+    handler: createStripsProject,
+  },
+  {
+    name: 'strips_save_project',
+    description: '更新拼接项目：可替换 composition / 烘焙数据 / 基础模型，或改名（重名会失败）',
+    inputSchema: objectSchema(
+      {
+        id: idProperty,
+        composition: { type: 'object', description: '新的拼接编排（必须含 tracks 数组）' },
+        data: { type: 'object', description: '新的 fbx-animation-data 烘焙数据' },
+        basePath: { type: 'string', description: '基础模型 FBX 绝对路径' },
+        baseName: { type: 'string', description: '基础模型文件名' },
+        name: nameProperty,
+      },
+      ['id'],
+    ),
+    handler: saveStripsProject,
+  },
+  // ---------------------------------------------------------------- 3D 生成任务（HTTP 代理）
+  // 任务运行态由 HTTP 服务持有（state.json + worker），MCP 独立进程直接写会互相覆盖，
+  // 因此这些工具统一转发到本地 API；服务没启动时会返回明确的启动提示。
+  {
+    name: 'model_providers',
+    description: '列出可用 3D 生成引擎及其 Key 配置状态（不含密钥）',
+    inputSchema: objectSchema({}),
+    handler: () => apiRequest('/api/providers'),
+  },
+  {
+    name: 'model_list_jobs',
+    description: '列出 3D 生成任务（默认最近 30 条，最多 300），并返回队列状态',
+    inputSchema: objectSchema({
+      limit: { type: 'number', description: '返回条数，默认 30，最多 300' },
+    }),
+    handler: async (args) => {
+      const limit = Math.min(300, Math.max(1, Math.round(readNumber(args, 'limit') ?? 30)));
+      const state = await apiRequest<{ jobs: unknown[]; totalJobs: number; queue: unknown }>(
+        `/api/state?limit=${limit}`,
+      );
+      return { totalJobs: state.totalJobs, queue: state.queue, jobs: state.jobs };
+    },
+  },
+  {
+    name: 'model_get_job',
+    description: '读取单个 3D 生成任务（状态、参数、资产文件）',
+    inputSchema: objectSchema({ id: idProperty }, ['id']),
+    handler: (args) => apiRequest(`/api/jobs/${encodeURIComponent(requireString(args, 'id'))}`),
+  },
+  {
+    name: 'model_create_job',
+    description:
+      '提交 3D 生成任务（text / image / multiview）。任务交给本地 API 的 worker 执行，需要服务正在运行',
+    inputSchema: objectSchema(
+      {
+        mode: { type: 'string', enum: ['text', 'image', 'multiview'], description: '输入模式，默认 text' },
+        prompt: { type: 'string', description: '文生模式必填的描述文字' },
+        imageBase64: { type: 'string', description: '图生模式单张参考图（base64 或 data URL）' },
+        imageName: { type: 'string', description: '参考图文件名（仅展示）' },
+        views: {
+          type: 'array',
+          description: '多视角图片 [{ viewType, imageBase64, name }]',
+          items: { type: 'object' },
+        },
+        previewDataUrl: { type: 'string', description: '可选：输入图预览（data:image/...;base64,...）' },
+        provider: { type: 'string', description: '引擎 id（hunyuan3d / tripo3d / meshy），缺省用默认引擎' },
+        params: {
+          type: 'object',
+          description:
+            '生成参数 { model?, generateType?, faceCount?, enablePbr?, polygonType?, resultFormat? }',
+        },
+      },
+      ['mode'],
+    ),
+    handler: (args) => {
+      const body: Record<string, unknown> = {
+        mode: requireString(args, 'mode'),
+        prompt: readString(args, 'prompt') ?? '',
+      };
+      for (const key of ['imageBase64', 'imageName', 'previewDataUrl', 'provider'] as const) {
+        if (args[key] !== undefined) body[key] = args[key];
+      }
+      if (args.views !== undefined) body.views = args.views;
+      if (args.params !== undefined) body.params = args.params;
+      return apiRequest('/api/jobs', { method: 'POST', body: JSON.stringify(body) });
+    },
+  },
+  {
+    name: 'model_cancel_job',
+    description: '取消进行中的 3D 生成任务（会尽量同步取消远端任务）',
+    inputSchema: objectSchema({ id: idProperty }, ['id']),
+    handler: (args) =>
+      apiRequest(`/api/jobs/${encodeURIComponent(requireString(args, 'id'))}/cancel`, {
+        method: 'POST',
+        body: '{}',
+      }),
+  },
+  {
+    name: 'model_delete_job',
+    description: '删除已结束的 3D 生成任务及其本地素材文件（进行中的任务需先取消）',
+    inputSchema: objectSchema({ id: idProperty }, ['id']),
+    handler: (args) =>
+      apiRequest(`/api/jobs/${encodeURIComponent(requireString(args, 'id'))}`, { method: 'DELETE' }),
+  },
 ];
 
 const toolMap = new Map(tools.map((tool) => [tool.name, tool]));
@@ -645,7 +1014,8 @@ async function handleMessage(message: RpcMessage): Promise<void> {
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions:
-          '该服务管理 3D 工作台的「新建动画」项目（含回收站）与 Kimodo 文生动作生成。' +
+          '该服务管理 3D 工作台：动画项目（含回收站）、拼接动画项目（composition）、' +
+          '舞台文档、Kimodo 文生动作，以及 3D 生成任务（model_* 转发到本地 API，需服务已启动）。' +
           '所有工具都不会返回 .env 中的路径或密钥。',
       });
       return;

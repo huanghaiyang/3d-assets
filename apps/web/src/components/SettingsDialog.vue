@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue';
 import Icon from './ui/Icon.vue';
+import McpServersPanel from './McpServersPanel.vue';
 import { useWorkspaceStore } from '@/stores/workspace';
 import type { ProviderId } from '@/api/types';
 
@@ -218,6 +219,8 @@ async function makeDefault(providerId: ProviderId): Promise<void> {
               {{ verifyResults[provider.id]!.message }}
             </p>
           </section>
+
+          <McpServersPanel />
 
           <section class="block">
             <span class="field-label">运行信息</span>
