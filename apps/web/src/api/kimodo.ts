@@ -93,10 +93,22 @@ export interface KimodoAnimation {
  * 喂给 conditioned shim 生成首尾精确对齐的过渡段。
  */
 export interface KimodoConditionedBody {
-  /** 前一段动画的 animationId（必须是 kimodo 生成的，才有原始 f32 可切） */
-  prevAnimationId: string;
+  /**
+   * 前一段动画的 animationId（必须是 kimodo 生成的，才有原始 f32 可切）。
+   * 与 `prevPose` 二选一。
+   */
+  prevAnimationId?: string;
   /** 后一段动画的 animationId */
-  nextAnimationId: string;
+  nextAnimationId?: string;
+  /**
+   * 前一段末帧的姿势（base64 的 float32，排布与 Kimodo 原始 f32 一致）。
+   *
+   * FBX / 新建动画片段没有 animationId，前端会采样边界帧并做 Mixamo → SOMA
+   * 逆向重定向，把结果按这个格式发上来，仍然走真实 pose 约束。
+   */
+  prevPose?: { root: string; rot: string };
+  /** 后一段首帧的姿势，格式同 prevPose */
+  nextPose?: { root: string; rot: string };
   /** 过渡段总帧数（8–300），决定中间过渡有多长 */
   frames: number;
   /** 首尾各硬约束多少帧，默认 1（只对齐 prev 末帧与 next 首帧） */

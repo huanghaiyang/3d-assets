@@ -13,6 +13,7 @@ import { useAnimationStore } from '@/stores/animation';
 import { useWorkspaceStore } from '@/stores/workspace';
 import { rotateXZ } from '@/viewer/stage/StageActor';
 import { buildTimeline } from '@/viewer/stage/SequenceTimeline';
+import { somaPosesToBase64 } from '@/viewer/stage/somaRetarget';
 import type { StagePlayer } from '@/viewer/stage/StagePlayer';
 import {
   actorSegments,
@@ -69,6 +70,29 @@ function segmentLength(segment: SegmentDef): number {
 
 /** Kimodo 动作按 30fps 生成，用于估算片段时长 */
 const SOMA_FPS = 30;
+
+/**
+ * 过渡段首尾各用多少帧真实姿态做锚点窗口。
+ *
+ * 只给 1 帧（旧行为）时模型看不到进出时的速度和朝向，中段容易自己转一圈；
+ * 8 帧 ≈ 0.27s，足够让模型看到「正在往哪走、身体朝哪」，中间帧仍完全由模型生成。
+ * 交付时会把这 8 帧从首尾裁掉（见 transitionTrim），舞台上不会重播前后段。
+ */
+const ANCHOR_FRAMES = 8;
+
+/**
+ * 过渡段的可见裁剪窗口。
+ *
+ * 生成段的首尾各 ANCHOR_FRAMES 帧是 prev/next 的真实姿态副本：
+ * 尾部窗口的末帧（下标 anchor-1）正好等于 prev 末帧，头部窗口的首帧
+ * （下标 frames-anchor）正好等于 next 首帧。只交付这两帧之间的一段，
+ * 既保证姿态衔接，又不会把 prev 的尾巴 / next 的开头在舞台上重播一遍。
+ */
+function transitionTrim(frames: number): { trimStart: number; trimEnd: number } {
+  const anchor = Math.min(ANCHOR_FRAMES, Math.max(1, Math.floor(frames / 2)));
+  if (anchor <= 1) return { trimStart: 0, trimEnd: Math.max(0.2, frames / SOMA_FPS) };
+  return { trimStart: (anchor - 1) / SOMA_FPS, trimEnd: (frames - anchor) / SOMA_FPS };
+}
 
 export const useStageStore = defineStore('stage', () => {
   const docs = ref<StageSummary[]>([]);
@@ -430,7 +454,7 @@ export const useStageStore = defineStore('stage', () => {
     const startPose = player?.segmentEndPose(task.actorId, task.prevId) ?? {
       ...(prev.pose ?? { x: 0, z: 0, yaw: 0 }),
     };
-    const duration = Math.max(0.2, frames / SOMA_FPS);
+    const trim = transitionTrim(frames);
     // 过渡段紧接前一段结束（首尾帧已精确对齐，不需要交叉淡化）
     const ordered = segments.filter((item) => item.actorId === task.actorId);
     const prevPlan = buildTimeline(ordered);
@@ -440,8 +464,8 @@ export const useStageStore = defineStore('stage', () => {
       id: createId(),
       actorId: task.actorId,
       source: { kind: 'kimodo', animationId },
-      trimStart: 0,
-      trimEnd: duration,
+      trimStart: trim.trimStart,
+      trimEnd: trim.trimEnd,
       start,
       pose: startPose,
       transition: { prevId: task.prevId, nextId: task.nextId },
@@ -450,7 +474,7 @@ export const useStageStore = defineStore('stage', () => {
     recordHistory('generate-transition', false);
     segments.splice(prevIndex + 1, 0, segment);
     // 系统先帮忙对齐：从过渡段之后开始，把被压住的段依次右移，保持首尾相接
-    let cursor = start + duration;
+    let cursor = start + segmentLength(segment);
     let passed = false;
     for (const item of segments.filter((entry) => entry.actorId === task.actorId)) {
       if (item.id === segment.id) {
@@ -513,7 +537,10 @@ export const useStageStore = defineStore('stage', () => {
       Math.max(0.8, Math.max(distance / 1.25 + 0.25, Math.abs(turn) / (Math.PI * 0.9) + 0.35)),
     );
     // 帧数 = duration × 30fps，对齐到偶数（DDIM 采样对偶数帧更友好），夹到 [24, 96]
-    const frames = Math.max(24, Math.min(96, Math.round((duration * SOMA_FPS) / 2) * 2));
+    // 再加首尾各 ANCHOR_FRAMES-1 帧的锚点窗口：窗口交付时会被 transitionTrim 裁掉，
+    // 补回来之后可见时长才等于上面按距离估算的 duration。
+    const visibleFrames = Math.max(24, Math.min(96, Math.round((duration * SOMA_FPS) / 2) * 2));
+    const frames = visibleFrames + 2 * (ANCHOR_FRAMES - 1);
 
     const task: TransitionTask = {
       key,
@@ -531,18 +558,27 @@ export const useStageStore = defineStore('stage', () => {
     // ---- 决定走哪条生成路径 ----
     // 判断两段是否都是 Kimodo 生成的片段：只有 source.kind === 'kimodo' 的段才有
     // animationId，后端才能根据 animationId 切出原始 f32 做真实 pose 约束。
-    // 如果任一段来自 FBX / 新建动画（没有 animationId），只能退回纯文本 prompt。
     const prevAnimId = prev.source.kind === 'kimodo' ? prev.source.animationId : undefined;
     const nextAnimId = next.source.kind === 'kimodo' ? next.source.animationId : undefined;
     const bothKimodo = !!prevAnimId && !!nextAnimId;
 
+    // 非 Kimodo 源（FBX 片段 / 新建动画）没有现成的 f32，但骨架就在浏览器里：
+    // 采样首尾各 ANCHOR_FRAMES 帧并做 Mixamo → SOMA 逆向重定向，把姿态窗口转成 f32 再上传，
+    // 这样过渡段依旧走真实 pose 约束，而不是退回纯文本 prompt（首尾会有跳变）。
+    const sampledPoses = bothKimodo
+      ? null
+      : {
+          prev: player?.sampleSegmentBoundarySoma(prev.actorId, prevId, 'end', ANCHOR_FRAMES) ?? null,
+          next: player?.sampleSegmentBoundarySoma(next.actorId, nextId, 'start', ANCHOR_FRAMES) ?? null,
+        };
+
     try {
       let job;
       if (bothKimodo) {
-        // 真实 pose 约束路径：首尾帧精确对齐 prev 末 / next 首（RMS=0）
+        // 真实 pose 约束路径：首尾各 ANCHOR_FRAMES 帧精确对齐 prev 末 / next 首窗口
         // 关键参数选择：
-        //   transitionFrames=1 → 只硬约束首尾各 1 帧（prev 末帧 + next 首帧），
-        //                        中间帧完全交给 DDIM 自由生成，保证过渡自然不僵硬
+        //   transitionFrames=8 → 首尾各 8 帧真实姿态做锚点（模型能看到真实速度/朝向），
+        //                        中间帧仍完全交给 DDIM 生成；交付时锚点窗口会被裁掉
         //   steps=50           → 条件生成需要更多扩散步收敛，比文本生成的 20 步更稳
         //   rootDelta=local    → 两段 root 都是各自 Kimodo job 的局部坐标、原点都在 0 附近，
         //                        直接把 prev 末帧/next 首帧当约束会让模型「看不出距离」而原地踏步。
@@ -553,13 +589,24 @@ export const useStageStore = defineStore('stage', () => {
           prevAnimationId: prevAnimId,
           nextAnimationId: nextAnimId,
           frames,
-          transitionFrames: 1,
+          transitionFrames: ANCHOR_FRAMES,
+          steps: 50,
+          prompt: task.prompt,
+          rootDelta: { dx: local.x, dz: local.z },
+        });
+      } else if (sampledPoses?.prev && sampledPoses.next) {
+        // 采样成功：上传两段边界帧窗口的 SOMA 姿势（base64 f32），参数与 Kimodo 路径一致
+        job = await kimodoApi.generateConditioned({
+          prevPose: somaPosesToBase64(sampledPoses.prev),
+          nextPose: somaPosesToBase64(sampledPoses.next),
+          frames,
+          transitionFrames: ANCHOR_FRAMES,
           steps: 50,
           prompt: task.prompt,
           rootDelta: { dx: local.x, dz: local.z },
         });
       } else {
-        // 纯文本 prompt 回退路径（任一段非 kimodo 源时使用）
+        // 兜底：连骨架都采不到（片段加载失败等）才退回纯文本 prompt
         // 只靠文字描述位移/转向来生成，首尾无法精确对齐，可能有 5–10cm 的跳变
         // steps=20 足够，文本生成不需要那么多扩散步
         job = await kimodoApi.generate({ prompt: task.prompt, frames, steps: 20 });
@@ -599,17 +646,17 @@ export const useStageStore = defineStore('stage', () => {
       failTransition(key, '舞台内容已改变，过渡段未更新');
       return;
     }
-    const duration = Math.max(0.2, frames / SOMA_FPS);
+    const trim = transitionTrim(frames);
     recordHistory(`regenerate-transition:${target.id}`, false);
     target.source = { kind: 'kimodo', animationId };
-    target.trimStart = 0;
-    target.trimEnd = duration;
+    target.trimStart = trim.trimStart;
+    target.trimEnd = trim.trimEnd;
     if (task.startPose) target.pose = { ...task.startPose };
 
     // 新过渡的时长可能变了：从它之后开始依次顺延，保持首尾相接
     const ordered = doc.value.segments.filter((item) => item.actorId === task.actorId);
     const position = ordered.findIndex((item) => item.id === target.id);
-    let cursor = (target.start ?? 0) + duration;
+    let cursor = (target.start ?? 0) + segmentLength(target);
     for (let index = position + 1; index < ordered.length; index += 1) {
       const item = ordered[index];
       item.start = Math.max(item.start ?? cursor, cursor);
@@ -624,7 +671,9 @@ export const useStageStore = defineStore('stage', () => {
   }
 
   /**
-   * 重新生成已有过渡段：前提是它仍有 prev/next，且前后两段都是 Kimodo 源。
+   * 重新生成已有过渡段：前提是它仍有 prev/next，且三段属于同一角色。
+   * 前后两段都是 Kimodo 源时用 animationId 切真实 f32；FBX / 新建动画则在浏览器里
+   * 采样首尾各 ANCHOR_FRAMES 帧姿态窗口上传，同样走真实 pose 约束。
    * 提交前按当前舞台重新校准 prev 末帧落点、next 站位、位移/转向与帧数，
    * 完成后原位替换该过渡段。
    */
@@ -650,13 +699,16 @@ export const useStageStore = defineStore('stage', () => {
       toast('error', '前一段、后一段必须和过渡段属于同一角色');
       return;
     }
-    // 缺少任何一侧的 Kimodo 动画都不生成
-    const prevAnimId = prev.source.kind === 'kimodo' ? prev.source.animationId : null;
-    const nextAnimId = next.source.kind === 'kimodo' ? next.source.animationId : null;
-    if (!prevAnimId || !nextAnimId) {
-      toast('error', '前后两段必须都是 Kimodo 动画，才能重新生成过渡');
-      return;
-    }
+    // 与新建过渡一致：两段都有 animationId 走 Kimodo 约束；否则采样首尾真实姿态窗口上传
+    const prevAnimId = prev.source.kind === 'kimodo' ? prev.source.animationId : undefined;
+    const nextAnimId = next.source.kind === 'kimodo' ? next.source.animationId : undefined;
+    const bothKimodo = !!prevAnimId && !!nextAnimId;
+    const sampledPoses = bothKimodo
+      ? null
+      : {
+          prev: player?.sampleSegmentBoundarySoma(prev.actorId, prevId, 'end', ANCHOR_FRAMES) ?? null,
+          next: player?.sampleSegmentBoundarySoma(next.actorId, nextId, 'start', ANCHOR_FRAMES) ?? null,
+        };
     // 顺序必须是 prev → 过渡段 → next
     const ordered = actorSegments(doc.value, segment.actorId);
     const position = ordered.findIndex((item) => item.id === id);
@@ -693,7 +745,9 @@ export const useStageStore = defineStore('stage', () => {
       3.2,
       Math.max(0.8, Math.max(distance / 1.25 + 0.25, Math.abs(turn) / (Math.PI * 0.9) + 0.35)),
     );
-    const frames = Math.max(24, Math.min(96, Math.round((duration * SOMA_FPS) / 2) * 2));
+    // 可见帧数按距离估算，生成帧数再补上首尾锚点窗口（交付时裁掉）
+    const visibleFrames = Math.max(24, Math.min(96, Math.round((duration * SOMA_FPS) / 2) * 2));
+    const frames = visibleFrames + 2 * (ANCHOR_FRAMES - 1);
 
     const task: TransitionTask = {
       key,
@@ -712,16 +766,32 @@ export const useStageStore = defineStore('stage', () => {
     putTask(task);
 
     try {
-      // 两段都有 animationId：走真实 pose 约束（首尾各 1 帧 + 舞台位移 rootDelta）
-      const job = await kimodoApi.generateConditioned({
-        prevAnimationId: prevAnimId,
-        nextAnimationId: nextAnimId,
-        frames,
-        transitionFrames: 1,
-        steps: 50,
-        prompt: task.prompt,
-        rootDelta: { dx: local.x, dz: local.z },
-      });
+      let job;
+      if (bothKimodo) {
+        // 两段都有 animationId：走真实 pose 约束（首尾各 ANCHOR_FRAMES 帧窗口 + 舞台位移 rootDelta）
+        job = await kimodoApi.generateConditioned({
+          prevAnimationId: prevAnimId,
+          nextAnimationId: nextAnimId,
+          frames,
+          transitionFrames: ANCHOR_FRAMES,
+          steps: 50,
+          prompt: task.prompt,
+          rootDelta: { dx: local.x, dz: local.z },
+        });
+      } else if (sampledPoses?.prev && sampledPoses.next) {
+        // FBX / 新建动画：上传浏览器采样的首尾姿态窗口，参数与新生成路径一致
+        job = await kimodoApi.generateConditioned({
+          prevPose: somaPosesToBase64(sampledPoses.prev),
+          nextPose: somaPosesToBase64(sampledPoses.next),
+          frames,
+          transitionFrames: ANCHOR_FRAMES,
+          steps: 50,
+          prompt: task.prompt,
+          rootDelta: { dx: local.x, dz: local.z },
+        });
+      } else {
+        job = await kimodoApi.generate({ prompt: task.prompt, frames, steps: 20 });
+      }
 
       const live = transitionTasks.value[key];
       if (!live) return;

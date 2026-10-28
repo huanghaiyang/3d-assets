@@ -13,6 +13,13 @@ import {
   type GhostOptions,
 } from './StageActor';
 import type { LegChain } from './FootIK';
+import {
+  SOMA_HIPS_HEIGHT_M,
+  SOMA_JOINT_COUNT,
+  SOMA_TO_MIXAMO_LABEL,
+  somaLocalsFromGlobals,
+  type SomaPoseSample,
+} from './somaRetarget';
 import type { ResolvedSlot, SegmentPose, StageActorDef } from './StageTypes';
 
 /** FBX 源文件加载后的共享缓存：克隆给各个角色实例，动画片段直接复用 */
@@ -35,6 +42,10 @@ export class FbxActor extends MixerActor {
   private rightFoot: THREE.Object3D | null = null;
   private legChains: { left: LegChain | null; right: LegChain | null } = { left: null, right: null };
   private nameMap: Map<string, string> = new Map();
+  /** SOMA 关节索引 → 对应骨骼在静止姿态下的片段空间朝向（重定向用） */
+  private readonly somaRestQuats = new Map<number, THREE.Quaternion>();
+  /** 片段空间位移（舞台单位）→ SOMA 米制的换算倍率，按静态髋高归一 */
+  private somaMetersPerStage = 1;
   private loaded = false;
 
   constructor(def: StageActorDef) {
@@ -114,6 +125,84 @@ export class FbxActor extends MixerActor {
 
     this.mixer = new THREE.AnimationMixer(object);
     this.loaded = true;
+
+    // 此时模型仍是 bind pose（还没播任何片段），正好用来记录重定向所需的静止朝向
+    this.captureSomaRest();
+  }
+
+  /** SOMA 关节 → 该模型里对应骨骼；标签匹配忽略 mixamorig 前缀与大小写 */
+  private findBone(label: string): THREE.Object3D | null {
+    return this.bones.find((bone) => cleanBoneLabel(bone.name).toLowerCase() === label) ?? null;
+  }
+
+  /**
+   * 记录 SOMA 各关节对应骨骼的静止朝向（片段空间）与髋高换算倍率。
+   *
+   * 片段空间 = 去掉 placement / 段偏移的舞台旋转后的空间，也就是动画轨道所在的坐标；
+   * 采样姿态时用同样的空间做差，得到「相对静止姿态的世界增量」。
+   */
+  private captureSomaRest(): void {
+    this.updateWorld();
+    const motionQ = new THREE.Quaternion();
+    this.motion.getWorldQuaternion(motionQ).invert();
+
+    this.somaRestQuats.clear();
+    for (const [index, label] of SOMA_TO_MIXAMO_LABEL) {
+      const bone = this.findBone(label);
+      if (!bone) continue;
+      const quaternion = new THREE.Quaternion();
+      bone.getWorldQuaternion(quaternion);
+      quaternion.premultiply(motionQ);
+      this.somaRestQuats.set(index, quaternion);
+    }
+
+    const hips = this.hips;
+    if (hips) {
+      const position = new THREE.Vector3();
+      hips.getWorldPosition(position);
+      this.motion.worldToLocal(position);
+      // 把不同身高的 FBX 角色的髋高归一到 SOMA 标准，约束与 SOMA 空间才对得上
+      this.somaMetersPerStage = SOMA_HIPS_HEIGHT_M / Math.max(0.001, Math.abs(position.y));
+    }
+  }
+
+  /**
+   * 把当前片段在 time 时刻的姿态重定向成一帧 SOMA 姿势。
+   *
+   * 骨骼换算沿用 to_mixamo.py 的逆变换（详见 somaRetarget.ts 顶部说明）：
+   * 先求每根骨骼相对静止姿态的世界增量，再逐级反解出 SOMA 的局部旋转。
+   */
+  sampleSomaPose(clip: THREE.AnimationClip, time: number): SomaPoseSample | null {
+    if (!this.model || this.somaRestQuats.size === 0) return null;
+
+    return this.withClipSample(clip, time, () => {
+      const motionQ = new THREE.Quaternion();
+      this.motion.getWorldQuaternion(motionQ).invert();
+
+      const globals: (THREE.Quaternion | null)[] = new Array(SOMA_JOINT_COUNT).fill(null);
+      for (const [index, label] of SOMA_TO_MIXAMO_LABEL) {
+        const rest = this.somaRestQuats.get(index);
+        const bone = this.findBone(label);
+        if (!rest || !bone) continue;
+        const pose = new THREE.Quaternion();
+        bone.getWorldQuaternion(pose);
+        // 去掉舞台旋转 → 片段空间的世界朝向，再乘静止朝向的逆 → 相对静止的世界增量
+        globals[index] = pose.premultiply(motionQ).multiply(rest.clone().invert()).normalize();
+      }
+
+      const root = new THREE.Vector3();
+      const hips = this.hips;
+      if (hips) {
+        hips.getWorldPosition(root);
+        this.motion.worldToLocal(root);
+      }
+      root.multiplyScalar(this.somaMetersPerStage);
+
+      return {
+        root: new Float32Array([root.x, root.y, root.z]),
+        rotations: somaLocalsFromGlobals(globals),
+      };
+    });
   }
 
   /** Mixamo 的腿部链：*UpLeg → *Leg → *Foot */

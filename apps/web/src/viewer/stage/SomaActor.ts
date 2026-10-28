@@ -11,6 +11,7 @@ import {
   type GhostOptions,
 } from './StageActor';
 import type { LegChain } from './FootIK';
+import { SOMA_JOINT_COUNT, type SomaPoseSample } from './somaRetarget';
 import type { ResolvedSlot, SegmentPose, StageActorDef } from './StageTypes';
 
 export interface SomaSkeletonData {
@@ -238,6 +239,27 @@ export class SomaActor extends MixerActor {
     this.mixer = new THREE.AnimationMixer(rig.group);
     this.loaded = true;
     this.syncVisuals();
+  }
+
+  /**
+   * SOMA 角色本身就是 30 关节原生骨架，采样时直接读关节局部四元数与髋部位置，
+   * 不需要像 FBX 那样做重定向。
+   */
+  sampleSomaPose(clip: THREE.AnimationClip, time: number): SomaPoseSample | null {
+    const rig = this.rigData;
+    if (!rig) return null;
+    return this.withClipSample(clip, time, () => {
+      const rotations = new Float32Array(SOMA_JOINT_COUNT * 4);
+      const count = Math.min(rig.joints.length, SOMA_JOINT_COUNT);
+      for (let index = 0; index < count; index += 1) {
+        rig.joints[index].quaternion.toArray(rotations, index * 4);
+      }
+      const hips = rig.joints[0]?.position ?? new THREE.Vector3();
+      return {
+        root: new Float32Array([hips.x, hips.y, hips.z]),
+        rotations,
+      };
+    });
   }
 
   /** Soma 骨架的腿部链：LeftLeg → LeftShin → LeftFoot */

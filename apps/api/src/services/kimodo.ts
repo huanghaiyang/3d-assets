@@ -276,6 +276,7 @@ class KimodoService {
   private conditionedPendingLines: string[] = []; // 没有等待者时暂存的已读行
   private conditionedLineWaiters: Array<(line: string | null) => void> = []; // 等待下一行响应的 Promise 回调
   private conditionedStderrTail: string[] = [];   // 最近 30 条 stderr，用于排错
+  private conditionedExitCode: number | null = null; // 最近一次 shim 退出码（排错用）
   private conditionedWeightsLoaded = false;        // 模型权重是否已加载（冷启动耗时估算用）
 
   // --- 全局状态（两个 session 共享同一套队列和计数器） ---
@@ -665,6 +666,7 @@ class KimodoService {
     this.conditionedStdoutBuffer = '';
     this.conditionedPendingLines = [];
     this.conditionedStderrTail = [];
+    this.conditionedExitCode = null;
 
     child.stdout.on('data', (chunk: Buffer) => this.onConditionedStdout(chunk));
     child.stderr.on('data', (chunk: Buffer) => {
@@ -678,6 +680,7 @@ class KimodoService {
       if (this.conditionedSession === child) {
         this.conditionedSession = null;
         this.conditionedWeightsLoaded = false;
+        this.conditionedExitCode = code;
         for (const wake of this.conditionedLineWaiters.splice(0)) wake(null);
         this.conditionedPendingLines = [];
       }
@@ -916,7 +919,17 @@ class KimodoService {
       session.stdin.write(`${line}\n`);
 
       const response = await this.nextConditionedLine(30 * 60 * 1000);
-      if (response === null) throw new Error('conditioned shim 无响应（超时）');
+      if (response === null) {
+        // shim 在生成途中退出（崩溃/被杀）时，exit 回调会以 null 唤醒等待者；
+        // 把退出码与 stderr 末尾带出来，否则舞台侧只能看到「无响应」无从排查
+        const exitNote = this.conditionedExitCode !== null
+          ? `，shim 退出 code=${this.conditionedExitCode}`
+          : '';
+        const stderrNote = this.conditionedStderrTail.length
+          ? `，stderr 末尾：${this.conditionedStderrTail.at(-1)}`
+          : '';
+        throw new Error(`conditioned shim 无响应（超时）${exitNote}${stderrNote}`);
+      }
       const trimmed = response.trim();
       if (trimmed.startsWith('ERR\t')) throw new Error(trimmed.slice(4));
       if (!trimmed.startsWith('OK')) throw new Error(`conditioned shim 返回异常：${trimmed.slice(0, 200)}`);

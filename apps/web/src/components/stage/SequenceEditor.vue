@@ -159,7 +159,7 @@ function regenText(id: string): string {
 function regenTitle(id: string): string {
   const task = store.regenerateTaskFor(id);
   if (task?.status === 'failed') return `上次生成失败：${task.message ?? '未知原因'}，点击重试`;
-  return '用 Kimodo 基于前一段末帧和后一段首帧重新生成过渡（要求前后两段都是 Kimodo 动画）';
+  return '用 Kimodo 基于前一段末帧和后一段首帧重新生成过渡（Kimodo 片段取原始 f32，其他片段采样真实姿态）';
 }
 </script>
 

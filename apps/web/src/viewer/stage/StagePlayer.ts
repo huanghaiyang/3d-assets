@@ -10,7 +10,7 @@ import { FbxActor, type FbxSource } from './FbxActor';
 import { FootLock } from './FootIK';
 import { buildRootAlign, resolveRootOffset, type RootAlignPlan } from './RootAlign';
 import { buildTimeline, resolveSegmentPose, resolveTimeline } from './SequenceTimeline';
-import { SomaActor, somaClipFromMotion } from './SomaActor';
+import { SomaActor, somaClipFromMotion, SOMA_FPS } from './SomaActor';
 import { rotateXZ, type ActorClipInput, type ActorGhost, type StageActor } from './StageActor';
 import {
   ZERO_SEGMENT_POSE,
@@ -24,6 +24,7 @@ import {
   type TimelinePlan,
 } from './StageTypes';
 import { clipsFromAnimationData } from './clipFromAnimationData';
+import type { SomaPoseSample } from './somaRetarget';
 import { segmentColorNumber } from './segmentColors';
 
 export type GizmoMode = 'translate' | 'rotate';
@@ -495,6 +496,43 @@ export class StagePlayer {
     return { x: pose.x + delta.x, z: pose.z + delta.z, yaw: pose.yaw };
   }
 
+  /**
+   * 采样某一段边界处的 SOMA 姿势窗口（根位置 + 30 关节局部四元数）。
+   *
+   * `side='end'` 取该段最后 count 帧（末帧在最后，供 prev 约束），
+   * `'start'` 取该段最前 count 帧（首帧在最前，供 next 约束）。
+   * 多帧窗口让 Kimodo 看到真实的进入/退出速度与朝向，而不是只有一帧静态姿态；
+   * 生成段交付时会把这 count 帧从首尾剪掉（见 stage.ts completeTransition）。
+   */
+  sampleSegmentBoundarySoma(
+    actorId: string,
+    segmentId: string,
+    side: 'start' | 'end',
+    count = 1,
+  ): SomaPoseSample[] | null {
+    const runtime = this.runtimes.get(actorId);
+    if (!runtime || !runtime.actor.ready) return null;
+    const index = runtime.segmentIds.indexOf(segmentId);
+    const timing = runtime.plan.timings[index];
+    const clip = runtime.clips[index]?.clip;
+    if (index < 0 || !timing || !clip) return null;
+    const start = timing.trimStart;
+    const end = timing.trimStart + timing.length;
+    const frames = Math.max(1, Math.round(count));
+    const samples: SomaPoseSample[] = [];
+    for (let offset = 0; offset < frames; offset += 1) {
+      // end：从末帧往前取，保证最后一帧正好是段末；start：从首帧往后取
+      const raw = side === 'end'
+        ? end - (frames - 1 - offset) / SOMA_FPS
+        : start + offset / SOMA_FPS;
+      const time = Math.min(end, Math.max(start, raw));
+      const sample = runtime.actor.sampleSomaPose(clip, time);
+      if (!sample) return null;
+      samples.push(sample);
+    }
+    return samples;
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -749,10 +787,30 @@ export class StagePlayer {
 
     const x0 = values[0];
     const z0 = values[2];
-    const x1 = values[(keys - 1) * size];
-    const z1 = values[(keys - 1) * size + 2];
-    const clipDx = x1 - x0;
-    const clipDz = z1 - z0;
+
+    // 在根轨上按时间线性取样（x/z），用于取「裁剪窗口」两端的实际位移。
+    // 过渡段首尾各有一段锚点窗口会被 trimStart/trimEnd 剪掉，
+    // 如果仍按整条轨道的首尾帧算，缩放后的可见位移就对不上舞台距离。
+    const sampleAt = (time: number): { x: number; z: number } => {
+      let lo = 0;
+      let hi = keys - 1;
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if ((track.times[mid] ?? 0) <= time) lo = mid;
+        else hi = mid;
+      }
+      const t0 = track.times[lo] ?? 0;
+      const t1 = track.times[hi] ?? 0;
+      const k = t1 - t0 > 1e-6 ? THREE.MathUtils.clamp((time - t0) / (t1 - t0), 0, 1) : 0;
+      return {
+        x: (values[lo * size] ?? 0) + ((values[hi * size] ?? 0) - (values[lo * size] ?? 0)) * k,
+        z: (values[lo * size + 2] ?? 0) + ((values[hi * size + 2] ?? 0) - (values[lo * size + 2] ?? 0)) * k,
+      };
+    };
+    const from = sampleAt(segment.trimStart);
+    const to = sampleAt(segment.trimEnd);
+    const clipDx = to.x - from.x;
+    const clipDz = to.z - from.z;
     const clipLength = Math.hypot(clipDx, clipDz);
 
     // 目标位移转到片段局部空间，并换成 clip 自身的长度单位

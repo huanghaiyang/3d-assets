@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { solveTwoBoneIk, type LegChain } from './FootIK';
+import type { SomaPoseSample } from './somaRetarget';
 import type { ActorKind, ActorTransform, ResolvedSlot, SegmentPose, StageActorDef } from './StageTypes';
 
 /** 一段已加载好的片段 + 裁剪区间（clip 为 null 表示该段素材加载失败） */
@@ -69,6 +70,14 @@ export interface StageActor {
   sampleHips(clip: THREE.AnimationClip, time: number): HipsSample | null;
   /** 采样某个片段在指定时间双脚中点的水平位置（motion 局部空间） */
   sampleFeetCenter(clip: THREE.AnimationClip, time: number): { x: number; z: number } | null;
+  /**
+   * 采样某个片段在指定时间的一帧 SOMA 姿势（根位置 + 30 关节局部四元数）。
+   *
+   * 用于把 FBX / 新建动画这类「没有 Kimodo 原始 f32」的片段转成约束数据，
+   * 让过渡段也能走真实 pose 约束而不是纯文本 prompt。
+   * 采样失败（骨架缺失等）返回 null，调用方自行决定是否回退。
+   */
+  sampleSomaPose(clip: THREE.AnimationClip, time: number): SomaPoseSample | null;
   /**
    * 动画轨道单位相对舞台单位的倍率：舞台位移 × 该值 = 轨道位移。
    *
@@ -356,8 +365,16 @@ export abstract class MixerActor implements StageActor {
     });
   }
 
-  /** 用一次性 mixer 求值某个片段，避免污染正在播放的主 mixer 状态 */
-  private withClipSample<T>(clip: THREE.AnimationClip, time: number, read: () => T | null): T | null {
+  /** 默认不支持 SOMA 采样；FBX / SOMA 角色各自实现 */
+  sampleSomaPose(_clip: THREE.AnimationClip, _time: number): SomaPoseSample | null {
+    return null;
+  }
+
+  /**
+   * 用一次性 mixer 求值某个片段，避免污染正在播放的主 mixer 状态。
+   * 子类做姿态采样（SOMA 重定向）时需要复用它。
+   */
+  protected withClipSample<T>(clip: THREE.AnimationClip, time: number, read: () => T | null): T | null {
     const root = this.mixerRoot;
     if (!root) return null;
     const mixer = new THREE.AnimationMixer(root);

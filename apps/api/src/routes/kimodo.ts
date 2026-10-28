@@ -133,9 +133,10 @@ export async function registerKimodoRoutes(app: FastifyInstance): Promise<void> 
     }
 
     // 约束帧数（首尾各取这么多帧作为 observed 硬约束）：
-    // 默认 1 帧 = 只对齐 prev 末帧与 next 首帧；前端过渡场景只用单帧对齐即可，
-    // 多帧约束会让首尾过度僵硬，中间过渡失去自然度。
-    const transitionFrames = Math.max(1, Math.round(Number(body.transitionFrames) || 1));
+    // 默认 1 帧 = 只对齐 prev 末帧与 next 首帧；前端舞台过渡传 8 帧，
+    // 让模型看到真实的进出速度/朝向（锚点窗口在交付时会被前端裁掉）。
+    // 用 let：方式 C（前端采样好的姿势）帧数有限，需要向下夹到实际帧数。
+    let transitionFrames = Math.max(1, Math.round(Number(body.transitionFrames) || 1));
     // DDIM 扩散步数：条件生成比纯文本需要更充分收敛，默认 50（文本生成默认 20）
     const steps = Math.round(Number(body.steps) || 50);
     // 随机种子：传了就用，没传由 service 层自己掷，保证结果可复现
@@ -154,6 +155,32 @@ export async function registerKimodoRoutes(app: FastifyInstance): Promise<void> 
       typeof body.nextRotPath === 'string';
     const hasAnimationIds =
       typeof body.prevAnimationId === 'string' && typeof body.nextAnimationId === 'string';
+
+    /**
+     * 方式 C：前端直接传采样好的 SOMA 姿势（base64 的 float32）。
+     *
+     * FBX / 新建动画片段没有 Kimodo 的原始 f32，前端会采样边界帧并做一次
+     * Mixamo → SOMA 的逆向重定向，把结果按 f32 排布发上来。
+     *   prevPose / nextPose = { root: base64(float32[T,3]), rot: base64(float32[T,30,4]) }
+     */
+    const readPosePayload = (value: unknown): { root: Buffer; rot: Buffer } | null => {
+      if (!value || typeof value !== 'object') return null;
+      const pose = value as { root?: unknown; rot?: unknown };
+      if (typeof pose.root !== 'string' || typeof pose.rot !== 'string') return null;
+      const root = Buffer.from(pose.root, 'base64');
+      const rot = Buffer.from(pose.rot, 'base64');
+      const perFrameRot = 30 * 4 * 4;
+      if (root.length === 0 || root.length % 12 !== 0) return null;
+      if (rot.length === 0 || rot.length % perFrameRot !== 0) return null;
+      // 两个文件必须帧数一致，否则 shim 的 FK 会错位
+      if (root.length / 12 !== rot.length / perFrameRot) return null;
+      return { root, rot };
+    };
+
+    const prevPose = readPosePayload(body.prevPose);
+    const nextPose = readPosePayload(body.nextPose);
+    const hasPoses = !!prevPose && !!nextPose;
+
     /** 方式 B 的约束切片目录名；方式 A 保持 undefined */
     let constraintTag: string | undefined;
 
@@ -237,9 +264,32 @@ export async function registerKimodoRoutes(app: FastifyInstance): Promise<void> 
       fs.writeFileSync(prevRotPath, prevRotBuf);
       fs.writeFileSync(nextRootPath, nextRootBuf);
       fs.writeFileSync(nextRotPath, nextRotBuf);
+    } else if (hasPoses) {
+      // 方式 C：前端采样好的姿势，直接落盘成临时 f32
+      const outDir = kimodoService.outputDir;
+      const tag = `pose-${Date.now().toString(36)}`;
+      const tmpDir = path.join(outDir, '_constraints', tag);
+      fs.mkdirSync(tmpDir, { recursive: true });
+
+      prevRootPath = path.join(tmpDir, 'prev_root.f32');
+      prevRotPath = path.join(tmpDir, 'prev_rot.f32');
+      nextRootPath = path.join(tmpDir, 'next_root.f32');
+      nextRotPath = path.join(tmpDir, 'next_rot.f32');
+
+      fs.writeFileSync(prevRootPath, prevPose!.root);
+      fs.writeFileSync(prevRotPath, prevPose!.rot);
+      fs.writeFileSync(nextRootPath, nextPose!.root);
+      fs.writeFileSync(nextRotPath, nextPose!.rot);
+
+      // 前端一帧一采，约束帧数不能超过实际帧数
+      const poseFrames = prevPose!.root.length / 12;
+      transitionFrames = Math.min(transitionFrames, poseFrames);
+      constraintTag = tag;
     } else {
       return reply.code(400).send({
-        error: '必须提供 animationId 组合（prevAnimationId + nextAnimationId）或直接路径（四个 .f32 绝对路径）',
+        error:
+          '必须提供 animationId 组合（prevAnimationId + nextAnimationId）、' +
+          '前端采样的姿势（prevPose + nextPose）或直接路径（四个 .f32 绝对路径）',
       });
     }
 
