@@ -17,6 +17,7 @@ import {
   type AutoRigResult,
   type OrientationFix,
 } from './autorig/autoRig';
+import { retargetClipToRig } from './autorig/retarget';
 
 export type { SceneNode };
 
@@ -79,6 +80,21 @@ export class ModelViewer {
   private skeletonHelper: THREE.SkeletonHelper | null = null;
   /** 当前模型是否已通过 autoRig() 绑定骨架 */
   private rigged = false;
+
+  // ===== 绑骨后的动画预览 =====
+  /** 驱动绑骨骨架的混音器；null 表示当前没有挂载动画 */
+  private rigMixer: THREE.AnimationMixer | null = null;
+  private rigAction: THREE.AnimationAction | null = null;
+  /** 绑定姿态（骨骼局部变换），停止动画时还原 */
+  private rigRestPose: Map<string, { position: THREE.Vector3; quaternion: THREE.Quaternion; scale: THREE.Vector3 }> | null =
+    null;
+  private rigPlaying = false;
+  /** 递增令牌：切换素材 / 连续选择动画时丢弃过期的加载结果 */
+  private rigLoadToken = 0;
+  /** 动画播放期间线框叠加层需让位（叠加层是绑定姿态的静态副本，不会跟随蒙皮形变） */
+  private rigAnimationActive = false;
+  /** 上一帧时间戳，用于计算 AnimationMixer 的步长 */
+  private lastTickTime = 0;
 
   // ===== 场景节点树（与动画页共用 NodeHighlighter）=====
   private sceneTree: SceneNode[] = [];
@@ -194,6 +210,18 @@ export class ModelViewer {
 
   private tick(): void {
     if (this.disposed) return;
+
+    // 动画预览：只有播放中才推进混音器；暂停时保持当前姿势不再消耗 CPU
+    const now = performance.now();
+    const delta = this.lastTickTime > 0 ? Math.min((now - this.lastTickTime) / 1000, 0.1) : 0;
+    this.lastTickTime = now;
+    if (this.rigPlaying && this.rigMixer) {
+      this.rigMixer.update(delta);
+      // 蒙皮网格每帧都在形变，阴影贴图也要跟着重算
+      this.renderer.shadowMap.needsUpdate = true;
+      this.renderRequested = true;
+    }
+
     // OrbitControls 的阻尼与自动旋转会让相机持续变化；update() 返回 true 表示这一帧相机动了
     const cameraChanged = this.controls.update();
     if (!cameraChanged && !this.renderRequested) return;
@@ -347,6 +375,10 @@ export class ModelViewer {
   clear(): void {
     this.clearNodeSelection();
     this.sceneTree = [];
+    // 先停动画（此时 modelRoot 还在，可还原姿态、解绑混音器），再拆场景对象
+    this.rigAnimationActive = false;
+    this.stopRigAnimation();
+    this.rigRestPose = null;
     if (this.skeletonHelper) {
       this.scene.remove(this.skeletonHelper);
       this.skeletonHelper.dispose();
@@ -436,12 +468,130 @@ export class ModelViewer {
     if (this.hasSkeleton) throw new Error('模型已包含骨架，无需自动绑定');
     const result = await autoRigHumanoid(this.modelRoot, onProgress);
     this.rigged = true;
+    // 记录绑定姿态：播放 / 停止动画时都从它出发，保证预览不会污染原始姿势
+    this.captureRigRestPose();
     // 节点树与线框叠加都按绑骨后的新结构重建
     if (this.nodeHighlighter) this.sceneTree = this.nodeHighlighter.reset(this.modelRoot);
     this.applyWireframeState();
     this.setSkeletonVisible(true);
     this.invalidateShadows();
     return result;
+  }
+
+  // ===== 绑骨后的动画预览 =====
+
+  /** 是否已挂载预览动画（暂停也算） */
+  get hasRigAnimation(): boolean {
+    return this.rigAction !== null;
+  }
+
+  get isRigAnimationPlaying(): boolean {
+    return this.rigPlaying;
+  }
+
+  /**
+   * 加载动画库里的一段 FBX 动画，重定向到自动绑骨骨架并循环播放。
+   *
+   * 重定向前会先停止当前动画、把骨架还原成绑定姿态 —— 重定向以「绑定姿态」
+   * 作为参考姿态，若骨架还停在上一条动画的姿势里，结果会叠加两次偏移。
+   *
+   * @param url 动画取流地址（animationApi.fileUrl）
+   * @returns 是否成功挂载；连续切换时被更新的一次选择会返回 false
+   */
+  async playRigAnimation(url: string): Promise<boolean> {
+    if (!this.modelRoot || !this.rigged) throw new Error('请先完成自动绑骨');
+    const token = ++this.rigLoadToken;
+    const source = await new FBXLoader().loadAsync(url);
+
+    try {
+      if (this.disposed || token !== this.rigLoadToken || !this.modelRoot) return false;
+
+      const sourceClip = (source.animations ?? []).find(
+        (clip) => clip.duration > 1e-3 && clip.tracks.length > 0,
+      );
+      if (!sourceClip) throw new Error('该动画文件里没有可播放的片段');
+
+      // 先回到绑定姿态，再以它作为重定向的参考
+      this.stopRigAnimation();
+      const retargeted = retargetClipToRig(this.modelRoot, source, sourceClip);
+      if (!retargeted) throw new Error('该动画的骨架与自动绑骨的骨骼无法匹配');
+
+      this.rigMixer = new THREE.AnimationMixer(this.modelRoot);
+      this.rigAction = this.rigMixer.clipAction(retargeted.clip);
+      this.rigAction.setLoop(THREE.LoopRepeat, Infinity);
+      this.rigAction.play();
+      this.rigPlaying = true;
+      this.lastTickTime = performance.now();
+
+      // 静态线框叠加层不会跟随蒙皮形变，播放期间切回材质自带线框
+      this.setRigAnimationActive(true);
+      this.invalidateShadows();
+      return true;
+    } finally {
+      // 源 FBX 只用于采样动画，骨骼数据已经转成关键帧轨道，可以整个释放
+      disposeObject(source);
+    }
+  }
+
+  /** 播放 / 暂停当前预览动画（暂停时保留当前姿势） */
+  setRigAnimationPlaying(on: boolean): void {
+    if (!this.rigMixer) return;
+    this.rigPlaying = on;
+    this.lastTickTime = performance.now();
+    this.requestRender();
+  }
+
+  /** 停止预览动画并还原绑定姿态（同时让在途的动画加载结果作废） */
+  stopRigAnimation(): void {
+    this.rigLoadToken += 1;
+    if (this.rigMixer) {
+      this.rigMixer.stopAllAction();
+      if (this.modelRoot) this.rigMixer.uncacheRoot(this.modelRoot);
+      this.rigMixer = null;
+    }
+    this.rigAction = null;
+    this.rigPlaying = false;
+    this.resetRigPose();
+    this.setRigAnimationActive(false);
+    this.requestRender();
+  }
+
+  /** 抓取当前骨骼的局部变换作为绑定姿态 */
+  private captureRigRestPose(): void {
+    const pose = new Map<string, { position: THREE.Vector3; quaternion: THREE.Quaternion; scale: THREE.Vector3 }>();
+    this.modelRoot?.traverse((child) => {
+      const bone = child as THREE.Bone;
+      if (!bone.isBone) return;
+      pose.set(bone.name, {
+        position: bone.position.clone(),
+        quaternion: bone.quaternion.clone(),
+        scale: bone.scale.clone(),
+      });
+    });
+    this.rigRestPose = pose;
+  }
+
+  private resetRigPose(): void {
+    if (!this.modelRoot || !this.rigRestPose) return;
+    const pose = this.rigRestPose;
+    this.modelRoot.traverse((child) => {
+      const bone = child as THREE.Bone;
+      if (!bone.isBone) return;
+      const rest = pose.get(bone.name);
+      if (!rest) return;
+      bone.position.copy(rest.position);
+      bone.quaternion.copy(rest.quaternion);
+      bone.scale.copy(rest.scale);
+    });
+    this.modelRoot.updateMatrixWorld(true);
+    this.invalidateShadows();
+  }
+
+  /** 播放状态变化时重建线框表现（绑定姿态的静态叠加层在动画中会穿帮） */
+  private setRigAnimationActive(active: boolean): void {
+    if (this.rigAnimationActive === active) return;
+    this.rigAnimationActive = active;
+    this.applyWireframeState();
   }
 
   /** 骨骼连线显示开关（对绑骨后的模型或自带骨架的模型都有效） */
@@ -496,7 +646,9 @@ export class ModelViewer {
       this.wireOverlay = null;
     }
 
-    const useOverlay = (this.stats?.triangles ?? 0) <= MAX_WIREFRAME_OVERLAY_TRIANGLES;
+    // 动画播放中线框叠加层是绑定姿态的静态副本，会与形变后的表面错位，改用材质线框
+    const useOverlay =
+      !this.rigAnimationActive && (this.stats?.triangles ?? 0) <= MAX_WIREFRAME_OVERLAY_TRIANGLES;
     this.modelRoot.traverse((child) => {
       const mesh = child as THREE.Mesh;
       if (!mesh.isMesh) return;

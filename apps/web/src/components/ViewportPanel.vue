@@ -7,6 +7,7 @@ import { useWorkspaceStore, isActive } from '@/stores/workspace';
 import { useNow } from '@/composables/useNow';
 import { confirmAction } from '@/composables/useConfirm';
 import { formatDuration } from '@/utils/image';
+import { animationApi, type AnimationFile } from '@/api/animation';
 import type { Asset, Job } from '@/api/types';
 
 const store = useWorkspaceStore();
@@ -28,6 +29,28 @@ const rigging = ref(false);
 const rigProgress = ref(0);
 /** 模型是否已手动/绑骨流程纠正过朝向（用于按钮 active 状态） */
 const orientationCorrected = ref(false);
+
+// ===== 绑骨后的动画预览 =====
+/** 动画库文件列表（懒加载：首次绑骨成功后读取一次） */
+const animFiles = ref<AnimationFile[]>([]);
+const animLoading = ref(false);
+const animListError = ref<string | null>(null);
+/** 当前选中的动画绝对路径；空串表示保持绑定姿态 */
+const animPath = ref('');
+const animPlaying = ref(false);
+const animBusy = ref(false);
+
+/** 按来源文件夹分组，下拉框里用 optgroup 展示 */
+const animGroups = computed(() => {
+  const groups = new Map<string, AnimationFile[]>();
+  for (const file of animFiles.value) {
+    const label = file.sourceLabel || '动画库';
+    const list = groups.get(label);
+    if (list) list.push(file);
+    else groups.set(label, [file]);
+  }
+  return [...groups.entries()].map(([label, files]) => ({ label, files }));
+});
 
 const asset = computed<Asset | null>(() => store.selectedAsset);
 const job = computed<Job | null>(() => store.selectedJob);
@@ -63,6 +86,7 @@ async function loadAsset(target: Asset | null): Promise<void> {
   if (!target) {
     instance.clear();
     stats.value = null;
+    resetAnimationPreview();
     return;
   }
 
@@ -70,6 +94,7 @@ async function loadAsset(target: Asset | null): Promise<void> {
   if (!loadTarget) {
     instance.clear();
     stats.value = null;
+    resetAnimationPreview();
     loadError.value = '该素材没有浏览器可直接预览的格式，请下载后用本地软件打开';
     return;
   }
@@ -80,6 +105,7 @@ async function loadAsset(target: Asset | null): Promise<void> {
   rigged.value = false;
   skeletonOn.value = false;
   orientationCorrected.value = false;
+  resetAnimationPreview();
   try {
     stats.value = await instance.load(loadTarget);
     instance.setWireframe(store.wireframe);
@@ -192,6 +218,8 @@ async function autoRig(): Promise<void> {
         (result.orientation.note ? ` · ${result.orientation.note}` : '') +
         (fallbackParts.length > 0 ? ` · ${fallbackParts.join('/')}回退模板比例` : ''),
     );
+    // 绑骨成功后才需要动画列表，懒加载避免白跑一次文件夹扫描
+    void ensureAnimationList();
   } catch (err) {
     store.toast('error', err instanceof Error ? err.message : '自动绑骨失败');
   } finally {
@@ -226,11 +254,85 @@ async function exportRigged(): Promise<void> {
   const instance = viewer.value;
   if (!instance) return;
   try {
+    // 导出的是绑定姿态的骨架：先停掉预览动画，避免把当前姿势烘进节点变换
+    instance.stopRigAnimation();
+    animPath.value = '';
+    animPlaying.value = false;
     const baseName = (job.value?.name ?? 'model').replace(/[\\/:*?"<>|]/g, '_');
     await instance.exportGlb(`${baseName}-rigged.glb`);
   } catch (err) {
     store.toast('error', err instanceof Error ? err.message : '导出 GLB 失败');
   }
+}
+
+/**
+ * 读取动画库文件列表（绑骨成功后懒加载一次）。
+ * 文件夹缺失或为空时只在面板里给出提示，不影响绑骨本身。
+ */
+async function ensureAnimationList(): Promise<void> {
+  if (animLoading.value || animFiles.value.length > 0) return;
+  animLoading.value = true;
+  animListError.value = null;
+  try {
+    const result = await animationApi.list();
+    animFiles.value = result.files;
+    if (result.files.length === 0) {
+      animListError.value =
+        result.missing.length > 0
+          ? '动画库文件夹不存在，请到「动画」页重新添加'
+          : '动画库为空，请到「动画」页添加 FBX 动画文件夹';
+    }
+  } catch (err) {
+    animListError.value = err instanceof Error ? err.message : '读取动画库失败';
+  } finally {
+    animLoading.value = false;
+  }
+}
+
+/** 切换素材 / 卸载模型时清空动画预览状态 */
+function resetAnimationPreview(): void {
+  animPath.value = '';
+  animPlaying.value = false;
+  animBusy.value = false;
+  viewer.value?.stopRigAnimation();
+}
+
+/** 下拉框选择：空值 = 回到绑定姿态，其余加载 FBX 并重定向到绑骨骨架 */
+async function onAnimChange(event: Event): Promise<void> {
+  const instance = viewer.value;
+  const path = (event.target as HTMLSelectElement).value;
+  animPath.value = path;
+  animPlaying.value = false;
+  if (!instance) return;
+
+  if (!path) {
+    instance.stopRigAnimation();
+    return;
+  }
+
+  const file = animFiles.value.find((item) => item.path === path);
+  if (!file) return;
+
+  animBusy.value = true;
+  try {
+    const applied = await instance.playRigAnimation(animationApi.fileUrl(file.path));
+    // 连续切换时旧的一次加载会被新选择取代，这里不改状态
+    if (!applied) return;
+    animPlaying.value = instance.isRigAnimationPlaying;
+  } catch (err) {
+    animPath.value = '';
+    instance.stopRigAnimation();
+    store.toast('error', err instanceof Error ? err.message : '动画预览加载失败');
+  } finally {
+    animBusy.value = false;
+  }
+}
+
+function toggleAnimPlay(): void {
+  const instance = viewer.value;
+  if (!instance || !animPath.value) return;
+  instance.setRigAnimationPlaying(!animPlaying.value);
+  animPlaying.value = instance.isRigAnimationPlaying;
 }
 </script>
 
@@ -367,6 +469,41 @@ async function exportRigged(): Promise<void> {
           <Icon name="refresh" :size="13" />
           重试
         </button>
+      </div>
+    </div>
+
+    <!-- 绑骨后的动画预览（左下角，避开底部居中的生成状态卡） -->
+    <div v-if="rigged" class="overlay overlay-anim">
+      <div class="anim-card">
+        <div class="anim-head">
+          <Icon name="film" :size="13" />
+          <span>动画预览</span>
+          <span v-if="animPlaying" class="anim-live">循环中</span>
+        </div>
+        <div v-if="animLoading" class="anim-note">
+          <Icon name="refresh" :size="12" class="spin" />
+          正在读取动画库…
+        </div>
+        <div v-else-if="animFiles.length === 0" class="anim-note">{{ animListError ?? '动画库为空' }}</div>
+        <template v-else>
+          <select class="anim-select" :value="animPath" :disabled="animBusy" @change="onAnimChange">
+            <option value="">绑定姿态（无动画）</option>
+            <optgroup v-for="group in animGroups" :key="group.label" :label="group.label">
+              <option v-for="file in group.files" :key="file.path" :value="file.path">{{ file.name }}</option>
+            </optgroup>
+          </select>
+          <div class="anim-row">
+            <button class="anim-play" type="button" :disabled="!animPath || animBusy" @click="toggleAnimPlay">
+              <Icon
+                :name="animBusy ? 'refresh' : animPlaying ? 'pause' : 'play'"
+                :size="12"
+                :class="{ spin: animBusy }"
+              />
+              {{ animBusy ? '载入中' : animPlaying ? '暂停' : '播放' }}
+            </button>
+            <span class="anim-tip">{{ animPath ? (animPlaying ? '预览中' : '已暂停') : '选择动画预览骨骼' }}</span>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -640,5 +777,98 @@ async function exportRigged(): Promise<void> {
   padding: 4px 10px;
   border-radius: 999px;
   pointer-events: none;
+}
+
+/* 绑骨后的动画预览面板 */
+.overlay-anim {
+  left: 14px;
+  bottom: 14px;
+  width: min(268px, calc(100% - 28px));
+}
+
+.anim-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 11px;
+  border-radius: var(--radius);
+  background: rgba(22, 23, 27, 0.8);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--shadow);
+}
+
+.anim-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.anim-live {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--accent-hover);
+}
+
+.anim-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+.anim-select {
+  width: 100%;
+  height: 28px;
+  padding: 0 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: var(--bg-app);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.anim-select:disabled {
+  opacity: 0.5;
+}
+
+.anim-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.anim-play {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.anim-play:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+
+.anim-play:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.anim-tip {
+  font-size: 11px;
+  color: var(--text-faint);
 }
 </style>
