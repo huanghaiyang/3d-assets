@@ -181,6 +181,10 @@ export class StripsPlayer {
 
   /** emit 节流时间戳（毫秒），避免每帧都触发 Vue 更新 */
   private lastEmit = 0;
+  /** 上一次真正渲染的时刻：暂停且相机静止时用它在空闲帧上限流 */
+  private lastRenderAt = 0;
+  /** 有显式改动（求值、开关切换）时置位，保证空闲限流下也能立刻重绘 */
+  private renderRequested = true;
   private disposed = false;
 
   /** 三个回调：帧状态、一次性通知（用于 toast）、片段加载状态 */
@@ -628,6 +632,8 @@ export class StripsPlayer {
   private tick(): void {
     if (this.disposed) return;
     const delta = this.clock.getDelta();
+    // 容器隐藏（切到其它页面 / 折叠）时宽度为 0：不吃 GPU、也不推进时间
+    if (this.container.clientWidth === 0) return;
     if (this.playing && this.duration > 0) {
       this.time += delta * this.speed;
       if (this.time >= this.duration) {
@@ -641,8 +647,14 @@ export class StripsPlayer {
       this.apply(this.time);
       this.emit();
     }
+    // update() 返回 true 表示这一帧相机有变化（阻尼、用户拖拽）
+    const cameraChanged = this.controls.update();
+    const now = performance.now();
+    // 暂停且相机静止时把渲染降到约 20fps：多个预览区同时挂载时空闲常渲非常吃 GPU
+    if (!this.playing && !cameraChanged && !this.renderRequested && now - this.lastRenderAt < 50) return;
+    this.renderRequested = false;
+    this.lastRenderAt = now;
     if (this.showSkeleton) this.updateSkeletonLines();
-    this.controls.update();
     this.renderer.render(this.scene, this.camera);
   }
 
@@ -653,6 +665,8 @@ export class StripsPlayer {
    * live ：调用 StripBlend.applyStrips 逐骨骼混合。
    */
   private apply(time: number): void {
+    // 时间轴求值属于显式改动：请求立即重绘
+    this.renderRequested = true;
     if (!this.base) return;
     if (this.mode === 'baked' && this.bakedAction && this.bakedClip) {
       this.bakedAction.time = Math.min(Math.max(time, 0), Math.max(0, this.bakedClip.duration - 1e-4));

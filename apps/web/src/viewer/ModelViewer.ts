@@ -60,6 +60,13 @@ export class ModelViewer {
   private readonly resizeObserver: ResizeObserver;
   private readonly axis: AxisIndicator | null;
 
+  /**
+   * 是否有待渲染的画面改动。
+   * 静止（没有相机阻尼、没有自动旋转、没有模型/选择变化）时不再逐帧渲染，
+   * 空闲的预览区几乎不占 GPU —— 页面上同时挂着多个 3D 预览时这一项收益最大。
+   */
+  private renderRequested = true;
+
   private modelRoot: THREE.Object3D | null = null;
   private wireOverlay: THREE.Group | null = null;
   private stats: MeshStats | null = null;
@@ -80,10 +87,11 @@ export class ModelViewer {
   constructor(container: HTMLElement, options: ModelViewerOptions = {}) {
     this.container = container;
 
+    // 不开启 preserveDrawingBuffer：它会强制浏览器每帧保留缓冲区，是一直开着的高额显存/带宽开销。
+    // captureThumbnail() 里先 render 再同步 drawImage，同一任务内读像素，无需保留缓冲区。
     this.renderer = new THREE.WebGLRenderer({
       antialias: true,
       alpha: true,
-      preserveDrawingBuffer: true, // 便于随时截取缩略图
     });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -91,6 +99,9 @@ export class ModelViewer {
     this.renderer.toneMappingExposure = 1.05;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // 阴影贴图只在模型/灯光变化后重算：静止预览不做"从光源再渲一遍场景"的无用功
+    this.renderer.shadowMap.autoUpdate = false;
+    this.renderer.shadowMap.needsUpdate = true;
     this.renderer.domElement.style.display = 'block';
     this.renderer.domElement.style.width = '100%';
     this.renderer.domElement.style.height = '100%';
@@ -120,7 +131,8 @@ export class ModelViewer {
     const keyLight = new THREE.DirectionalLight(0xffffff, 2.1);
     keyLight.position.set(4, 6.5, 4.5);
     keyLight.castShadow = true;
-    keyLight.shadow.mapSize.set(2048, 2048);
+    // 1024 对单个模型的接触阴影已经足够，2048 的填充率是它的 4 倍
+    keyLight.shadow.mapSize.set(1024, 1024);
     keyLight.shadow.bias = -0.0005;
     keyLight.shadow.camera.near = 0.5;
     keyLight.shadow.camera.far = 30;
@@ -165,9 +177,27 @@ export class ModelViewer {
     this.renderer.setAnimationLoop(() => this.tick());
   }
 
+  /**
+   * 标记需要重绘一帧。
+   * 任何不经过相机交互的画面变化（加载模型、切换线框/骨骼、节点选择、取景）都要调用，
+   * 否则按需渲染的画面会停留在上一帧。
+   */
+  private requestRender(): void {
+    this.renderRequested = true;
+  }
+
+  /** 重新计算阴影贴图（模型位置、朝向或网格变化后调用） */
+  private invalidateShadows(): void {
+    this.renderer.shadowMap.needsUpdate = true;
+    this.renderRequested = true;
+  }
+
   private tick(): void {
     if (this.disposed) return;
-    this.controls.update();
+    // OrbitControls 的阻尼与自动旋转会让相机持续变化；update() 返回 true 表示这一帧相机动了
+    const cameraChanged = this.controls.update();
+    if (!cameraChanged && !this.renderRequested) return;
+    this.renderRequested = false;
     // 高亮包围盒跟着自动旋转/模型动作刷新
     this.nodeHighlighter?.refreshBoxes();
     this.axis?.update(this.camera);
@@ -180,6 +210,7 @@ export class ModelViewer {
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
+    this.requestRender();
   }
 
   get currentStats(): MeshStats | null {
@@ -228,6 +259,8 @@ export class ModelViewer {
     this.sceneTree = this.nodeHighlighter.reset(root);
     this.applyWireframeState();
     this.frameCamera(size.y * scale);
+    // 新模型可能换了尺寸/位置，阴影贴图必须重算
+    this.invalidateShadows();
     return stats;
   }
 
@@ -244,10 +277,12 @@ export class ModelViewer {
   /** 指定要高亮的节点（加选逻辑在上层 store 里） */
   setNodeSelection(ids: readonly string[]): void {
     this.nodeHighlighter?.setSelection(ids);
+    this.requestRender();
   }
 
   clearNodeSelection(): void {
     this.nodeHighlighter?.clear();
+    this.requestRender();
   }
 
   private async loadObject(target: LoadTarget): Promise<THREE.Object3D> {
@@ -298,6 +333,7 @@ export class ModelViewer {
     this.camera.far = distance * 40;
     this.camera.updateProjectionMatrix();
     this.controls.update();
+    this.requestRender();
   }
 
   resetView(): void {
@@ -328,6 +364,7 @@ export class ModelViewer {
     }
     this.stats = null;
     this.rigged = false;
+    this.invalidateShadows();
   }
 
   // ===== 自动绑骨 =====
@@ -369,6 +406,7 @@ export class ModelViewer {
         // 已绑骨时，骨架层是 modelRoot 的子节点，还原旋转后也要把 skeletonHelper 刷新一下
         if (this.skeletonHelper) this.skeletonHelper.update();
       }
+      this.invalidateShadows();
       return { yaw: 0, note: '已还原模型原始朝向' };
     }
 
@@ -384,6 +422,7 @@ export class ModelViewer {
       this.modelRoot.rotation.y += fix.yaw;
       this.modelRoot.updateMatrixWorld(true);
       if (this.rigged && this.skeletonHelper) this.skeletonHelper.update();
+      this.invalidateShadows();
     }
     return fix;
   }
@@ -401,6 +440,7 @@ export class ModelViewer {
     if (this.nodeHighlighter) this.sceneTree = this.nodeHighlighter.reset(this.modelRoot);
     this.applyWireframeState();
     this.setSkeletonVisible(true);
+    this.invalidateShadows();
     return result;
   }
 
@@ -410,6 +450,7 @@ export class ModelViewer {
       this.skeletonHelper?.dispose();
       if (this.skeletonHelper) this.scene.remove(this.skeletonHelper);
       this.skeletonHelper = null;
+      this.requestRender();
       return;
     }
     if (!this.skeletonHelper) {
@@ -420,6 +461,7 @@ export class ModelViewer {
       this.scene.add(helper);
     }
     this.skeletonHelper.visible = on;
+    this.requestRender();
   }
 
   /** 把当前模型（含绑骨结果）导出为 GLB 并触发浏览器下载 */
@@ -466,7 +508,10 @@ export class ModelViewer {
       }
     });
 
-    if (!this.wireframeOn || !useOverlay) return;
+    if (!this.wireframeOn || !useOverlay) {
+      this.requestRender();
+      return;
+    }
 
     // 低面数模型使用独立线框叠加层，保留表面着色同时清晰展示拓扑
     this.modelRoot.updateMatrixWorld(true);
@@ -485,16 +530,19 @@ export class ModelViewer {
     });
     this.wireOverlay = group;
     this.scene.add(group);
+    this.requestRender();
   }
 
   setGrid(on: boolean): void {
     this.gridOn = on;
     this.grid.visible = on;
     this.shadowPlane.visible = on;
+    this.requestRender();
   }
 
   setAutoRotate(on: boolean): void {
     this.controls.autoRotate = on;
+    this.requestRender();
   }
 
   get isGridVisible(): boolean {

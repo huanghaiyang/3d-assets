@@ -276,18 +276,29 @@ export class FbxPlayer {
   private inPlaceOn = false;
   private speed = 1;
   private playing = false;
+  /**
+   * 是否有待渲染的画面改动。
+   * 暂停且相机静止时跳过整帧渲染，避免空闲的预览区一直占用 GPU。
+   */
+  private renderRequested = true;
+  /** 上次向 Vue 推送播放进度的时刻：节流到约 20fps，避免每帧触发响应式更新 */
+  private lastEmitAt = 0;
   private listeners: ((state: PlaybackState) => void)[] = [];
 
   constructor(container: HTMLElement, options: FbxPlayerOptions = {}) {
     this.container = container;
 
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+    // 不开启 preserveDrawingBuffer：captureFrame() 是"先 render 再同步读取"，同一任务内读像素即可
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.05;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // 阴影贴图手动触发更新：只有角色在动或模型变化时才重算
+    this.renderer.shadowMap.autoUpdate = false;
+    this.renderer.shadowMap.needsUpdate = true;
     this.renderer.domElement.style.cssText = 'display:block;width:100%;height:100%';
     container.appendChild(this.renderer.domElement);
 
@@ -313,7 +324,8 @@ export class FbxPlayer {
     const keyLight = new THREE.DirectionalLight(0xffffff, 2.0);
     keyLight.position.set(4, 7, 4.5);
     keyLight.castShadow = true;
-    keyLight.shadow.mapSize.set(2048, 2048);
+    // 1024 已足够支撑接触阴影；2048 的填充率是它的 4 倍
+    keyLight.shadow.mapSize.set(1024, 1024);
     keyLight.shadow.bias = -0.0005;
     keyLight.shadow.camera.near = 0.5;
     keyLight.shadow.camera.far = 40;
@@ -364,26 +376,46 @@ export class FbxPlayer {
     this.renderer.setAnimationLoop(() => this.tick());
   }
 
+  /** 标记需要重绘一帧（暂停状态下任何画面变化都要调用） */
+  private requestRender(): void {
+    this.renderRequested = true;
+  }
+
+  /** 重新计算阴影贴图（模型、姿势或朝向变化后调用） */
+  private invalidateShadows(): void {
+    this.renderer.shadowMap.needsUpdate = true;
+    this.renderRequested = true;
+  }
+
   private tick(): void {
     if (this.disposed) return;
     const delta = this.clock.getDelta();
-    // 姿态模式下不再让动画覆盖手动摆的姿势
-    if (this.mixer && !this.poseMode) {
-      this.mixer.update(delta * this.speed * (this.playing ? 1 : 0));
+    // 只有真正在播放时推进动画：暂停时不再每帧空转 mixer，也不再让动画覆盖手动摆的姿势
+    const animating = Boolean(this.currentAction && this.playing && !this.poseMode);
+    if (animating) this.mixer?.update(delta * this.speed);
+
+    // update() 返回 true 表示这一帧相机有变化（阻尼、自动旋转、用户拖拽）
+    const cameraChanged = this.controls.update();
+    // 静止（暂停且相机没动）时直接跳过整帧渲染；姿态模式与显式改动仍会重绘
+    if (!animating && !cameraChanged && !this.poseMode && !this.renderRequested) return;
+    this.renderRequested = false;
+
+    if (animating || this.poseMode) {
+      // 骨骼随动画/手动摆姿移动，刷新叠加层与拾取用的点云，并同步重算阴影
+      this.skeleton?.refreshPositions();
+      this.renderer.shadowMap.needsUpdate = true;
     }
-    this.controls.update();
-    // 骨骼随动画移动，逐帧刷新叠加层与拾取用的点云
-    this.skeleton?.refreshPositions();
     this.nodeHighlighter?.refreshBoxes();
     this.axis?.update(this.camera);
     this.renderer.render(this.scene, this.camera);
-    if (this.mixer && this.currentAction) {
-      this.emit({
-        time: this.currentAction.time,
-        duration: this.currentAction.getClip().duration,
-        playing: this.playing,
-        speed: this.speed,
-      });
+
+    // 播放进度推给 Vue：节流到约 20fps，时间轴显示足够顺滑，又不至于每帧触发整页响应式更新
+    if (this.currentAction && animating) {
+      const now = performance.now();
+      if (now - this.lastEmitAt >= 50) {
+        this.lastEmitAt = now;
+        this.emitPlayback();
+      }
     }
   }
 
@@ -421,6 +453,8 @@ export class FbxPlayer {
   }
 
   private emitPose(): void {
+    // 骨骼变了：暂停状态下也要重绘一帧，否则画面停在旧姿势
+    this.invalidateShadows();
     const bone = this.poseMode ? (this.bonesById.get(this.selectedBoneId ?? '') ?? null) : null;
     let changedCount = 0;
     for (const id of this.poseBoneIds) {
@@ -469,10 +503,12 @@ export class FbxPlayer {
   /** 指定要高亮的节点（加选逻辑在上层 store 里） */
   setNodeSelection(ids: readonly string[]): void {
     this.nodeHighlighter?.setSelection(ids);
+    this.requestRender();
   }
 
   clearNodeSelection(): void {
     this.nodeHighlighter?.clear();
+    this.requestRender();
   }
 
   // ===== 模态变换：按 G / R / S 之后鼠标直接驱动骨骼 =====
@@ -871,6 +907,7 @@ export class FbxPlayer {
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
+    this.requestRender();
   }
 
   get clipList(): ClipInfo[] {
@@ -1020,6 +1057,7 @@ export class FbxPlayer {
   setSkeletonVisible(on: boolean): void {
     this.skeletonOn = on;
     this.skeleton?.setVisible(on);
+    this.requestRender();
   }
 
   get boneDisplayMode(): BoneDisplayMode {
@@ -1030,14 +1068,17 @@ export class FbxPlayer {
   setBoneDisplayMode(mode: BoneDisplayMode): void {
     this.skeletonMode = mode;
     this.skeleton?.setDisplayMode(mode);
+    this.requestRender();
   }
 
   setSelectedBones(ids: readonly string[]): void {
     this.skeleton?.setSelection(ids);
+    this.requestRender();
   }
 
   setHoveredBone(id: string | null): void {
     this.skeleton?.setHovered(id);
+    this.requestRender();
   }
 
   /** 在模型上用屏幕坐标点选骨骼；返回骨骼 id，未命中为 null */
@@ -1125,6 +1166,8 @@ export class FbxPlayer {
     this.currentAction = null;
     this.playing = false;
 
+    // 新模型：重算阴影并重绘一帧
+    this.invalidateShadows();
     return { clips: this.clipList, stats: collectStats(object) };
   }
 
@@ -1158,6 +1201,7 @@ export class FbxPlayer {
     this.clips = [];
     this.playing = false;
     this.emitPlayback();
+    this.invalidateShadows();
   }
 
   /**
@@ -1202,6 +1246,9 @@ export class FbxPlayer {
   setPlaying(playing: boolean): void {
     this.playing = playing;
     if (playing && this.currentAction && !this.currentAction.isRunning()) this.currentAction.play();
+    // 暂停时按需渲染，因此播放状态变化后主动重绘并同步一次进度
+    this.requestRender();
+    this.emitPlayback();
   }
 
   togglePlay(): void {
@@ -1210,6 +1257,7 @@ export class FbxPlayer {
 
   setSpeed(speed: number): void {
     this.speed = Math.max(0.05, Math.min(4, speed));
+    this.emitPlayback();
   }
 
   seek(time: number): void {
@@ -1217,12 +1265,16 @@ export class FbxPlayer {
     const duration = this.currentAction.getClip().duration;
     this.currentAction.time = Math.max(0, Math.min(time, duration));
     this.mixer?.update(0);
+    // 暂停状态下拖动时间轴：立即求值并重绘
+    this.invalidateShadows();
+    this.emitPlayback();
   }
 
   setGrid(on: boolean): void {
     this.gridOn = on;
     this.grid.visible = on;
     this.shadowPlane.visible = on;
+    this.requestRender();
   }
 
   /** 镜像：把模型整体沿 X 轴翻转（正面朝向不变，左右互换） */
@@ -1247,6 +1299,8 @@ export class FbxPlayer {
         }
       }
     });
+    // 镜像改变了模型整体变换，阴影与画面都要重算
+    this.invalidateShadows();
   }
 
   get inPlace(): boolean {
@@ -1307,6 +1361,7 @@ export class FbxPlayer {
     this.camera.far = distance * 40;
     this.camera.updateProjectionMatrix();
     this.controls.update();
+    this.requestRender();
   }
 
   /** 把动画定位到某个比例处（用于生成缩略图） */
@@ -1315,6 +1370,7 @@ export class FbxPlayer {
     const duration = this.currentAction.getClip().duration;
     this.currentAction.time = Math.max(0, Math.min(duration * ratio, duration));
     this.mixer.update(0);
+    this.invalidateShadows();
   }
 
   captureFrame(size = 256): string | null {

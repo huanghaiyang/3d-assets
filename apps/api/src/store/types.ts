@@ -154,6 +154,11 @@ export interface Asset {
   creditConsumed: number | null;
   creditDetails: string | null;
   bytes: number;
+  /**
+   * 素材的本地来源绝对路径（仅「扫描文件夹导入」写入）。
+   * 用于重复扫描时去重：同一路径的 GLB 不会重复入库。
+   */
+  sourcePath?: string;
 }
 
 export interface Job {

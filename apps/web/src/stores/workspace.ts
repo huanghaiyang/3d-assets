@@ -3,10 +3,13 @@ import { defineStore } from 'pinia';
 import { api, ApiError } from '@/api/client';
 import type { SceneNode } from '@/viewer/sceneNodes';
 import type {
+  BatchTransformResponse,
+  FolderScanResponse,
   GenerateType,
   GenerationParams,
   InputMode,
   Job,
+  PivotMode,
   PolygonType,
   ProviderCapabilities,
   ProviderId,
@@ -582,6 +585,101 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     if (!uploading.value) uploadQueue.value = [];
   }
 
+  // ===== 扫描文件夹导入（服务端直接读磁盘，不经过浏览器上传）=====
+  /** 扫描请求进行中（按钮 loading / 防止重复点击） */
+  const scanning = ref(false);
+
+  /**
+   * 扫描磁盘上的某个文件夹，把其中所有 `.glb` 一次性导入素材库。
+   *
+   * 与「上传」的区别：文件已经在服务端所在机器上，直接按路径复制，几百个模型
+   * 也不需要经过浏览器逐字节上传。同一路径重复扫描会自动跳过已导入的文件。
+   *
+   * @returns 扫描结果（失败 / 跳过 / 超上限的数量），请求失败时返回 null
+   */
+  async function scanFolder(dir: string, recursive = true): Promise<FolderScanResponse | null> {
+    if (scanning.value) return null;
+    scanning.value = true;
+    try {
+      const result = await api.scanGlbFolder(dir, recursive);
+      const parts: string[] = [`扫描 ${result.scanned} 个 GLB`];
+      parts.push(`导入 ${result.created.length} 个`);
+      if (result.skipped > 0) parts.push(`跳过 ${result.skipped} 个已导入`);
+      if (result.failed.length > 0) parts.push(`失败 ${result.failed.length} 个`);
+      if (result.overflow > 0) parts.push(`超出上限 ${result.overflow} 个未处理`);
+      const summary = parts.join('，');
+      if (result.created.length > 0) {
+        toast('success', summary);
+        // 自动选中本次导入的第一个模型，视口立即展示
+        selectedId.value = result.created[0]!.id;
+        await refresh();
+        // 新导入的模型没有封面，交给后端 worker 逐个渲染
+        void fillMissingThumbnails({ ids: result.created.map((job) => job.id) });
+      } else {
+        toast(result.scanned === 0 ? 'info' : 'error', result.scanned === 0 ? `文件夹里没有 .glb：${result.folder}` : summary);
+      }
+      return result;
+    } catch (err) {
+      toast('error', err instanceof Error ? err.message : '扫描文件夹失败');
+      return null;
+    } finally {
+      scanning.value = false;
+    }
+  }
+
+  // ===== 批量修正中心点 / 朝向 =====
+  /** 批量变换请求进行中 */
+  const transforming = ref(false);
+
+  /**
+   * 批量修正素材的中心点（轴心）与朝向。
+   *
+   * 服务端会直接改写 GLB / glTF 文件里的根节点矩阵（不动顶点与骨骼），
+   * 因此改完必须刷新素材：文件 URL 带 `?v=` 版本号绕过浏览器缓存，
+   * 同时清空封面以便按新朝向重新渲染。
+   *
+   * @param ids 目标素材 id（通常来自素材库多选）
+   * @param pivot 轴心模式：none 保持原地 / center 包围盒中心 / bottom 底部中心
+   * @param yaw 'auto' 自动纠正朝向，或额外旋转的角度（90 的倍数）
+   */
+  async function batchTransform(
+    ids: string[],
+    pivot: PivotMode,
+    yaw: 'auto' | number,
+  ): Promise<BatchTransformResponse | null> {
+    if (transforming.value || ids.length === 0) return null;
+    transforming.value = true;
+    try {
+      const result = await api.batchTransform(ids, pivot, yaw);
+      const changedItems = result.transformed.filter((item) => item.changed);
+      const okCount = result.transformed.length;
+      if (okCount > 0) {
+        const yawText = yaw === 'auto' ? '并按几何纠正朝向' : yaw === 0 ? '' : `并旋转 ${yaw}°`;
+        if (changedItems.length > 0) {
+          toast('success', `已处理 ${changedItems.length} 个模型${yawText}`);
+          await refresh();
+          // 只有真正改写了文件的模型才需要重渲染封面
+          // （后端按文件 mtime 自动让旧封面缓存失效）
+          void fillMissingThumbnails({ ids: changedItems.map((item) => item.id) });
+        }
+        const unchanged = okCount - changedItems.length;
+        if (unchanged > 0) {
+          toast('info', `${unchanged} 个模型已经是目标状态，文件未改动`);
+        }
+      }
+      if (result.skipped.length > 0) {
+        const reason = result.skipped[0]!.reason;
+        toast('error', `有 ${result.skipped.length} 个模型未处理：${reason}`);
+      }
+      return result;
+    } catch (err) {
+      toast('error', err instanceof Error ? err.message : '批量处理失败');
+      return null;
+    } finally {
+      transforming.value = false;
+    }
+  }
+
   /**
    * 重新生成单个素材的封面（强制后端重渲染，忽略已有封面）。
    * 返回的新 URL 带 ?v=<时间戳>，浏览器不会继续用旧图。
@@ -829,6 +927,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     uploading,
     uploadInfo,
     thumbnailTask,
+    scanning,
+    transforming,
     // getters
     selectedJob,
     selectedAsset,
@@ -864,6 +964,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     uploadFiles,
     cancelUpload,
     clearUploadQueue,
+    scanFolder,
+    batchTransform,
     fillMissingThumbnails,
     regenerateCover,
     submit,

@@ -3,13 +3,26 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import Icon from '../ui/Icon.vue';
 import { animationApi, type AnimationDirEntry } from '@/api/animation';
 
-const props = defineProps<{ open: boolean; startDir: string }>();
+const props = withDefaults(
+  defineProps<{
+    open: boolean;
+    startDir: string;
+    /** 对话框标题；素材库的 GLB 扫描复用本组件时传自己的标题 */
+    title?: string;
+    /** 统计并展示的扩展名（不含点）；默认 fbx，扫描模型时传 glb */
+    ext?: string;
+  }>(),
+  { title: '选择动画文件夹', ext: 'fbx' },
+);
 const emit = defineEmits<{ close: []; pick: [dir: string] }>();
+
+/** 扩展名的大写形式，用于界面文案（FBX / GLB） */
+const extLabel = computed(() => props.ext.toUpperCase());
 
 const current = ref('');
 const parent = ref<string | null>(null);
 const dirs = ref<AnimationDirEntry[]>([]);
-const fbxCount = ref(0);
+const fileCount = ref(0);
 const manualPath = ref('');
 const busy = ref(false);
 const error = ref<string | null>(null);
@@ -18,11 +31,11 @@ async function browse(dir?: string): Promise<void> {
   busy.value = true;
   error.value = null;
   try {
-    const result = await animationApi.browse(dir);
+    const result = await animationApi.browse(dir, props.ext);
     current.value = result.dir;
     parent.value = result.parent;
     dirs.value = result.dirs;
-    fbxCount.value = result.fbxCount;
+    fileCount.value = result.fileCount;
     manualPath.value = result.dir;
   } catch (err) {
     error.value = (err as Error).message;
@@ -57,11 +70,11 @@ onBeforeUnmount(() => {
 <template>
   <Transition name="fade">
     <div v-if="open" class="backdrop" @click.self="emit('close')">
-      <div class="dialog" role="dialog" aria-modal="true" aria-label="选择动画文件夹">
+      <div class="dialog" role="dialog" aria-modal="true" :aria-label="title">
         <header class="dialog-head">
           <div class="dialog-title">
             <Icon name="folder" :size="15" />
-            选择动画文件夹
+            {{ title }}
             <span class="chip chip-info">只读</span>
           </div>
           <button class="btn btn-ghost btn-icon" type="button" @click="emit('close')">
@@ -84,7 +97,7 @@ onBeforeUnmount(() => {
             <Icon name="arrowUp" :size="14" />
           </button>
           <span class="mono path-text" :title="current">{{ current }}</span>
-          <span class="chip">{{ fbxCount }} 个 FBX</span>
+          <span class="chip">{{ fileCount }} 个 {{ extLabel }}</span>
         </div>
 
         <div class="dir-list">
@@ -101,7 +114,7 @@ onBeforeUnmount(() => {
           >
             <Icon name="folder" :size="14" />
             <span class="dir-name">{{ entry.name }}</span>
-            <span v-if="entry.fbxCount > 0" class="chip chip-accent">{{ entry.fbxCount }} FBX</span>
+            <span v-if="entry.fileCount > 0" class="chip chip-accent">{{ entry.fileCount }} {{ extLabel }}</span>
             <span v-else-if="entry.hidden" class="chip">隐藏</span>
           </button>
         </div>
@@ -109,12 +122,12 @@ onBeforeUnmount(() => {
         <footer class="dialog-foot">
           <p class="hint">
             <Icon name="info" :size="12" />
-            只读取 .fbx 文件，不会写入、修改或锁定该文件夹中的任何文件。
+            只读取 .{{ ext }} 文件，不会写入、修改或锁定该文件夹中的任何文件。
           </p>
           <div class="foot-actions">
             <button class="btn" type="button" @click="emit('close')">取消</button>
             <button class="btn btn-primary" type="button" :disabled="busy" @click="emit('pick', current)">
-              使用此文件夹<span v-if="fbxCount > 0">（{{ fbxCount }} 个 FBX）</span>
+              使用此文件夹<span v-if="fileCount > 0">（{{ fileCount }} 个 {{ extLabel }}）</span>
             </button>
           </div>
         </footer>

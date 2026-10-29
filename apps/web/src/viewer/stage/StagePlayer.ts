@@ -144,6 +144,10 @@ export class StagePlayer {
     { line: THREE.LineSegments; pairs: { parent: THREE.Object3D; child: THREE.Object3D }[] }
   >();
   private lastEmit = 0;
+  /** 上一次真正渲染的时刻：暂停且相机静止时用它在空闲帧上限流 */
+  private lastRenderAt = 0;
+  /** 有显式改动（拖动、求值、选择变化）时置位，保证空闲限流下也能立刻重绘 */
+  private renderRequested = true;
   private disposed = false;
   private readonly ikTarget = new THREE.Vector3();
   /** 骨骼连线采样用的临时点 */
@@ -238,6 +242,8 @@ export class StagePlayer {
       if (!dragging) this.commitPoseDrag();
     });
     this.transform.addEventListener('objectChange', () => {
+      // 拖动 gizmo 属于显式改动：立即重绘，不受空闲限流影响
+      this.renderRequested = true;
       // 起始帧残影拖动只改残影根节点，拖拽结束才回写段站位
       if (!this.poseTarget) this.emitPlacement();
     });
@@ -832,7 +838,10 @@ export class StagePlayer {
   // ===== 每帧驱动 =====
 
   private tick(): void {
+    if (this.disposed) return;
     const delta = this.clock.getDelta();
+    // 容器隐藏（切到其它页面 / 折叠）时宽度为 0：不吃 GPU、也不推进时间
+    if (this.container.clientWidth === 0) return;
     if (this.playing && this.durationValue > 0) {
       this.time += delta * this.speed;
       if (this.time >= this.durationValue) {
@@ -846,13 +855,22 @@ export class StagePlayer {
       this.apply(this.time);
     }
 
-    this.controls.update();
+    // update() 返回 true 表示这一帧相机有变化（阻尼、用户拖拽）
+    const cameraChanged = this.controls.update();
+    const now = performance.now();
+    // 暂停且相机静止时把渲染降到约 20fps：舞台页常常同时挂着多个预览，空闲常渲很吃 GPU
+    if (!this.playing && !cameraChanged && !this.renderRequested && now - this.lastRenderAt < 50) return;
+    this.renderRequested = false;
+    this.lastRenderAt = now;
+
     this.updateSelectionRing();
     this.renderer.render(this.scene, this.camera);
-    if (this.playing && performance.now() - this.lastEmit > 60) this.emit(false);
+    if (this.playing && now - this.lastEmit > 60) this.emit(false);
   }
 
   private apply(time: number): void {
+    // 时间轴求值属于显式改动：请求立即重绘
+    this.renderRequested = true;
     for (const runtime of this.runtimes.values()) {
       if (!runtime.actor.ready || runtime.plan.timings.length === 0) continue;
       const slots = resolveTimeline(runtime.plan, time);

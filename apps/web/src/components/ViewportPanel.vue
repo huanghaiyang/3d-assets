@@ -99,7 +99,13 @@ async function loadAsset(target: Asset | null): Promise<void> {
   }
 }
 
-const viewKey = computed(() => (asset.value ? `${asset.value.id}:${asset.value.files.length}` : null));
+// 素材切换 / 文件集合变化 / 文件被改写（批量修正中心点或朝向）后都要重新加载：
+// 改写后的 URL 带 ?v= 版本号，把它并入 key 才能触发重载
+const viewKey = computed(() => {
+  if (!asset.value) return null;
+  const primary = asset.value.files[0]?.primaryUrl ?? '';
+  return `${asset.value.id}:${asset.value.files.length}:${primary}`;
+});
 
 watch(viewKey, () => void loadAsset(asset.value));
 watch(
@@ -145,7 +151,7 @@ function retry(): void {
 }
 
 /**
- * 自动绑骨：模板骨架按模型高度拟合，胶囊距离蒙皮。
+ * 自动绑骨：从网格几何测量躯干/手臂/腿部走向后拟合骨架，胶囊距离蒙皮。
  * 先弹确认（提示适用条件），确认后分块计算并通过 rigProgress 更新进度条。
  */
 async function autoRig(): Promise<void> {
@@ -153,10 +159,10 @@ async function autoRig(): Promise<void> {
   if (!instance || rigging.value || !stats.value) return;
   const confirmed = await confirmAction({
     title: '自动绑骨（实验）',
-    message: '将按 T-pose 人形比例自动拟合 19 根骨骼并计算蒙皮权重。',
+    message: '将按模型的实际几何走向自适应拟合 19 根骨骼并计算蒙皮权重。',
     detail:
-      '适用于四肢水平伸展（T 字）的人形模型；A-pose / 非人形模型绑骨效果较差。' +
-      '绑定不改变当前外观，可导出 GLB；切换素材后失效。',
+      '适用于站立人形模型，T-pose / A-pose / 手臂自然下垂都可以；' +
+      '仍要求左右对称、脚底贴地。绑定不改变当前外观，可导出 GLB；切换素材后失效。',
     confirmText: '开始绑定',
     danger: false,
   });
@@ -174,10 +180,17 @@ async function autoRig(): Promise<void> {
     orientationCorrected.value = instance.isOrientationCorrected;
     // 骨骼已进场景，刷新节点树
     store.setNodeTree(instance.sceneNodes);
+    // 几何测量失败的部分会回退到模板比例，这里如实告知用户，便于判断绑骨质量
+    const fallbackParts = [
+      result.fit.torso ? '' : '躯干',
+      result.fit.arms ? '' : '手臂',
+      result.fit.legs ? '' : '腿部',
+    ].filter(Boolean);
     store.toast(
       'success',
       `绑骨完成：${result.bones} 根骨骼 · ${result.vertices.toLocaleString('en-US')} 个顶点` +
-        (result.orientation.note ? ` · ${result.orientation.note}` : ''),
+        (result.orientation.note ? ` · ${result.orientation.note}` : '') +
+        (fallbackParts.length > 0 ? ` · ${fallbackParts.join('/')}回退模板比例` : ''),
     );
   } catch (err) {
     store.toast('error', err instanceof Error ? err.message : '自动绑骨失败');
@@ -296,7 +309,7 @@ async function exportRigged(): Promise<void> {
           v-if="!hasSkeleton"
           class="tool"
           type="button"
-          title="自动绑骨（T-pose 人形，实验）"
+          title="自动绑骨（自适应站姿，实验）"
           :disabled="rigging"
           @click="autoRig"
         >

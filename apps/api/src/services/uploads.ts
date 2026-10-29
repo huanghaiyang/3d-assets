@@ -34,6 +34,8 @@ export interface StagedFile {
   name: string;
   size: number;
   ext: string;
+  /** 本地来源绝对路径（仅「扫描文件夹导入」会带，用于重复扫描去重） */
+  sourcePath?: string;
 }
 
 export interface UploadGroup {
@@ -193,14 +195,18 @@ export async function discardBatch(batchId: string): Promise<void> {
   await fs.rm(stagingDirFor(batchId), { recursive: true, force: true });
 }
 
-async function createAssetFromGroup(workspace: Workspace, group: UploadGroup): Promise<Job> {
+async function createAssetFromGroup(
+  workspace: Workspace,
+  group: UploadGroup,
+  persist = true,
+): Promise<Job> {
   const assetId = newId('u');
   const assetDir = path.join(storageDir, assetId);
   await fs.rm(assetDir, { recursive: true, force: true });
   await fs.mkdir(assetDir, { recursive: true });
 
   try {
-    return await buildAsset(workspace, group, assetId, assetDir);
+    return await buildAsset(workspace, group, assetId, assetDir, persist);
   } catch (err) {
     // 中途失败时清掉半成品目录，避免残留空目录或残缺文件
     await fs.rm(assetDir, { recursive: true, force: true });
@@ -208,11 +214,48 @@ async function createAssetFromGroup(workspace: Workspace, group: UploadGroup): P
   }
 }
 
+/**
+ * 把一个本地磁盘上的独立模型文件导入素材库（「扫描文件夹」批量导入的底层实现）。
+ *
+ * 与浏览器上传的区别：文件已经在磁盘上，直接按路径读取并复制到素材存储目录，
+ * 不需要经过暂存区。`persist=false` 时只落盘文件与返回 Job，由调用方批量写状态，
+ * 避免一次扫描几百个模型时把 state.json 写几百遍。
+ *
+ * @param filePath 磁盘上的模型绝对路径（只读取，不修改源文件）
+ * @param sourcePath 写入 Asset.sourcePath 的值，用于重复扫描去重
+ */
+export async function importLocalModel(
+  workspace: Workspace,
+  filePath: string,
+  sourcePath: string,
+  persist = true,
+): Promise<Job> {
+  const stat = await fs.stat(filePath);
+  if (!stat.isFile()) throw new UploadError('路径不是文件');
+  if (stat.size <= 0) throw new UploadError('文件为空');
+  if (stat.size > MAX_UPLOAD_BYTES) {
+    throw new UploadError(`超过单文件上限 ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)}MB`);
+  }
+  const name = path.basename(filePath);
+  const group: UploadGroup = {
+    primary: {
+      filePath,
+      name,
+      size: stat.size,
+      ext: extensionOf(name),
+      sourcePath,
+    },
+    companions: [],
+  };
+  return createAssetFromGroup(workspace, group, persist);
+}
+
 async function buildAsset(
   workspace: Workspace,
   group: UploadGroup,
   assetId: string,
   assetDir: string,
+  persist = true,
 ): Promise<Job> {
   const entries: AssetFileEntry[] = [];
   let bytes = 0;
@@ -305,6 +348,8 @@ async function buildAsset(
     creditConsumed: null,
     creditDetails: null,
     bytes,
+    // 扫描文件夹导入时记录来源路径，重复扫描可以据此跳过
+    ...(group.primary.sourcePath ? { sourcePath: group.primary.sourcePath } : {}),
   };
 
   const job: Job = {
@@ -338,10 +383,12 @@ async function buildAsset(
     asset,
   };
 
-  await workspace.mutate((state) => {
-    state.jobs.unshift(job);
-  });
-  log.info(`已上传素材 ${assetId} (${fileName}, ${entries.length} 个文件)`);
+  if (persist) {
+    await workspace.mutate((state) => {
+      state.jobs.unshift(job);
+    });
+  }
+  log.info(`已导入素材 ${assetId} (${fileName}, ${entries.length} 个文件)`);
   return job;
 }
 

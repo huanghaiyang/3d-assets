@@ -2,11 +2,12 @@
 import { computed, nextTick, ref, watch } from 'vue';
 import Icon from './ui/Icon.vue';
 import { downloadUrl } from '@/api/client';
+import FolderPicker from './animation/FolderPicker.vue';
 import { useWorkspaceStore, isActive } from '@/stores/workspace';
 import { useNow } from '@/composables/useNow';
 import { confirmAction } from '@/composables/useConfirm';
 import { formatDuration } from '@/utils/image';
-import type { Job } from '@/api/types';
+import type { FolderScanResponse, Job, PivotMode } from '@/api/types';
 
 const store = useWorkspaceStore();
 const now = useNow(1000);
@@ -223,6 +224,122 @@ const uploadProgress = computed(() => {
   }, 0);
   return Math.round(total / queue.length);
 });
+
+// ===== 扫描文件夹导入：服务端直接读磁盘，一次导入整个目录的 .glb =====
+const SCAN_DIR_KEY = 'h3d.library.scanDir.v1';
+const scanOpen = ref(false);
+const scanDir = ref('');
+const scanRecursive = ref(true);
+const scanResult = ref<FolderScanResponse | null>(null);
+/** 应用内「选择文件夹」对话框是否打开 */
+const picking = ref(false);
+
+// 记住上次扫描过的路径：重复导入同一个素材目录时不用重新输入
+try {
+  scanDir.value = localStorage.getItem(SCAN_DIR_KEY) ?? '';
+} catch {
+  /* 隐私模式下 localStorage 不可用，忽略即可 */
+}
+
+function toggleScan(): void {
+  scanOpen.value = !scanOpen.value;
+  if (scanOpen.value) scanResult.value = null;
+}
+
+async function runScan(): Promise<void> {
+  const dir = scanDir.value.trim();
+  if (!dir) {
+    store.toast('error', '请选择要扫描的文件夹');
+    return;
+  }
+  const result = await store.scanFolder(dir, scanRecursive.value);
+  if (!result) return;
+  scanResult.value = result;
+  try {
+    localStorage.setItem(SCAN_DIR_KEY, dir);
+  } catch {
+    /* 忽略写入失败 */
+  }
+}
+
+/**
+ * 打开应用内已有的「选择文件夹」对话框（与动画工作区共用 FolderPicker 组件），
+ * 选中后把绝对路径回填到扫描输入框。
+ *
+ * 不用系统文件对话框：浏览器弹窗在本地服务进程里异步等待，容易「点了没反应」，
+ * 而应用内对话框走普通的 /api/anim/browse 接口，交互与动画工作区完全一致。
+ */
+function openScanPicker(): void {
+  picking.value = true;
+}
+
+function onScanDirPicked(dir: string): void {
+  picking.value = false;
+  if (!dir) return;
+  scanDir.value = dir;
+  scanResult.value = null;
+  try {
+    localStorage.setItem(SCAN_DIR_KEY, dir);
+  } catch {
+    /* 忽略写入失败 */
+  }
+}
+
+// ===== 多选 + 批量修正（中心点 / 朝向）=====
+const selecting = ref(false);
+const selectedIds = ref<Set<string>>(new Set());
+const pivotMode = ref<PivotMode>('none');
+/** 朝向：auto 自动纠正；'0' 不改朝向；其余为额外旋转角度（90 的倍数，叠加在自动结果上） */
+const yawMode = ref<'auto' | '0' | '90' | '-90' | '180'>('auto');
+
+const selectedCount = computed(() => selectedIds.value.size);
+/** 没有任何实际动作（保持轴心 + 不转朝向）时禁用「应用」 */
+const transformDisabled = computed(
+  () => selectedCount.value === 0 || store.transforming || (pivotMode.value === 'none' && yawMode.value === '0'),
+);
+
+function toggleSelecting(): void {
+  selecting.value = !selecting.value;
+  if (!selecting.value) selectedIds.value = new Set();
+}
+
+function toggleSelected(id: string): void {
+  const next = new Set(selectedIds.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  selectedIds.value = next;
+}
+
+/** 只选中当前页，避免翻页时误把其它页的素材一起处理 */
+function selectCurrentPage(): void {
+  selectedIds.value = new Set(pagedJobs.value.map((job) => job.id));
+}
+
+function clearSelection(): void {
+  selectedIds.value = new Set();
+}
+
+function onCardClick(job: Job): void {
+  // 多选模式下点卡片是勾选，不切换视口
+  if (selecting.value) {
+    toggleSelected(job.id);
+    return;
+  }
+  store.select(job.id);
+}
+
+async function applyTransform(): Promise<void> {
+  const ids = [...selectedIds.value];
+  if (ids.length === 0) return;
+  const yaw: 'auto' | number = yawMode.value === 'auto' ? 'auto' : Number(yawMode.value);
+  const result = await store.batchTransform(ids, pivotMode.value, yaw);
+  if (!result) return;
+  // 成功的已刷新；失败 / 跳过的保留选中状态，方便单独处理
+  const failedIds = new Set(result.skipped.map((item) => item.id));
+  selectedIds.value = new Set(ids.filter((id) => failedIds.has(id)));
+  if (selectedIds.value.size === 0 && result.transformed.length > 0) selecting.value = false;
+}
+
 </script>
 
 <template>
@@ -253,6 +370,15 @@ const uploadProgress = computed(() => {
         >
           <Icon name="image" :size="12" />
           补全缩略图 {{ store.thumbnailsMissing.length }}
+        </button>
+        <button
+          class="btn scan-btn"
+          type="button"
+          title="扫描本地文件夹，一次导入其中所有 .glb"
+          @click="toggleScan"
+        >
+          <Icon name="folder" :size="12" />
+          扫描
         </button>
         <button
           class="btn upload-btn"
@@ -296,6 +422,108 @@ const uploadProgress = computed(() => {
     </div>
 
     <div class="list">
+      <!-- 扫描文件夹导入：服务端直接读磁盘，一次导入整个目录的 GLB -->
+      <div v-if="scanOpen" class="scan-panel">
+        <div class="upload-head">
+          <span class="section-title">
+            <Icon name="folder" :size="12" />
+            扫描文件夹导入 GLB
+          </span>
+          <button class="mini" type="button" title="收起" @click="toggleScan">
+            <Icon name="close" :size="11" />
+          </button>
+        </div>
+        <div class="scan-row">
+          <input
+            v-model="scanDir"
+            class="scan-input"
+            type="text"
+            spellcheck="false"
+            placeholder="选择或填写文件夹绝对路径，例如 D:\models\characters"
+            @keydown.enter="runScan"
+          />
+          <button
+            class="btn scan-pick"
+            type="button"
+            :disabled="store.scanning"
+            title="打开应用内的文件夹选择器，浏览并选中要扫描的目录"
+            @click="openScanPicker"
+          >
+            <Icon name="folder" :size="12" />
+            选择…
+          </button>
+        </div>
+        <label class="scan-option">
+          <input v-model="scanRecursive" type="checkbox" />
+          递归子目录
+        </label>
+        <button class="btn scan-run" type="button" :disabled="store.scanning" @click="runScan">
+          <Icon :name="store.scanning ? 'refresh' : 'search'" :size="12" :class="{ spin: store.scanning }" />
+          {{ store.scanning ? '扫描中…' : '开始扫描并导入' }}
+        </button>
+        <p class="scan-hint">
+          只导入 .glb；同一路径重复扫描会自动跳过已导入的模型，单次最多 500 个。
+          「选择…」打开应用内的文件夹选择器，可直接浏览磁盘目录。
+        </p>
+        <div v-if="scanResult" class="scan-result">
+          <p class="mono" :title="scanResult.folder">{{ scanResult.folder }}</p>
+          <p>
+            发现 {{ scanResult.scanned }} 个 · 导入 {{ scanResult.created.length }} · 跳过
+            {{ scanResult.skipped }} · 失败 {{ scanResult.failed.length }}
+            <template v-if="scanResult.overflow > 0"> · 超上限 {{ scanResult.overflow }}</template>
+          </p>
+          <ul v-if="scanResult.failed.length > 0" class="scan-failed">
+            <li v-for="item in scanResult.failed.slice(0, 5)" :key="item.path" :title="item.path">
+              {{ item.name }}：{{ item.error }}
+            </li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- 批量修正中心点 / 朝向（多选） -->
+      <div class="batch-bar" :class="{ active: selecting }">
+        <div class="batch-head">
+          <button class="mini batch-toggle" :class="{ on: selecting }" type="button" @click="toggleSelecting">
+            <Icon :name="selecting ? 'check' : 'grid'" :size="11" />
+            {{ selecting ? '退出多选' : '批量修正' }}
+          </button>
+          <template v-if="selecting">
+            <span class="batch-count">已选 {{ selectedCount }}</span>
+            <button class="mini" type="button" title="选中当前页全部素材" @click="selectCurrentPage">全选本页</button>
+            <button class="mini" type="button" title="清空选择" @click="clearSelection">清空</button>
+          </template>
+        </div>
+        <template v-if="selecting">
+          <div class="batch-controls">
+            <label class="batch-field">
+              <span>中心点</span>
+              <select v-model="pivotMode" class="batch-select">
+                <option value="none">保持不动</option>
+                <option value="center">包围盒中心</option>
+                <option value="bottom">底部中心（贴地）</option>
+              </select>
+            </label>
+            <label class="batch-field">
+              <span>朝向</span>
+              <select v-model="yawMode" class="batch-select">
+                <option value="auto">自动纠正</option>
+                <option value="0">不修改</option>
+                <option value="90">+90°</option>
+                <option value="-90">-90°</option>
+                <option value="180">180°</option>
+              </select>
+            </label>
+          </div>
+          <button class="btn batch-apply" type="button" :disabled="transformDisabled" @click="applyTransform">
+            <Icon :name="store.transforming ? 'refresh' : 'rotate'" :size="12" :class="{ spin: store.transforming }" />
+            {{ store.transforming ? '处理中…' : `应用到 ${selectedCount} 个模型` }}
+          </button>
+          <p class="batch-hint">
+            直接改写模型文件（只调整根节点变换，不破坏骨骼与材质）；完成后会自动重渲染封面。
+          </p>
+        </template>
+      </div>
+
       <!-- 上传进度 -->
       <div v-if="store.uploadQueue.length > 0" class="upload-panel">
         <div class="upload-head">
@@ -358,8 +586,12 @@ const uploadProgress = computed(() => {
         v-for="job in pagedJobs"
         :key="job.id"
         class="card"
-        :class="{ selected: store.selectedId === job.id }"
-        @click="store.select(job.id)"
+        :class="{
+          selected: store.selectedId === job.id,
+          picking: selecting,
+          picked: selectedIds.has(job.id),
+        }"
+        @click="onCardClick(job)"
       >
         <div class="thumb-wrap">
           <img v-if="thumbnailOf(job)" class="thumb" :src="thumbnailOf(job)!" :alt="job.name" loading="lazy" />
@@ -369,6 +601,11 @@ const uploadProgress = computed(() => {
               :size="20"
             />
           </div>
+
+          <!-- 多选勾选标记（点卡片任意位置都能切换） -->
+          <span v-if="selecting" class="pick" :class="{ on: selectedIds.has(job.id) }">
+            <Icon v-if="selectedIds.has(job.id)" name="check" :size="10" />
+          </span>
 
           <span v-if="job.origin === 'uploaded'" class="badge badge-upload">
             <Icon name="upload" :size="10" />
@@ -440,6 +677,10 @@ const uploadProgress = computed(() => {
               <Icon name="layers" :size="12" />
             </button>
           </template>
+          <!-- 显式重命名入口：双击名称同样可以改名 -->
+          <button class="mini" type="button" title="重命名" @click.stop="startRename(job)">
+            <Icon name="edit" :size="12" />
+          </button>
           <button
             v-if="job.origin !== 'uploaded'"
             class="mini"
@@ -502,6 +743,16 @@ const uploadProgress = computed(() => {
       </p>
       <p class="drop-hint faint">{{ store.uploadInfo.hint }}</p>
     </div>
+
+    <!-- 应用内文件夹选择器（与动画工作区共用同一个组件，这里统计 .glb 数量） -->
+    <FolderPicker
+      :open="picking"
+      :start-dir="scanDir"
+      title="选择要扫描的文件夹"
+      ext="glb"
+      @close="picking = false"
+      @pick="onScanDirPicked"
+    />
   </aside>
 </template>
 
@@ -558,6 +809,199 @@ const uploadProgress = computed(() => {
 .upload-btn:hover:not(:disabled) {
   background: rgba(124, 92, 255, 0.26);
   border-color: transparent;
+}
+
+.scan-btn {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* ===== 扫描文件夹导入 ===== */
+.scan-panel {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel-2);
+}
+
+/* 路径输入框与「选择…」按钮同一行 */
+.scan-row {
+  display: flex;
+  gap: 6px;
+}
+
+.scan-row .scan-input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 调起系统文件夹选择窗口 */
+.scan-pick {
+  flex: none;
+  height: 26px;
+  padding: 0 8px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.scan-input {
+  height: 26px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-app);
+  color: var(--text);
+  font-size: 11px;
+  outline: none;
+}
+
+.scan-input:focus {
+  border-color: var(--accent);
+}
+
+.scan-option {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+.scan-run {
+  height: 26px;
+  font-size: 11.5px;
+}
+
+.scan-hint {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text-faint);
+}
+
+.scan-result {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 5px 6px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.scan-result p {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scan-failed {
+  margin: 0;
+  padding-left: 14px;
+  color: var(--danger);
+}
+
+.scan-failed li {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ===== 批量修正中心点 / 朝向 ===== */
+.batch-bar {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel-2);
+}
+
+.batch-bar.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.batch-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.batch-head .mini {
+  flex: none;
+  width: auto;
+  padding: 0 6px;
+  gap: 3px;
+}
+
+.batch-toggle.on {
+  border-color: var(--accent);
+  background: transparent;
+  color: var(--accent-hover);
+}
+
+.batch-count {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.batch-controls {
+  display: flex;
+  gap: 6px;
+}
+
+.batch-field {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+.batch-select {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  padding: 0 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  color: var(--text);
+  font-size: 10.5px;
+}
+
+.batch-apply {
+  height: 24px;
+  font-size: 11px;
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent-hover);
+}
+
+.batch-apply:hover:not(:disabled) {
+  background: rgba(124, 92, 255, 0.26);
+}
+
+.batch-hint {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text-faint);
 }
 
 .file-input {
@@ -885,6 +1329,33 @@ const uploadProgress = computed(() => {
 .card.selected {
   border-color: var(--accent);
   background: var(--accent-soft);
+}
+
+/* 多选模式：点卡片即勾选 */
+.card.picked {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.pick {
+  position: absolute;
+  right: 4px;
+  top: 4px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255, 255, 255, 0.55);
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+}
+
+.pick.on {
+  border-color: var(--accent);
+  background: var(--accent);
 }
 
 .thumb-wrap {

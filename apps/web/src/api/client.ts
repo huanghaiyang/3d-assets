@@ -1,7 +1,10 @@
 import type {
+  BatchTransformResponse,
   CommitUploadResponse,
   CreateJobBody,
+  FolderScanResponse,
   Job,
+  PivotMode,
   ProviderId,
   ProviderSummary,
   SettingsSummary,
@@ -136,6 +139,26 @@ export const api = {
     }),
   abortUpload: (batchId: string) =>
     request<{ ok: boolean }>(`/api/library/staging/${encodeURIComponent(batchId)}`, { method: 'DELETE' }),
+
+  /**
+   * 扫描本地文件夹并一次性导入其中所有 .glb（服务端直接读磁盘，不经浏览器上传）。
+   * dir 必须是绝对路径；recursive 默认 true。
+   */
+  scanGlbFolder: (dir: string, recursive = true) =>
+    request<FolderScanResponse>('/api/library/scan-glb', {
+      method: 'POST',
+      body: JSON.stringify({ dir, recursive }),
+    }),
+
+  /**
+   * 批量修正素材的中心点与朝向（服务端就地改写 GLB / glTF 的根节点矩阵）。
+   * yaw='auto' 按几何自动检测；数字表示额外旋转角度（90 的倍数）。
+   */
+  batchTransform: (ids: string[], pivot: PivotMode, yaw: 'auto' | number) =>
+    request<BatchTransformResponse>('/api/library/transform', {
+      method: 'POST',
+      body: JSON.stringify({ ids, pivot, yaw }),
+    }),
 };
 
 function uploadWithProgress(

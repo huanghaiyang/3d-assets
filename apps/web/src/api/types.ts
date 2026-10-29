@@ -109,6 +109,8 @@ export interface Asset {
   creditConsumed: number | null;
   creditDetails: string | null;
   bytes: number;
+  /** 仅「扫描文件夹导入」写入：本地来源绝对路径（重复扫描去重用） */
+  sourcePath?: string;
 }
 
 export interface Job {
@@ -203,4 +205,41 @@ export interface CommitUploadResponse {
   ok: boolean;
   created: Job[];
   warnings: string[];
+}
+
+/** 轴心处理方式：none 保持原地、center 包围盒中心归零、bottom 底部中心归零 */
+export type PivotMode = 'none' | 'center' | 'bottom';
+
+/** 扫描本地文件夹导入（POST /api/library/scan-glb）的返回 */
+export interface FolderScanResponse {
+  ok: boolean;
+  /** 单次扫描的文件数量上限 */
+  limit: number;
+  /** 规范化后的扫描根目录 */
+  folder: string;
+  /** 扫描到的 .glb 总数（含跳过 / 失败的） */
+  scanned: number;
+  created: Job[];
+  /** 已导入过（同一来源路径）而跳过的文件数 */
+  skipped: number;
+  failed: Array<{ name: string; path: string; error: string }>;
+  /** 超过单次上限、未处理的文件数 */
+  overflow: number;
+}
+
+/** 批量修正中心点 / 朝向（POST /api/library/transform）的返回 */
+export interface BatchTransformResponse {
+  ok: boolean;
+  transformed: Array<{
+    id: string;
+    name: string;
+    /** 实际施加的绕 Y 旋转角度（度） */
+    yawDeg: number;
+    pivot: PivotMode;
+    /** 变换前模型的世界包围盒尺寸 */
+    size: [number, number, number];
+    /** 是否真正改写了文件；false 表示本来就是目标状态，无需重建封面 */
+    changed: boolean;
+  }>;
+  skipped: Array<{ id: string; name: string; reason: string }>;
 }

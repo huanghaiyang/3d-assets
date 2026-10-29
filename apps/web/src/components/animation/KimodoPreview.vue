@@ -57,6 +57,15 @@ let lastTime = 0;
 let clock = 0;
 const FPS = 30;
 
+/**
+ * 是否有待绘制的改动。
+ * 暂停且没有任何交互时不再跑 rAF 渲染：这个预览在抽屉里，常常是"开着看一会儿就停"，
+ * 空闲时持续 60fps 重绘会明显拖慢页面里其它 3D 预览。
+ */
+let needsRender = true;
+/** 组件已卸载：rAF 回调里提前退出，避免操作已释放的 renderer */
+let destroyed = false;
+
 // 相机轨道参数（鼠标拖拽旋转、滚轮缩放）
 let yaw = 0.35;
 let pitch = 0.18;
@@ -164,29 +173,52 @@ function fitCamera(): void {
   const fitted = (maxDim / (2 * Math.tan(halfFov))) * 1.25;
   cameraTarget.set(center.x, center.y, center.z);
   distance = Math.min(9, Math.max(2.2, fitted));
+  requestRender();
 }
 
 function loop(now: number): void {
-  rafId = requestAnimationFrame(loop);
-  const delta = lastTime ? (now - lastTime) / 1000 : 0;
+  rafId = 0;
+  if (destroyed) return;
+
+  const delta = lastTime ? Math.min(0.1, (now - lastTime) / 1000) : 0;
   lastTime = now;
+
   if (playing.value && totalFrames.value > 0) {
     clock += delta;
     const index = Math.floor(clock * FPS) % totalFrames.value;
     if (index !== frame.value) {
       frame.value = index;
       applyFrame(index);
+      needsRender = true;
     }
   }
 
-  if (!renderer || !scene || !camera) return;
-  camera.position.set(
-    cameraTarget.x + distance * Math.sin(yaw) * Math.cos(pitch),
-    cameraTarget.y + distance * Math.sin(pitch),
-    cameraTarget.z + distance * Math.cos(yaw) * Math.cos(pitch),
-  );
-  camera.lookAt(cameraTarget);
-  renderer.render(scene, camera);
+  // 抽屉收起时容器宽度为 0：画面看不见，不做绘制，也不再排下一帧
+  const visible = (container.value?.clientWidth ?? 0) > 0;
+
+  if (needsRender && visible && renderer && scene && camera) {
+    needsRender = false;
+    camera.position.set(
+      cameraTarget.x + distance * Math.sin(yaw) * Math.cos(pitch),
+      cameraTarget.y + distance * Math.sin(pitch),
+      cameraTarget.z + distance * Math.cos(yaw) * Math.cos(pitch),
+    );
+    camera.lookAt(cameraTarget);
+    renderer.render(scene, camera);
+  }
+
+  if (playing.value && visible) {
+    rafId = requestAnimationFrame(loop);
+  } else {
+    // 暂停（或隐藏）后清掉时间基准：下次播放的第一帧不会把停留时长算进 delta
+    lastTime = 0;
+  }
+}
+
+/** 请求绘制一帧；已经在排队时不会重复调度 */
+function requestRender(): void {
+  needsRender = true;
+  if (!rafId && !destroyed) rafId = requestAnimationFrame(loop);
 }
 
 function setupScene(): void {
@@ -220,6 +252,8 @@ function setupScene(): void {
     pitch = Math.max(-1.2, Math.min(1.2, pitch + (event.clientY - lastY) * 0.01));
     lastX = event.clientX;
     lastY = event.clientY;
+    // 暂停状态下拖动视角也要重绘
+    requestRender();
   });
   canvas.addEventListener('pointerup', (event) => {
     dragging = false;
@@ -228,6 +262,7 @@ function setupScene(): void {
   canvas.addEventListener('wheel', (event) => {
     event.preventDefault();
     distance = Math.max(1.2, Math.min(9, distance + Math.sign(event.deltaY) * 0.3));
+    requestRender();
   }, { passive: false });
 }
 
@@ -248,6 +283,7 @@ function resize(): void {
   renderer.setSize(width, height);
   camera.aspect = width / height;
   camera.updateProjectionMatrix();
+  requestRender();
 }
 
 /** 移除上一次的骨架（生成中/切换任务时先清空，避免旧动作留在画面里） */
@@ -270,6 +306,8 @@ function clearRig(): void {
   totalFrames.value = 0;
   frame.value = 0;
   clock = 0;
+  // 清空后画面也要重绘（否则上一帧的骨架会留在 canvas 上）
+  requestRender();
 }
 
 async function load(): Promise<void> {
@@ -286,6 +324,7 @@ async function load(): Promise<void> {
       fitCamera();
     }
     applyFrame(0);
+    requestRender();
     return;
   }
   if (!props.animationId || !props.skeleton) return;
@@ -315,8 +354,10 @@ async function load(): Promise<void> {
       fitCamera();
     }
     applyFrame(0);
+    requestRender();
   } catch (err) {
     error.value = (err as Error).message;
+    requestRender();
   } finally {
     loading.value = false;
   }
@@ -325,6 +366,11 @@ async function load(): Promise<void> {
 watch(() => props.animationId, load);
 // 中间产物面板切换产物时直接换数据源
 watch(() => [props.rootData, props.rotationData], () => void load());
+// 播放/暂停切换：重置时间基准并立即重绘一次（暂停后不再有持续渲染）
+watch(playing, () => {
+  lastTime = 0;
+  requestRender();
+});
 watch(() => props.skeleton, (value) => {
   if (value) void load();
 });
@@ -364,11 +410,14 @@ onMounted(() => {
     });
     resizeObserver.observe(container.value);
   }
-  rafId = requestAnimationFrame(loop);
+  // 按需渲染：只有播放中或画面变化时才排 rAF，空闲时完全不占 CPU/GPU
+  requestRender();
 });
 
 onBeforeUnmount(() => {
-  cancelAnimationFrame(rafId);
+  destroyed = true;
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = 0;
   window.removeEventListener('resize', resize);
   resizeObserver?.disconnect();
   resizeObserver = null;
@@ -385,6 +434,7 @@ function scrub(value: number): void {
   frame.value = value;
   clock = value / FPS;
   applyFrame(value);
+  requestRender();
 }
 </script>
 
