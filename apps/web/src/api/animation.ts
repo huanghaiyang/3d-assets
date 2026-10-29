@@ -23,24 +23,6 @@ export interface AnimationListResponse {
   missing: string[];
 }
 
-export interface AnimationDirEntry {
-  name: string;
-  path: string;
-  /** 该子目录里目标扩展名的文件数（默认统计 .fbx，浏览 GLB 时统计 .glb） */
-  fileCount: number;
-  hidden: boolean;
-}
-
-export interface AnimationBrowseResponse {
-  dir: string;
-  parent: string | null;
-  dirs: AnimationDirEntry[];
-  /** 当前目录下目标扩展名的文件数 */
-  fileCount: number;
-  /** 本次浏览统计的扩展名（不含点，例如 fbx / glb） */
-  extension: string;
-}
-
 export interface AnimationInfoResponse {
   defaultDir: string;
   parent: string;
@@ -163,17 +145,6 @@ export const animationApi = {
   /** 保存文件夹列表（服务端持久化，只做校验，不写目标目录） */
   saveDirs: (dirs: string[]) =>
     request<AnimationDirsResponse>('/api/anim/dirs', { method: 'PUT', body: JSON.stringify({ dirs }) }),
-
-  /**
-   * 浏览子目录，用于应用内的「选择文件夹」对话框（同一个组件也被素材库扫描复用）。
-   * @param dir 起始目录，缺省时用动画文件夹列表的第一项
-   * @param ext 统计的扩展名（不含点），默认 fbx；素材库扫描 GLB 时传 glb
-   */
-  browse: (dir?: string, ext = 'fbx') => {
-    const params = new URLSearchParams({ ext });
-    if (dir) params.set('dir', dir);
-    return request<AnimationBrowseResponse>(`/api/anim/browse?${params.toString()}`);
-  },
 
   // ===== 新建动画 / 拼接动画（内置白模 + 导入/烘焙的动画数据） =====
 

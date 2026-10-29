@@ -155,6 +155,12 @@ export interface Asset {
   creditDetails: string | null;
   bytes: number;
   /**
+   * 主模型文件（GLB 或 zip 解包后的主模型）的 SHA-256 小写十六进制摘要。
+   * 用于跨路径、跨方式（扫描文件夹 / 直接上传）的内容级去重：相同内容只导入一次。
+   * 历史素材（加字段前创建的）没有这个值，去重时会退回到 bytes + sourcePath。
+   */
+  checksum?: string;
+  /**
    * 素材的本地来源绝对路径（仅「扫描文件夹导入」写入）。
    * 用于重复扫描时去重：同一路径的 GLB 不会重复入库。
    */

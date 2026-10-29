@@ -9,6 +9,7 @@ import { createLogger } from './lib/logger.js';
 import { registerApiRoutes } from './routes/api.js';
 import { registerAnimationRoutes } from './routes/animation.js';
 import { registerFileRoutes } from './routes/files.js';
+import { registerFsRoutes } from './routes/fs.js';
 import { registerKimodoRoutes } from './routes/kimodo.js';
 import { registerLibraryRoutes } from './routes/library.js';
 import { registerMcpRoutes } from './routes/mcp.js';
@@ -105,6 +106,7 @@ export async function buildApp(): Promise<AppContext> {
     },
   });
   await app.register(registerFileRoutes);
+  await app.register(registerFsRoutes);
   await app.register(registerKimodoRoutes);
   await app.register(registerStageRoutes);
   await app.register(registerMcpRoutes);

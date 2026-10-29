@@ -109,6 +109,8 @@ export interface Asset {
   creditConsumed: number | null;
   creditDetails: string | null;
   bytes: number;
+  /** 主模型文件的 SHA-256 摘要，用于内容级去重（跨路径 / 跨导入方式识别同文件） */
+  checksum?: string;
   /** 仅「扫描文件夹导入」写入：本地来源绝对路径（重复扫描去重用） */
   sourcePath?: string;
 }
@@ -220,8 +222,12 @@ export interface FolderScanResponse {
   /** 扫描到的 .glb 总数（含跳过 / 失败的） */
   scanned: number;
   created: Job[];
-  /** 已导入过（同一来源路径）而跳过的文件数 */
+  /** 跳过总数（= skippedByPath + skippedByContent） */
   skipped: number;
+  /** 来源路径已导入过（路径级去重） */
+  skippedByPath?: number;
+  /** 主模型文件的 SHA-256 已存在（内容级去重） */
+  skippedByContent?: number;
   failed: Array<{ name: string; path: string; error: string }>;
   /** 超过单次上限、未处理的文件数 */
   overflow: number;

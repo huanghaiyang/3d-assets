@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import AdmZip from 'adm-zip';
+import crypto from 'node:crypto';
 import { extensionOf, newId, safeFileName } from '../lib/ids.js';
 import { createLogger } from '../lib/logger.js';
 import { storageDir, uploadsStagingDir } from '../lib/paths.js';
@@ -36,6 +37,12 @@ export interface StagedFile {
   ext: string;
   /** 本地来源绝对路径（仅「扫描文件夹导入」会带，用于重复扫描去重） */
   sourcePath?: string;
+  /**
+   * 主模型文件的 SHA-256 摘要（可选）。
+   * 扫描文件夹导入时预先算好再传进来，避免在 buildAsset 里再读一遍文件。
+   * 普通上传不传，buildAsset 会自己从 primaryBuffer 算（buffer 已在内存，无额外 I/O）。
+   */
+  checksum?: string;
 }
 
 export interface UploadGroup {
@@ -223,12 +230,15 @@ async function createAssetFromGroup(
  *
  * @param filePath 磁盘上的模型绝对路径（只读取，不修改源文件）
  * @param sourcePath 写入 Asset.sourcePath 的值，用于重复扫描去重
+ * @param precomputedChecksum 预先算好的 SHA-256（扫描文件夹导入时传入，
+ *                            避免 buildAsset 再读一遍文件）
  */
 export async function importLocalModel(
   workspace: Workspace,
   filePath: string,
   sourcePath: string,
   persist = true,
+  precomputedChecksum?: string,
 ): Promise<Job> {
   const stat = await fs.stat(filePath);
   if (!stat.isFile()) throw new UploadError('路径不是文件');
@@ -244,6 +254,7 @@ export async function importLocalModel(
       size: stat.size,
       ext: extensionOf(name),
       sourcePath,
+      checksum: precomputedChecksum,
     },
     companions: [],
   };
@@ -263,10 +274,19 @@ async function buildAsset(
   let format = group.primary.ext;
   let wasZip = false;
   let size = 0;
+  /**
+   * 主模型文件的 SHA-256 摘要：
+   * - 普通文件 = 上传的主文件 buffer（GLB/STL/FBX/...）
+   * - zip = 解包后 pickPrimary 选出来的主模型文件
+   * 历史素材（加字段前创建的）没有 checksum；buildAsset 总是算好再写进 Asset。
+   */
+  let checksum = '';
 
   const primaryBuffer = await fs.readFile(group.primary.filePath);
   size += primaryBuffer.length;
   bytes += primaryBuffer.length;
+  // 优先用调用方预计算的 checksum（扫描文件夹导入就是这种情况），否则从已在内存里的 buffer 算
+  checksum = group.primary.checksum || crypto.createHash('sha256').update(primaryBuffer).digest('hex');
 
   if (ZIP_EXT.includes(group.primary.ext)) {
     // zip：解包到 <type>/ 目录，与原接口结果的落盘方式保持一致
@@ -348,6 +368,7 @@ async function buildAsset(
     creditConsumed: null,
     creditDetails: null,
     bytes,
+    checksum,
     // 扫描文件夹导入时记录来源路径，重复扫描可以据此跳过
     ...(group.primary.sourcePath ? { sourcePath: group.primary.sourcePath } : {}),
   };

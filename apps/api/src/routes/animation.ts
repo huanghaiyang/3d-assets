@@ -352,46 +352,6 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
   });
 
   /**
-   * 浏览子目录，用于应用内的「选择文件夹」对话框。
-   * ext 指定统计的扩展名（不含点，默认 fbx）；素材库的 GLB 扫描复用本接口时传 glb。
-   */
-  app.get('/api/anim/browse', async (request, reply) => {
-    const query = request.query as { dir?: string; ext?: string };
-    // 扩展名只保留字母数字：它参与文件名后缀比较，避免奇怪字符混进来
-    const extension = (query.ext ?? 'fbx').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'fbx';
-    const matchesExt = (name: string) => path.extname(name).slice(1).toLowerCase() === extension;
-    try {
-      const fallback = (await effectiveDirs()).dirs[0] ?? path.resolve(config.animationDir);
-      const dir = query.dir?.trim() ? await resolveDir(query.dir) : await resolveDir(fallback);
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      const dirs = [];
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-        const full = path.join(dir, entry.name);
-        let fileCount = 0;
-        try {
-          const children = await fs.readdir(full, { withFileTypes: true });
-          fileCount = children.filter((child) => child.isFile() && matchesExt(child.name)).length;
-        } catch {
-          /* 权限不足时忽略 */
-        }
-        dirs.push({ name: entry.name, path: full, fileCount, hidden: entry.name.startsWith('.') });
-      }
-      dirs.sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }));
-      const parent = path.dirname(dir);
-      return {
-        dir,
-        parent: parent === dir ? null : parent,
-        dirs,
-        fileCount: entries.filter((entry) => entry.isFile() && matchesExt(entry.name)).length,
-        extension,
-      };
-    } catch (err) {
-      return reply.code(400).send({ error: `无法浏览该路径：${(err as Error).message}` });
-    }
-  });
-
-  /**
    * 读取单个 FBX 文件内容（只读、不落盘、不缓存）。
    * 整块读入内存后立即关闭句柄，因此不会锁文件。
    */

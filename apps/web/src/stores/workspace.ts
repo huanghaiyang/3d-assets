@@ -604,7 +604,12 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       const result = await api.scanGlbFolder(dir, recursive);
       const parts: string[] = [`扫描 ${result.scanned} 个 GLB`];
       parts.push(`导入 ${result.created.length} 个`);
-      if (result.skipped > 0) parts.push(`跳过 ${result.skipped} 个已导入`);
+      if (result.skipped > 0) {
+        const reasons: string[] = [];
+        if (result.skippedByPath && result.skippedByPath > 0) reasons.push(`路径重复 ${result.skippedByPath}`);
+        if (result.skippedByContent && result.skippedByContent > 0) reasons.push(`内容重复 ${result.skippedByContent}`);
+        parts.push(`跳过 ${result.skipped} 个已导入（${reasons.join(' + ')}）`);
+      }
       if (result.failed.length > 0) parts.push(`失败 ${result.failed.length} 个`);
       if (result.overflow > 0) parts.push(`超出上限 ${result.overflow} 个未处理`);
       const summary = parts.join('，');

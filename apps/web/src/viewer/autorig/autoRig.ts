@@ -14,11 +14,13 @@ import * as THREE from 'three';
  *     ±X 而不是 +Z），需要时先把它转正；
  *  2. 对网格顶点做等距采样（最多 9 万个点），从采样点云里测量：
  *       - 躯干宽度：在腰部薄层里找「以中线为中心的连续横向簇」，避免把手/腿算进来；
- *       - 手臂走向：左右两侧分别对「躯干以外的点云」做 PCA，得到真实的手臂中轴，
- *         再沿中轴取肩、肘、腕、指尖四点。T-pose 时中轴水平，A-pose 时中轴倾斜，
- *         手臂下垂时中轴接近竖直，三种站姿都能落进网格内部；
- *       - 腿部走向：按髋 / 膝 / 踝三个高度带的横向中位数得到腿骨位置；
- *       - 肢体粗细：用点到中轴的垂直距离分位数估计胶囊半径。
+ *       - 腿部走向：先测腿，踝 / 膝 / 髋三个高度带从下往上「窗口跟踪」取横向
+ *         中位数 —— 自然下垂的手掌就落在大腿两侧，直接从整带取中位数会被手带偏；
+ *       - 手臂走向：左右两侧分别对「躯干以外、且不属于同侧大腿」的点云做 PCA，
+ *         得到真实的手臂中轴，再沿中轴取肩、肘、腕、指尖四点。T-pose 时中轴水平，
+ *         A-pose 时中轴倾斜，手臂下垂时中轴接近竖直，三种站姿都能落进网格内部；
+ *       - 肢体粗细：上臂 / 前臂 / 手掌、大腿 / 小腿 / 脚掌各段分别用「点到该段
+ *         线段的垂直距离」分位数估计胶囊半径，细的那一段不会被粗的一段撑大。
  *  3. 任何一项测量失败（点太少、数值异常）时，只回退该项到模板比例，其余部位仍
  *     使用几何测量结果；
  *  4. 每根骨骼对应一到多条「胶囊」（骨骼段 + 半径），顶点权重 = 胶囊衰减
@@ -95,10 +97,18 @@ const TOE_SKEW_THRESHOLD = 1.15;
 const MAX_FIT_SAMPLES = 90_000;
 /** 朝向检测最多采样的顶点数（脚部薄层只需要统计范围，不需要全量顶点） */
 const MAX_ORIENTATION_SAMPLES = 150_000;
-/** 手臂 / 腿/ 躯干测量的兜底半径（相对身高） */
+/**
+ * 肢体 / 躯干测量的兜底半径（相对身高）。
+ * 上臂比前臂粗、大腿比小腿粗，所以按段各给一个兜底值，避免宁可「一样粗」
+ * 导致细的那一段胶囊覆盖过宽。
+ */
 const FALLBACK_TORSO_HALF_WIDTH = 0.115;
-const FALLBACK_ARM_RADIUS = 0.05;
-const FALLBACK_LEG_RADIUS = 0.075;
+const FALLBACK_UPPER_ARM_RADIUS = 0.05;
+const FALLBACK_FOREARM_RADIUS = 0.043;
+const FALLBACK_HAND_RADIUS = 0.03;
+const FALLBACK_THIGH_RADIUS = 0.075;
+const FALLBACK_SHIN_RADIUS = 0.06;
+const FALLBACK_FOOT_RADIUS = 0.038;
 const FALLBACK_HEAD_RADIUS = 0.08;
 
 export interface AutoRigResult {
@@ -266,6 +276,48 @@ function median(values: number[]): number {
   return quantileSorted(sorted, 0.5);
 }
 
+/**
+ * 收集「y 落在指定高度带」的点到一条线段的垂直距离（已排序）。
+ *
+ * 用来分段估计肢体粗细：上臂 / 前臂 / 大腿 / 小腿的半径差别明显，若整条肢体
+ * 共用一个平均半径，细的那一段（前臂、小腿）胶囊就会明显偏粗，把相邻躯干或
+ * 另一侧肢体的顶点也吸到自己身上。
+ */
+function segmentDistances(
+  points: number[],
+  a: THREE.Vector3,
+  b: THREE.Vector3,
+  minRatio: number,
+  maxRatio: number,
+  baseY: number,
+  height: number,
+): number[] {
+  const ab = new THREE.Vector3().subVectors(b, a);
+  const p = new THREE.Vector3();
+  const distances: number[] = [];
+  for (let i = 0; i < points.length; i += 3) {
+    const y = points[i + 1]!;
+    const ratio = (y - baseY) / height;
+    if (ratio < minRatio || ratio > maxRatio) continue;
+    p.set(points[i]!, y, points[i + 2]!);
+    distances.push(Math.sqrt(pointSegmentDistanceSq(p, a, ab)));
+  }
+  distances.sort((left, right) => left - right);
+  return distances;
+}
+
+/** 从距离样本里取分位数半径；样本不足或数值异常时用兜底值 */
+function radiusFromDistances(
+  distances: number[],
+  ratio: number,
+  minRadius: number,
+  maxRadius: number,
+  fallback: number,
+): number {
+  if (distances.length < 4) return Math.min(maxRadius, Math.max(minRadius, fallback));
+  return Math.min(maxRadius, Math.max(minRadius, quantileSorted(distances, ratio)));
+}
+
 interface TorsoMeasure {
   /** 腰部半宽（世界单位） */
   halfWidth: number;
@@ -276,34 +328,14 @@ interface TorsoMeasure {
 }
 
 /**
- * 测量躯干宽度。
+ * 从一条腰部薄片里量一次躯干半宽。
  *
- * 做法：在腰部高度带（0.45H ~ 0.62H）对 x 做直方图，从模型中线所在 bin 向两侧
- * 扩展「连续有顶点的簇」。手臂即使垂在身侧，也会因为和躯干之间存在空隙而不会
- * 被并进同一个簇，从而避免把手的宽度当成躯干宽度。
+ * 对 x 做直方图，从模型中线所在 bin 向两侧扩展「连续有顶点的簇」：手臂即使垂在
+ * 身侧，也会因为和躯干之间存在空隙而不会被并进同一个簇。
+ * 薄片点太少、或量出来的宽度明显不合理（把手臂并进来了 / 只量到一条缝）时返回 null。
  */
-function measureTorso(
-  samples: SampleCloud,
-  centerX: number,
-  defaultZ: number,
-  baseY: number,
-  height: number,
-): TorsoMeasure {
-  const lo = baseY + height * 0.45;
-  const hi = baseY + height * 0.62;
-  const xs: number[] = [];
-  const zs: number[] = [];
-  for (let i = 0; i < samples.count; i += 1) {
-    const base = i * 3;
-    const y = samples.data[base + 1]!;
-    if (y < lo || y > hi) continue;
-    xs.push(samples.data[base]!);
-    zs.push(samples.data[base + 2]!);
-  }
-  if (xs.length < 24) {
-    return { halfWidth: height * FALLBACK_TORSO_HALF_WIDTH, centerZ: defaultZ, measured: false };
-  }
-
+function sliceHalfWidth(xs: number[], centerX: number, height: number): number | null {
+  if (xs.length < 8) return null;
   let minX = Infinity;
   let maxX = -Infinity;
   for (const x of xs) {
@@ -311,7 +343,7 @@ function measureTorso(
     if (x > maxX) maxX = x;
   }
   const span = Math.max(maxX - minX, 1e-6);
-  const bins = 80;
+  const bins = 64;
   const counts = new Uint32Array(bins);
   for (const x of xs) {
     const index = Math.min(bins - 1, Math.max(0, Math.floor(((x - minX) / span) * bins)));
@@ -352,17 +384,62 @@ function measureTorso(
     }
     return edge;
   };
-  const leftBin = expand(-1);
-  const rightBin = expand(1);
   const binSize = span / bins;
-  const leftX = minX + leftBin * binSize;
-  const rightX = minX + (rightBin + 1) * binSize;
-  let halfWidth = Math.max(centerX - leftX, rightX - centerX);
-  // 数值异常（把手臂并进来 / 只测到一条缝）时回退模板宽度
-  const measured =
-    Number.isFinite(halfWidth) && halfWidth > height * 0.03 && halfWidth < height * 0.2;
-  if (!measured) halfWidth = height * FALLBACK_TORSO_HALF_WIDTH;
-  halfWidth = Math.min(halfWidth, height * 0.17);
+  const leftX = minX + expand(-1) * binSize;
+  const rightX = minX + (expand(1) + 1) * binSize;
+  const halfWidth = Math.max(centerX - leftX, rightX - centerX);
+  if (!Number.isFinite(halfWidth) || halfWidth <= height * 0.03 || halfWidth >= height * 0.2) {
+    return null;
+  }
+  return halfWidth;
+}
+
+/**
+ * 测量躯干宽度。
+ *
+ * 把腰部高度带（0.45H ~ 0.62H）切成 6 条薄片分别测量，再对这些结果取中位数。
+ * A-pose / 手臂贴近身体时，总有一两条薄片刚好和手肘粘成一片、量出来明显偏宽；
+ * 只用整带量一次的话，一次粘连就会让整项测量失败并回退模板比例。分片 + 中位数
+ * 能把异常薄片压掉，同时保留真正测到的躯干宽度。
+ */
+function measureTorso(
+  samples: SampleCloud,
+  centerX: number,
+  defaultZ: number,
+  baseY: number,
+  height: number,
+): TorsoMeasure {
+  const lo = baseY + height * 0.45;
+  const hi = baseY + height * 0.62;
+  const slices = 6;
+  const sliceXs: number[][] = Array.from({ length: slices }, () => []);
+  const xs: number[] = [];
+  const zs: number[] = [];
+  for (let i = 0; i < samples.count; i += 1) {
+    const base = i * 3;
+    const y = samples.data[base + 1]!;
+    if (y < lo || y > hi) continue;
+    const x = samples.data[base]!;
+    xs.push(x);
+    zs.push(samples.data[base + 2]!);
+    const slot = Math.min(slices - 1, Math.floor(((y - lo) / (hi - lo)) * slices));
+    sliceXs[slot]!.push(x);
+  }
+  if (xs.length < 24) {
+    return { halfWidth: height * FALLBACK_TORSO_HALF_WIDTH, centerZ: defaultZ, measured: false };
+  }
+
+  const widths: number[] = [];
+  for (const slice of sliceXs) {
+    const value = sliceHalfWidth(slice, centerX, height);
+    if (value !== null) widths.push(value);
+  }
+  // 取偏窄的一档（25% 分位）而不是中位数：测量只会因为「和手臂 / 大腿粘在一起」
+  // 而偏宽，几乎不会凭空偏窄，所以窄的那几片更接近真实躯干宽度。
+  const measured = widths.length >= 2;
+  widths.sort((left, right) => left - right);
+  const measuredWidth = widths.length > 0 ? quantileSorted(widths, 0.25) : height * FALLBACK_TORSO_HALF_WIDTH;
+  const halfWidth = Math.min(measuredWidth, height * 0.17);
 
   // 只统计躯干横向簇内的 z，忽略手臂/裙摆对深度中心的影响
   const near: number[] = [];
@@ -400,8 +477,10 @@ interface ArmFit {
   wrist: THREE.Vector3;
   /** 指尖（中轴最远端） */
   tip: THREE.Vector3;
-  /** 手臂平均半径 */
-  radius: number;
+  /** 上臂 / 前臂 / 手掌三段各自的胶囊半径 */
+  upperRadius: number;
+  foreRadius: number;
+  handRadius: number;
   fitted: boolean;
 }
 
@@ -411,6 +490,10 @@ interface ArmFit {
  * 这一版不再假设手臂水平：T-pose 时主轴接近水平，A-pose 是斜线，手臂自然下垂
  * 时接近竖直，三种姿势都能得到落在网格内部的手臂骨骼。
  * 点云取「离躯干中线超过腰部半宽」的顶点，并排除髋部以下（腿）区域。
+ *
+ * `leg` 是同一侧已经测好的腿：自然下垂的手臂和大腿在髋部高度带里横向位置很接近，
+ * 只按「躯干外侧」筛选会把大腿点也算进手臂点云；这些点会把 PCA 主轴拽向竖直方向、
+ * 把肩端拉低，表现出来就是整条手臂骨下沉 / 骨骼落到网格外。
  */
 function fitArm(
   samples: SampleCloud,
@@ -419,17 +502,29 @@ function fitArm(
   height: number,
   torsoHalfWidth: number,
   side: 1 | -1,
+  leg: LegFit,
 ): ArmFit | null {
   const threshold = torsoHalfWidth * 1.05 + height * 0.004;
   const points: number[] = [];
   const minY = baseY + height * 0.28;
   const maxY = baseY + height * 0.985;
+  const legAB = new THREE.Vector3().subVectors(leg.knee, leg.hip);
+  const thighExcludeRadius = leg.thighRadius * 1.05;
+  const legProbe = new THREE.Vector3();
+  /** 是否属于大腿柱（髋线到膝线之间）——这类点不能参与手臂拟合 */
+  const nearThigh = (x: number, y: number, z: number): boolean => {
+    const ratio = (y - baseY) / height;
+    if (ratio < 0.26 || ratio > 0.55) return false;
+    legProbe.set(x, y, z);
+    return pointSegmentDistanceSq(legProbe, leg.hip, legAB) < thighExcludeRadius * thighExcludeRadius;
+  };
   for (let i = 0; i < samples.count; i += 1) {
     const base = i * 3;
     const x = samples.data[base]!;
     const y = samples.data[base + 1]!;
     if (y < minY || y > maxY) continue;
     if ((x - centerX) * side <= threshold) continue;
+    if (nearThigh(x, y, samples.data[base + 2]!)) continue;
     points.push(x, y, samples.data[base + 2]!);
   }
   const count = points.length / 3;
@@ -522,22 +617,81 @@ function fitArm(
   const [tipFrom, tipTo] = span(endT, endT - sign * length * 0.12);
   const tip = onAxis(endT, tipFrom, tipTo);
 
-  // 半径：所有点到中轴的三维垂直距离，取 80% 分位（袖口、护肩等厚处会被略微放大）
-  const distances: number[] = [];
+  // 半径：分段测量上臂 / 前臂 / 手掌。手臂上粗下细，若三段共用一个半径，
+  // 前臂与手掌的胶囊会明显偏粗，把躯干侧面甚至腰部的顶点也吸到手臂骨上。
   const ab = new THREE.Vector3(dirX, dirY, 0);
   const abLen = ab.length();
   const unit = abLen > 0 ? ab.clone().divideScalar(abLen) : new THREE.Vector3(1, 0, 0);
-  const p = new THREE.Vector3();
+  const abUpper = new THREE.Vector3().subVectors(elbow, socket);
+  const abFore = new THREE.Vector3().subVectors(wrist, elbow);
+  const abHand = new THREE.Vector3().subVectors(tip, wrist);
+  const axisDistances: number[] = [];
+  const upperDistances: number[] = [];
+  const foreDistances: number[] = [];
+  const handDistances: number[] = [];
+  const probe = new THREE.Vector3();
+  const axisSpan = endT - startT;
   for (let i = 0; i < count; i += 1) {
-    p.set(points[i * 3]!, points[i * 3 + 1]!, points[i * 3 + 2]!).sub(socket);
-    const along = p.dot(unit);
-    p.addScaledVector(unit, -along);
-    distances.push(p.length());
+    probe.set(points[i * 3]!, points[i * 3 + 1]!, points[i * 3 + 2]!);
+    // 到中轴所在直线的垂直距离：分段样本不足时用它兜底
+    const dx = probe.x - socket.x;
+    const dy = probe.y - socket.y;
+    const dz = probe.z - socket.z;
+    const along = dx * unit.x + dy * unit.y + dz * unit.z;
+    const px = dx - unit.x * along;
+    const py = dy - unit.y * along;
+    const pz = dz - unit.z * along;
+    axisDistances.push(Math.sqrt(px * px + py * py + pz * pz));
+
+    // u：0 = 肩端，1 = 指尖；只取避开关节的区间，防止端点的球面把半径撑大
+    const u = (projections[i]! - startT) / axisSpan;
+    if (u >= 0.05 && u <= 0.42) {
+      upperDistances.push(Math.sqrt(pointSegmentDistanceSq(probe, socket, abUpper)));
+    } else if (u >= 0.55 && u <= 0.86) {
+      foreDistances.push(Math.sqrt(pointSegmentDistanceSq(probe, elbow, abFore)));
+    } else if (u >= 0.9 && u <= 1) {
+      handDistances.push(Math.sqrt(pointSegmentDistanceSq(probe, wrist, abHand)));
+    }
   }
-  distances.sort((a, b) => a - b);
-  const radius = Math.min(
+  axisDistances.sort((a, b) => a - b);
+  upperDistances.sort((a, b) => a - b);
+  foreDistances.sort((a, b) => a - b);
+  handDistances.sort((a, b) => a - b);
+
+  const baseRadius = radiusFromDistances(
+    axisDistances,
+    0.8,
+    height * 0.014,
     height * 0.08,
-    Math.max(height * 0.014, quantileSorted(distances, 0.8)),
+    height * FALLBACK_UPPER_ARM_RADIUS,
+  );
+  const upperRadius = radiusFromDistances(
+    upperDistances,
+    0.78,
+    height * 0.014,
+    height * 0.08,
+    baseRadius,
+  );
+  // 前臂 / 手掌不会比上臂更粗：袖口、手套这类局部加厚不应把半径放大
+  const foreRadius = Math.min(
+    upperRadius * 0.96,
+    radiusFromDistances(
+      foreDistances,
+      0.78,
+      height * 0.011,
+      height * 0.062,
+      baseRadius * 0.88,
+    ),
+  );
+  const handRadius = Math.min(
+    foreRadius * 1.08,
+    radiusFromDistances(
+      handDistances,
+      0.78,
+      height * 0.008,
+      height * 0.055,
+      baseRadius * 0.8,
+    ),
   );
 
   clampInsideBox(socket, centerX, baseY, height);
@@ -545,7 +699,7 @@ function fitArm(
   clampInsideBox(wrist, centerX, baseY, height);
   clampInsideBox(tip, centerX, baseY, height);
 
-  return { socket, elbow, wrist, tip, radius, fitted: true };
+  return { socket, elbow, wrist, tip, upperRadius, foreRadius, handRadius, fitted: true };
 }
 
 /**
@@ -581,7 +735,9 @@ function fallbackArm(
     elbow: lerp(0.45),
     wrist: lerp(0.82),
     tip,
-    radius: height * FALLBACK_ARM_RADIUS,
+    upperRadius: height * FALLBACK_UPPER_ARM_RADIUS,
+    foreRadius: height * FALLBACK_FOREARM_RADIUS,
+    handRadius: height * FALLBACK_HAND_RADIUS,
     fitted: false,
   };
 }
@@ -592,7 +748,10 @@ interface LegFit {
   ankle: THREE.Vector3;
   /** 脚尖位置（只用于脚部胶囊，不写成骨骼关节） */
   toe: THREE.Vector3;
-  radius: number;
+  /** 大腿 / 小腿 / 脚掌三段各自的胶囊半径 */
+  thighRadius: number;
+  shinRadius: number;
+  footRadius: number;
   fitted: boolean;
 }
 
@@ -600,6 +759,10 @@ interface LegFit {
  * 测量一侧腿骨位置。
  *
  * 髋 / 膝 / 踝三个高度带分别取横向中位数，能适配宽站姿、窄站姿和轻微弯曲的腿。
+ *
+ * 髋、膝两带不直接对整条带取中位数，而是以「下一段的中心」为基准先做窗口初筛：
+ * 自然下垂的手掌正好落在大腿两侧的同一高度带里，直接取中位数会被手部点带偏。
+ * 踝部高度带只有脚、不会混进手，所以从踝往上一级级跟踪最稳。
  * 脚部薄层再测量脚尖的 Z 范围，保证脚掌胶囊覆盖到脚趾而不会缩在脚踝。
  */
 function fitLeg(
@@ -610,6 +773,8 @@ function fitLeg(
   height: number,
   side: 1 | -1,
 ): LegFit | null {
+  /** 同侧髋部以下的所有点，用于分段测半径 */
+  const points: number[] = [];
   const hipBand: number[] = [];
   const kneeBand: number[] = [];
   const ankleBand: number[] = [];
@@ -617,37 +782,45 @@ function fitLeg(
   const zAnkle: number[] = [];
   const footZ: number[] = [];
 
-  const bandOf = (y: number): 0 | 1 | 2 | -1 => {
-    const ratio = (y - baseY) / height;
-    if (ratio >= 0.38 && ratio <= 0.47) return 0;
-    if (ratio >= 0.2 && ratio <= 0.29) return 1;
-    if (ratio >= 0.035 && ratio <= 0.11) return 2;
-    return -1;
-  };
-
   for (let i = 0; i < samples.count; i += 1) {
     const base = i * 3;
     const x = samples.data[base]!;
     const y = samples.data[base + 1]!;
     const z = samples.data[base + 2]!;
     if ((x - centerX) * side <= height * 0.004) continue;
-    const band = bandOf(y);
-    if (band === 0) {
+    const ratio = (y - baseY) / height;
+    if (ratio < 0.005 || ratio > 0.5) continue;
+    points.push(x, y, z);
+    if (ratio >= 0.38 && ratio <= 0.47) {
       hipBand.push(x);
       zHip.push(z);
-    } else if (band === 1) {
+    } else if (ratio >= 0.2 && ratio <= 0.29) {
       kneeBand.push(x);
-    } else if (band === 2) {
+    } else if (ratio <= 0.11) {
       ankleBand.push(x);
       zAnkle.push(z);
-      if ((y - baseY) / height <= 0.07) footZ.push(z);
+      if (ratio <= 0.07) footZ.push(z);
     }
   }
-  if (hipBand.length < 6 || kneeBand.length < 4 || ankleBand.length < 4) return null;
 
-  const hipX = median(hipBand);
-  const kneeX = median(kneeBand);
+  /**
+   * 以 anchor 为中心取窗口内的中位数；窗口内点太少时逐步放宽，
+   * 都不够时才退回整条带的中位数（宁可被手带偏，也不要丢掉整条腿的测量）。
+   */
+  const bandCenter = (values: number[], anchor: number): number | null => {
+    if (values.length < 4) return null;
+    const near = values.filter((value) => Math.abs(value - anchor) <= height * 0.07);
+    if (near.length >= 4) return median(near);
+    const wider = values.filter((value) => Math.abs(value - anchor) <= height * 0.14);
+    return wider.length >= 4 ? median(wider) : median(values);
+  };
+
+  if (ankleBand.length < 4) return null;
   const ankleX = median(ankleBand);
+  const kneeX = bandCenter(kneeBand, ankleX);
+  if (kneeX === null) return null;
+  const hipX = bandCenter(hipBand, kneeX);
+  if (hipX === null) return null;
   // 腿必须确实在对应侧，否则说明左右腿被错误合并
   if ((hipX - centerX) * side <= height * 0.002) return null;
 
@@ -662,33 +835,52 @@ function fitLeg(
   const ankle = new THREE.Vector3(ankleX, ankleY, ankleZ);
 
   // 脚尖：脚部薄层里 z 最大的一侧；数据不足时按 +Z（模型已转正）兜底
-  const toeZ = footZ.length > 2 ? Math.max(...footZ) : centerZ + height * 0.08;
+  let toeZ = -Infinity;
+  for (const value of footZ) {
+    if (value > toeZ) toeZ = value;
+  }
+  if (footZ.length <= 2 || !Number.isFinite(toeZ)) toeZ = centerZ + height * 0.08;
   const toe = new THREE.Vector3(ankleX, baseY + height * 0.02, toeZ - height * 0.005);
 
-  // 腿半径：所有低于髋部的同侧点到「髋-膝-踝」折线的横向偏差的 80% 分位
-  const distances: number[] = [];
-  for (let i = 0; i < samples.count; i += 1) {
-    const base = i * 3;
-    const x = samples.data[base]!;
-    const y = samples.data[base + 1]!;
-    if ((x - centerX) * side <= height * 0.004) continue;
-    const ratio = (y - baseY) / height;
-    if (ratio < 0.03 || ratio > 0.47) continue;
-    const centerLineX = ratio > 0.27
-      ? kneeX + (hipX - kneeX) * ((ratio - 0.27) / 0.23)
-      : ankleX + (kneeX - ankleX) * Math.max(0, (ratio - 0.055) / 0.215);
-    distances.push(Math.abs(x - centerLineX));
-  }
-  distances.sort((a, b) => a - b);
-  const radius = Math.min(
-    height * 0.1,
-    Math.max(height * 0.03, quantileSorted(distances, 0.8)),
+  // 半径：大腿 / 小腿 / 脚掌分别测量。大腿比小腿粗一大圈，共用半径会让小腿
+  // 胶囊明显偏粗，把另一条腿、裙摆甚至对侧脚踝的顶点也吸到这条腿上。
+  const thighRadius = radiusFromDistances(
+    segmentDistances(points, hip, knee, 0.33, 0.47, baseY, height),
+    0.8,
+    height * 0.032,
+    height * 0.11,
+    height * FALLBACK_THIGH_RADIUS,
+  );
+  const shinRadius = Math.min(
+    thighRadius * 0.9,
+    radiusFromDistances(
+      segmentDistances(points, knee, ankle, 0.12, 0.26, baseY, height),
+      0.8,
+      height * 0.026,
+      height * 0.09,
+      height * FALLBACK_SHIN_RADIUS,
+    ),
+  );
+  const footRadius = radiusFromDistances(
+    segmentDistances(
+      points,
+      new THREE.Vector3(ankleX, baseY + height * 0.04, ankleZ),
+      toe,
+      0.005,
+      0.085,
+      baseY,
+      height,
+    ),
+    0.7,
+    height * 0.018,
+    height * 0.055,
+    height * FALLBACK_FOOT_RADIUS,
   );
 
   clampInsideBox(hip, centerX, baseY, height);
   clampInsideBox(knee, centerX, baseY, height);
   clampInsideBox(ankle, centerX, baseY, height);
-  return { hip, knee, ankle, toe, radius, fitted: true };
+  return { hip, knee, ankle, toe, thighRadius, shinRadius, footRadius, fitted: true };
 }
 
 /** 腿部兜底：按模板比例摆放，但左右腿的横向位置跟随轮廓宽度略微展开 */
@@ -707,7 +899,9 @@ function fallbackLeg(
     knee: new THREE.Vector3(x, baseY + height * 0.27, centerZ),
     ankle: new THREE.Vector3(x, baseY + height * 0.055, centerZ),
     toe: new THREE.Vector3(x, baseY + height * 0.02, centerZ + height * 0.09),
-    radius: height * FALLBACK_LEG_RADIUS,
+    thighRadius: height * FALLBACK_THIGH_RADIUS,
+    shinRadius: height * FALLBACK_SHIN_RADIUS,
+    footRadius: height * FALLBACK_FOOT_RADIUS,
     fitted: false,
   };
 }
@@ -746,14 +940,16 @@ function fitBody(root: THREE.Object3D, meshes: THREE.Mesh[]): BodyFit {
   const centerZ = torso.centerZ;
   const silhouette = measureSilhouetteHalfWidth(samples, centerX, baseY, height);
 
-  const armL = fitArm(samples, centerX, baseY, height, torsoHalfWidth, 1)
-    ?? fallbackArm(centerX, baseY, height, torsoHalfWidth, silhouette, centerZ, 1);
-  const armR = fitArm(samples, centerX, baseY, height, torsoHalfWidth, -1)
-    ?? fallbackArm(centerX, baseY, height, torsoHalfWidth, silhouette, centerZ, -1);
+  // 先测腿、再测手臂：手臂拟合需要已测出的腿柱，用来把「髋部以下的大腿点」
+  // 从手臂点云里剔除（自然下垂时手掌/大腿在横向位置上几乎重叠）。
   const legL = fitLeg(samples, centerX, centerZ, baseY, height, 1)
     ?? fallbackLeg(centerX, centerZ, baseY, height, silhouette, 1);
   const legR = fitLeg(samples, centerX, centerZ, baseY, height, -1)
     ?? fallbackLeg(centerX, centerZ, baseY, height, silhouette, -1);
+  const armL = fitArm(samples, centerX, baseY, height, torsoHalfWidth, 1, legL)
+    ?? fallbackArm(centerX, baseY, height, torsoHalfWidth, silhouette, centerZ, 1);
+  const armR = fitArm(samples, centerX, baseY, height, torsoHalfWidth, -1, legR)
+    ?? fallbackArm(centerX, baseY, height, torsoHalfWidth, silhouette, centerZ, -1);
 
   const shoulderY = (armL.socket.y + armR.socket.y) / 2;
   const hipY = baseY + height * 0.52;
@@ -801,8 +997,15 @@ function fitBody(root: THREE.Object3D, meshes: THREE.Mesh[]): BodyFit {
   );
   const neckRadius = Math.max(height * 0.035, Math.min(torsoRadius * 0.45, height * 0.06));
   const headRadius = measureHeadRadius(samples, centerX, centerZ, resolvedNeckY, baseY + height, height);
-  const armRadius = (armL.radius + armR.radius) / 2;
-  const legRadius = (legL.radius + legR.radius) / 2;
+  // 左右两侧各用自己测出的半径：一侧拟合失败回退模板时，不会把另一侧也带偏
+  const shoulderBandRadius = Math.max(
+    Math.max(armL.upperRadius, armR.upperRadius) * 0.9,
+    torsoRadius * 0.55,
+  );
+  const hipBandRadius = Math.max(
+    Math.max(legL.thighRadius, legR.thighRadius) * 0.78,
+    height * 0.04,
+  );
 
   const capsules: CapsuleSpec[] = [];
   const hips = joints.get('Hips')!;
@@ -816,26 +1019,27 @@ function fitBody(root: THREE.Object3D, meshes: THREE.Mesh[]): BodyFit {
   capsules.push(
     // 骨盆：竖直主胶囊 + 横向一条覆盖胯部
     { bone: 'Hips', a: new THREE.Vector3(centerX, hipY - height * 0.06, centerZ), b: hips.clone(), radius: torsoRadius * 0.95, side: 'center' },
-    { bone: 'Hips', a: legR.hip.clone(), b: legL.hip.clone(), radius: Math.max(legRadius * 0.75, height * 0.04), side: 'center' },
+    { bone: 'Hips', a: legR.hip.clone(), b: legL.hip.clone(), radius: hipBandRadius, side: 'center' },
     { bone: 'Spine', a: hips.clone(), b: spine.clone(), radius: torsoRadius * 0.92, side: 'center' },
     { bone: 'Chest', a: spine.clone(), b: chest.clone(), radius: torsoRadius, side: 'center' },
     // 肩带横条：覆盖锁骨 / 上胸，避免整个肩膀被手臂骨骼抢走
-    { bone: 'Chest', a: shoulderR.clone(), b: shoulderL.clone(), radius: Math.max(armRadius * 0.9, torsoRadius * 0.55), side: 'center' },
+    { bone: 'Chest', a: shoulderR.clone(), b: shoulderL.clone(), radius: shoulderBandRadius, side: 'center' },
     { bone: 'Neck', a: neck.clone(), b: new THREE.Vector3(centerX, resolvedNeckY + height * 0.02, centerZ), radius: neckRadius, side: 'center' },
     { bone: 'Head', a: head.clone(), b: new THREE.Vector3(centerX, baseY + height * 0.995, centerZ), radius: headRadius, side: 'center' },
   );
 
   const addArm = (side: 1 | -1, fit: ArmFit): void => {
     const suffix = side === 1 ? 'L' : 'R';
+    const tag = side === 1 ? 'left' : 'right';
     const shoulder = joints.get(`Shoulder${suffix}`)!;
     const socket = joints.get(`UpperArm${suffix}`)!;
     const elbow = joints.get(`Forearm${suffix}`)!;
     const wrist = joints.get(`Hand${suffix}`)!;
     capsules.push(
-      { bone: `Shoulder${suffix}`, a: shoulder.clone(), b: socket.clone(), radius: Math.max(armRadius * 1.05, height * 0.03), side: side === 1 ? 'left' : 'right' },
-      { bone: `UpperArm${suffix}`, a: socket.clone(), b: elbow.clone(), radius: fit.radius, side: side === 1 ? 'left' : 'right' },
-      { bone: `Forearm${suffix}`, a: elbow.clone(), b: wrist.clone(), radius: fit.radius * 0.88, side: side === 1 ? 'left' : 'right' },
-      { bone: `Hand${suffix}`, a: wrist.clone(), b: fit.tip.clone(), radius: Math.max(fit.radius * 0.9, height * 0.02), side: side === 1 ? 'left' : 'right' },
+      { bone: `Shoulder${suffix}`, a: shoulder.clone(), b: socket.clone(), radius: Math.max(fit.upperRadius * 1.08, height * 0.03), side: tag },
+      { bone: `UpperArm${suffix}`, a: socket.clone(), b: elbow.clone(), radius: fit.upperRadius, side: tag },
+      { bone: `Forearm${suffix}`, a: elbow.clone(), b: wrist.clone(), radius: fit.foreRadius, side: tag },
+      { bone: `Hand${suffix}`, a: wrist.clone(), b: fit.tip.clone(), radius: Math.max(fit.handRadius, height * 0.018), side: tag },
     );
   };
   addArm(1, armL);
@@ -843,18 +1047,19 @@ function fitBody(root: THREE.Object3D, meshes: THREE.Mesh[]): BodyFit {
 
   const addLeg = (side: 1 | -1, fit: LegFit): void => {
     const suffix = side === 1 ? 'L' : 'R';
+    const tag = side === 1 ? 'left' : 'right';
     const hip = joints.get(`UpperLeg${suffix}`)!;
     const knee = joints.get(`LowerLeg${suffix}`)!;
     const ankle = joints.get(`Foot${suffix}`)!;
     capsules.push(
-      { bone: `UpperLeg${suffix}`, a: hip.clone(), b: knee.clone(), radius: fit.radius, side: side === 1 ? 'left' : 'right' },
-      { bone: `LowerLeg${suffix}`, a: knee.clone(), b: ankle.clone(), radius: fit.radius * 0.82, side: side === 1 ? 'left' : 'right' },
+      { bone: `UpperLeg${suffix}`, a: hip.clone(), b: knee.clone(), radius: fit.thighRadius, side: tag },
+      { bone: `LowerLeg${suffix}`, a: knee.clone(), b: ankle.clone(), radius: fit.shinRadius, side: tag },
       {
         bone: `Foot${suffix}`,
         a: new THREE.Vector3(ankle.x, baseY + height * 0.04, ankle.z - height * 0.02),
         b: fit.toe.clone(),
-        radius: Math.max(fit.radius * 0.7, height * 0.025),
-        side: side === 1 ? 'left' : 'right',
+        radius: Math.max(fit.footRadius, height * 0.022),
+        side: tag,
       },
     );
   };
@@ -1106,6 +1311,7 @@ function computeWeights(
   out.fill(0);
   let nearestIndex = -1;
   let nearestScore = Infinity;
+  let covered = false;
   for (let i = 0; i < capsules.length; i += 1) {
     const capsule = capsules[i]!;
     const distanceSq = pointSegmentDistanceSq(vertex, capsule.a, abList[i]!);
@@ -1125,18 +1331,11 @@ function computeWeights(
     if (capsule.side === 'left' && vertex.x < centerX) weight *= OPPOSITE_SIDE_FACTOR;
     else if (capsule.side === 'right' && vertex.x > centerX) weight *= OPPOSITE_SIDE_FACTOR;
     if (weight > out[capsule.boneIndex]!) out[capsule.boneIndex] = weight;
+    if (weight > 0) covered = true;
   }
 
-  if (nearestIndex >= 0) {
-    let covered = false;
-    for (let i = 0; i < out.length; i += 1) {
-      if (out[i]! > 0) {
-        covered = true;
-        break;
-      }
-    }
-    if (!covered) out[capsules[nearestIndex]!.boneIndex] = 1;
-  }
+  // 完全落在所有胶囊外（头发 / 配饰 / 披风）才回退到「归一化距离最近」的胶囊
+  if (!covered && nearestIndex >= 0) out[capsules[nearestIndex]!.boneIndex] = 1;
 }
 
 /** 取权重最高的 4 根骨骼写入属性；全零时挂到骨盆，避免塌缩到原点 */
