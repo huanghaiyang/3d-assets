@@ -281,6 +281,8 @@ export class FbxPlayer {
    * 暂停且相机静止时跳过整帧渲染，避免空闲的预览区一直占用 GPU。
    */
   private renderRequested = true;
+  /** 滚轮累计量：平滑滚轮/触控板一次只上报几像素，攒够一档再缩放，和带刻度滚轮手感一致 */
+  private wheelAccum = 0;
   /** 上次向 Vue 推送播放进度的时刻：节流到约 20fps，避免每帧触发响应式更新 */
   private lastEmitAt = 0;
   private listeners: ((state: PlaybackState) => void)[] = [];
@@ -301,6 +303,11 @@ export class FbxPlayer {
     this.renderer.shadowMap.needsUpdate = true;
     this.renderer.domElement.style.cssText = 'display:block;width:100%;height:100%';
     container.appendChild(this.renderer.domElement);
+
+    // 滚轮缩放自己接管：OrbitControls 直接拿 deltaY 原始值算缩放，鼠标驱动 / 触控板平滑滚动
+    // 上报的增量常常只有几像素，一格换算下来不到 1%，看起来就是「滚轮放大缩小失效」。
+    // 监听器必须早于 OrbitControls 注册（它构造时就挂到同一个 canvas 上），才能拦掉它自带的滚轮处理。
+    this.renderer.domElement.addEventListener('wheel', this.onWheelZoom, { passive: false });
 
     // 右下角 XYZ 轴向指示器（与工作台视口一致；离屏封面渲染不需要）
     this.axis =
@@ -1429,9 +1436,49 @@ export class FbxPlayer {
     this.playing = false;
   }
 
+  /**
+   * 滚轮缩放：把各平台的 delta 统一折算成像素后累计，攒够一档才缩放。
+   * 这样既能让平滑滚轮/触控板的几像素增量正常缩放，也能让带刻度滚轮保持原来的手感。
+   */
+  private onWheelZoom = (event: WheelEvent): void => {
+    if (this.disposed || !this.controls.enabled) return;
+    // Ctrl/⌘/Alt/Shift + 滚轮留给浏览器与其它面板的快捷操作
+    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    // deltaMode：0=像素 1=行 2=页，统一折算成像素
+    const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? this.container.clientHeight || 400 : 1;
+    const pixels = event.deltaY * unit;
+    if (pixels === 0) return;
+    event.preventDefault();
+    // 拦住 OrbitControls 自带的滚轮缩放，避免同一格被缩放两次
+    event.stopImmediatePropagation();
+    this.wheelAccum += pixels;
+    const stepPixels = 48;
+    if (Math.abs(this.wheelAccum) < stepPixels) return;
+    // 单次最多 2.4 档，避免高分辨率滚轮 / 快速滑动一下跳太远
+    const step = THREE.MathUtils.clamp(this.wheelAccum, -240, 240);
+    this.wheelAccum = 0;
+    this.zoomBy(Math.pow(0.95, -step / 100));
+  };
+
+  /** 沿视线方向推拉相机，等价于 OrbitControls 的 dolly，但缩放量由自己归一化 */
+  private zoomBy(factor: number): void {
+    const offset = this.camera.position.clone().sub(this.controls.target);
+    const distance = THREE.MathUtils.clamp(
+      offset.length() * factor,
+      this.controls.minDistance,
+      this.controls.maxDistance,
+    );
+    if (!Number.isFinite(distance) || distance <= 0) return;
+    offset.setLength(distance);
+    this.camera.position.copy(this.controls.target).add(offset);
+    this.controls.update();
+    this.requestRender();
+  }
+
   dispose(): void {
     this.disposed = true;
     this.renderer.setAnimationLoop(null);
+    this.renderer.domElement.removeEventListener('wheel', this.onWheelZoom);
     this.resizeObserver.disconnect();
     this.axis?.dispose();
     this.clear();
