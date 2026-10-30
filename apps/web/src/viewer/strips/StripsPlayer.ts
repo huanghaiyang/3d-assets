@@ -30,6 +30,7 @@ import { kimodoApi } from '@/api/kimodo';
 import type { AnimationData } from '@/viewer/FbxPlayer';
 import { filterShadowBones } from '@/viewer/SkeletonOverlay';
 import { FbxActor, type FbxSource } from '@/viewer/stage/FbxActor';
+import { disposeObject } from '@/viewer/stage/StageActor';
 import { buildBoneNameMap, clipsFromAnimationData } from '@/viewer/stage/clipFromAnimationData';
 import { sourceKey, type StageActorDef } from '@/viewer/stage/StageTypes';
 import { resolveSegmentColor } from '@/viewer/stage/segmentColors';
@@ -654,8 +655,13 @@ export class StripsPlayer {
     this.renderer.domElement.removeEventListener('wheel', this.onWheelZoom);
     this.resizeObserver.disconnect();
     this.disposeBase();
+    this.disposeFbxSources();
     this.controls.dispose();
+    // 网格地面 / 阴影承托面等场景自带对象也要释放，避免每次重建播放器都留一份显存
+    disposeObject(this.scene);
     this.renderer.dispose();
+    // 主动丢弃 WebGL 上下文：切换页签会反复重建播放器，靠浏览器 GC 回收太慢，容易撞上下文上限
+    this.renderer.forceContextLoss();
     this.renderer.domElement.remove();
   }
 
@@ -848,6 +854,23 @@ export class StripsPlayer {
     this.bakedAction = null;
     this.bakedClip = null;
     this.mode = 'live';
+  }
+
+  /**
+   * 释放 FBX 源缓存。
+   * base 角色是 SkeletonUtils 克隆出来的，几何体 / 材质 / 贴图与源对象共享，
+   * 必须等角色销毁之后再释放源，否则会误伤还在用的模型。
+   */
+  private disposeFbxSources(): void {
+    this.clipCache.clear();
+    for (const pending of this.fbxCache.values()) {
+      // 仍在加载中的源：等它落地后立刻释放，避免销毁后又泄漏一个完整模型
+      void pending.then(
+        (source) => disposeObject(source.object),
+        () => undefined,
+      );
+    }
+    this.fbxCache.clear();
   }
 
   // ===== 部位染色 / 半透明 / 外发光 =====

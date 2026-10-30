@@ -293,6 +293,8 @@ function clearRig(): void {
       if (child instanceof THREE.LineSegments || child instanceof THREE.Points) {
         scene.remove(child);
         child.geometry.dispose();
+        const material = child.material as THREE.Material | THREE.Material[];
+        for (const item of Array.isArray(material) ? material : [material]) item.dispose();
       } else if (child instanceof THREE.Group) {
         scene.remove(child);
       }
@@ -422,6 +424,8 @@ onBeforeUnmount(() => {
   resizeObserver?.disconnect();
   resizeObserver = null;
   renderer?.dispose();
+  // 抽屉反复开合会重建渲染器，主动丢弃上下文避免撞 WebGL 上下文上限
+  renderer?.forceContextLoss();
   renderer?.domElement.remove();
   renderer = null;
   scene = null;

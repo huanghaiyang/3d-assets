@@ -11,7 +11,7 @@ import { FootLock } from './FootIK';
 import { buildRootAlign, resolveRootOffset, type RootAlignPlan } from './RootAlign';
 import { buildTimeline, resolveSegmentPose, resolveTimeline } from './SequenceTimeline';
 import { SomaActor, somaClipFromMotion, SOMA_FPS } from './SomaActor';
-import { rotateXZ, type ActorClipInput, type ActorGhost, type StageActor } from './StageActor';
+import { disposeObject, rotateXZ, type ActorClipInput, type ActorGhost, type StageActor } from './StageActor';
 import {
   ZERO_SEGMENT_POSE,
   actorSegments,
@@ -559,9 +559,31 @@ export class StagePlayer {
     this.transform.dispose();
     this.controls.dispose();
     this.clearActors();
+    this.disposeFbxSources();
     this.disposeSkeletonOverlays();
+    // 网格地面 / 阴影承托面 / 选中环等场景自带对象也要释放
+    disposeObject(this.scene);
     this.renderer.dispose();
+    // 主动丢弃 WebGL 上下文：切换页签会反复重建播放器，靠浏览器 GC 回收太慢，容易撞上下文上限
+    this.renderer.forceContextLoss();
     this.renderer.domElement.remove();
+  }
+
+  /**
+   * 释放 FBX 源缓存。
+   * 角色都是 SkeletonUtils 克隆出来的，几何体 / 材质 / 贴图与源对象共享，
+   * 因此必须等所有角色销毁之后再释放源，否则会误伤还在场上的角色。
+   */
+  private disposeFbxSources(): void {
+    this.clipCache.clear();
+    for (const pending of this.fbxCache.values()) {
+      // 仍在加载中的源：等它落地后立刻释放，避免销毁后又泄漏一个完整模型
+      void pending.then(
+        (source) => disposeObject(source.object),
+        () => undefined,
+      );
+    }
+    this.fbxCache.clear();
   }
 
   // ===== 文档装配 =====

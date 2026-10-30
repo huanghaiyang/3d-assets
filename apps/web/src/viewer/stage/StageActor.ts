@@ -444,13 +444,28 @@ export abstract class MixerActor implements StageActor {
   }
 }
 
-/** 释放几何体与材质，避免反复切换角色时显存泄漏 */
+/** 释放几何体、材质与贴图，避免反复切换角色时显存泄漏 */
 export function disposeObject(root: THREE.Object3D): void {
+  const geometries = new Set<THREE.BufferGeometry>();
+  const materials = new Set<THREE.Material>();
+  const textures = new Set<THREE.Texture>();
   root.traverse((child) => {
     const mesh = child as THREE.Mesh & THREE.Points & THREE.LineSegments;
     if (!mesh.isMesh && !mesh.isPoints && !mesh.isLineSegments) return;
-    mesh.geometry?.dispose();
-    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-    for (const material of materials) material?.dispose();
+    if (mesh.geometry) geometries.add(mesh.geometry);
+    const list = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const material of list) {
+      if (!material) continue;
+      materials.add(material);
+      for (const value of Object.values(material as unknown as Record<string, unknown>)) {
+        if (value instanceof THREE.Texture) textures.add(value);
+      }
+    }
+    // 骨骼贴图由渲染器首次绘制蒙皮网格时创建，挂在 skeleton 上，材质遍历拿不到它
+    const skinned = child as THREE.SkinnedMesh;
+    if (skinned.isSkinnedMesh && skinned.skeleton?.boneTexture) skinned.skeleton.boneTexture.dispose();
   });
+  for (const geometry of geometries) geometry.dispose();
+  for (const material of materials) material.dispose();
+  for (const texture of textures) texture.dispose();
 }

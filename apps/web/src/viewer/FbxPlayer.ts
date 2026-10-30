@@ -220,6 +220,8 @@ export class FbxPlayer {
   private readonly grid: THREE.GridHelper;
   private readonly shadowPlane: THREE.Mesh;
   private readonly pmrem: THREE.PMREMGenerator;
+  /** PMREM 生成的环境贴图（fromScene 返回的 RenderTarget，dispose 时要单独释放） */
+  private readonly envTarget: THREE.WebGLRenderTarget;
   private readonly container: HTMLElement;
   private readonly resizeObserver: ResizeObserver;
   private readonly axis: AxisIndicator | null;
@@ -344,7 +346,11 @@ export class FbxPlayer {
     this.scene.add(rimLight);
 
     this.pmrem = new THREE.PMREMGenerator(this.renderer);
-    this.scene.environment = this.pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    const room = new RoomEnvironment();
+    this.envTarget = this.pmrem.fromScene(room, 0.04);
+    this.scene.environment = this.envTarget.texture;
+    // RoomEnvironment 的几何体/材质只在生成 PMREM 时用到，用完立刻释放
+    room.dispose();
     this.scene.environmentIntensity = 0.8;
 
     this.grid = new THREE.GridHelper(20, 40, 0x4a5262, 0x2a2f3a);
@@ -1486,9 +1492,12 @@ export class FbxPlayer {
     this.transformControls?.dispose();
     this.transformControls = null;
     this.controls.dispose();
+    this.envTarget.dispose();
     this.pmrem.dispose();
     disposeObject(this.scene);
     this.renderer.dispose();
+    // 主动丢弃 WebGL 上下文：切换页签会反复重建播放器，靠浏览器 GC 回收太慢，容易撞上下文上限
+    this.renderer.forceContextLoss();
     this.renderer.domElement.remove();
     this.listeners = [];
   }
@@ -1597,6 +1606,9 @@ function disposeObject(root: THREE.Object3D): void {
   root.traverse((child) => {
     const mesh = child as THREE.Mesh;
     if (mesh.geometry) geometries.add(mesh.geometry);
+    // 骨骼贴图由渲染器首次绘制蒙皮网格时创建，挂在 skeleton 上，材质遍历拿不到它
+    const skinned = child as THREE.SkinnedMesh;
+    if (skinned.isSkinnedMesh && skinned.skeleton?.boneTexture) skinned.skeleton.boneTexture.dispose();
     const list = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
     for (const material of list) {
       if (!material) continue;
