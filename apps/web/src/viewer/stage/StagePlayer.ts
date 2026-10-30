@@ -88,6 +88,9 @@ const PATH_SAMPLES = 36;
 /** 段间站位差超过该值即视为换位过渡 */
 const TRAVEL_EPSILON = 0.05;
 
+/** FBX 源缓存上限：长会话里反复换素材时不能无限堆模型 */
+const FBX_CACHE_LIMIT = 16;
+
 /** 交叉窗口内两段站位不同：正在走过去，不能锁脚，否则补偿会把位移抵消掉 */
 function isTravelWindow(poses: readonly SegmentPose[], slots: readonly { index: number }[]): boolean {
   if (slots.length < 2) return false;
@@ -310,6 +313,7 @@ export class StagePlayer {
 
     if (!doc) {
       this.clearActors();
+      this.pruneFbxCache();
       this.durationValue = 0;
       this.time = 0;
       this.emit(true);
@@ -673,6 +677,8 @@ export class StagePlayer {
     this.refreshPath();
     this.attachGizmo();
     this.apply(this.time);
+    // 新角色/片段都装好之后，回收这份文档不再引用的旧源
+    this.pruneFbxCache();
     this.emit(true);
   }
 
@@ -686,6 +692,39 @@ export class StagePlayer {
     const actor = new FbxActor(def);
     actor.install(source);
     return actor;
+  }
+
+  /** 当前文档实际引用的 FBX 路径：这些源被角色克隆共享，不能提前释放 */
+  private usedFbxPaths(): Set<string> {
+    const used = new Set<string>();
+    const doc = this.doc;
+    if (!doc) return used;
+    for (const actor of doc.actors) {
+      if (actor.kind === 'fbx' && actor.modelPath) used.add(actor.modelPath);
+    }
+    for (const segment of doc.segments) {
+      if (segment.source.kind === 'fbx-clip') used.add(segment.source.fbxPath);
+    }
+    return used;
+  }
+
+  /**
+   * 缓存超出上限时回收当前文档不再引用的 FBX 源（按加入顺序，先回收最旧的）。
+   * 角色是克隆体、与源共享几何体 / 材质 / 贴图，所以只动确定不再使用的源。
+   */
+  private pruneFbxCache(): void {
+    if (this.fbxCache.size <= FBX_CACHE_LIMIT) return;
+    const used = this.usedFbxPaths();
+    for (const [path, pending] of this.fbxCache) {
+      if (this.fbxCache.size <= FBX_CACHE_LIMIT) break;
+      if (used.has(path)) continue;
+      this.fbxCache.delete(path);
+      // 仍在加载的源：等它落地后立刻释放，避免刚回收又泄漏一个完整模型
+      void pending.then(
+        (source) => disposeObject(source.object),
+        () => undefined,
+      );
+    }
   }
 
   private loadFbx(path: string): Promise<FbxSource> {

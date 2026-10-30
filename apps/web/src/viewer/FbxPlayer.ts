@@ -12,6 +12,8 @@ import {
   type BoneNode,
   type FlatBone,
 } from './SkeletonOverlay';
+// 仅复用「被新请求取代」的错误类型，不引入 ModelViewer 的实现
+import { ViewerCanceledError } from './ModelViewer';
 
 export interface ClipInfo {
   name: string;
@@ -273,6 +275,8 @@ export class FbxPlayer {
   private readonly scratchQ = new THREE.Quaternion();
   private readonly scratchPlane = new THREE.Plane();
   private disposed = false;
+  /** 递增令牌：切换文件 / 清空后丢弃在途的模型加载结果 */
+  private loadToken = 0;
   private gridOn = true;
   private mirrorOn = false;
   private inPlaceOn = false;
@@ -1104,8 +1108,14 @@ export class FbxPlayer {
 
   /** 加载 FBX（只读读取，加载完成后源文件不再被占用） */
   async load(url: string): Promise<LoadResult> {
+    const token = ++this.loadToken;
     const loader = new FBXLoader();
     const object = await loader.loadAsync(url);
+    // 加载期间切换了文件 / 播放器已销毁：本次结果已过期，释放后丢弃
+    if (this.disposed || token !== this.loadToken) {
+      disposeObject(object);
+      throw new ViewerCanceledError();
+    }
     return this.installModel(object, object.animations ?? []);
   }
 
@@ -1414,6 +1424,8 @@ export class FbxPlayer {
   }
 
   clear(): void {
+    // 让在途的加载结果作废：它返回时场景里已经不是这个模型了
+    this.loadToken += 1;
     if (this.mixer) {
       this.mixer.stopAllAction();
       this.mixer.uncacheRoot(this.mixer.getRoot() as THREE.Object3D);
@@ -1482,7 +1494,10 @@ export class FbxPlayer {
   }
 
   dispose(): void {
+    // 组件卸载与播放器自身都可能调用 dispose：幂等，避免二次释放 renderer / 场景
+    if (this.disposed) return;
     this.disposed = true;
+    this.loadToken += 1;
     this.renderer.setAnimationLoop(null);
     this.renderer.domElement.removeEventListener('wheel', this.onWheelZoom);
     this.resizeObserver.disconnect();

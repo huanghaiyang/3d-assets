@@ -39,9 +39,19 @@ const log = createLogger('anim');
 
 const MAX_FILES = 3000;
 const MAX_DEPTH = 4;
+/** 单个 FBX 的体积上限：再大就不适合整块读进内存（避免误读超大文件把服务拖住） */
+const MAX_FBX_BYTES = 200 * 1024 * 1024;
 
 function isFbx(name: string): boolean {
   return path.extname(name).toLowerCase() === '.fbx';
+}
+
+/** target 是否落在某个已记录的文件夹内（Windows 下路径大小写不敏感） */
+function insideDir(target: string, dir: string): boolean {
+  const normalize = (value: string) => (process.platform === 'win32' ? value.toLowerCase() : value);
+  const file = normalize(target);
+  const root = normalize(dir);
+  return file === root || file.startsWith(`${root}${path.sep}`) || file.startsWith(`${root}/`);
 }
 
 interface AnimationFile {
@@ -312,9 +322,7 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
     }
 
     const { dirs } = await effectiveDirs();
-    const inside = dirs.some(
-      (dir) => target === dir || target.startsWith(`${dir}${path.sep}`) || target.startsWith(`${dir}/`),
-    );
+    const inside = dirs.some((dir) => insideDir(target, dir));
     if (!inside) return reply.code(403).send({ error: '只能为已记录的动画文件夹生成封面' });
 
     const stat = await fs.stat(target).catch(() => null);
@@ -376,6 +384,12 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
       return reply.code(415).send({ error: '动画预览只读取 .fbx 文件' });
     }
 
+    // 只允许读取已记录文件夹内的文件：否则任意绝对路径都能被读走
+    const { dirs } = await effectiveDirs();
+    if (!dirs.some((dir) => insideDir(target, dir))) {
+      return reply.code(403).send({ error: '只能读取已记录的动画文件夹内的文件' });
+    }
+
     let stat;
     try {
       stat = await fs.stat(target);
@@ -383,6 +397,12 @@ export async function registerAnimationRoutes(app: FastifyInstance, deps: Animat
       return reply.code(404).send({ error: '文件不存在' });
     }
     if (!stat.isFile()) return reply.code(404).send({ error: '不是文件' });
+    // 整块读入内存前先按体积拒绝：既防误读超大文件，也避免一个请求吃掉大量内存
+    if (stat.size > MAX_FBX_BYTES) {
+      return reply.code(413).send({
+        error: `文件过大（${(stat.size / 1024 / 1024).toFixed(1)} MB），动画预览上限 ${MAX_FBX_BYTES / 1024 / 1024} MB`,
+      });
+    }
 
     try {
       const data = await fs.readFile(target);

@@ -78,6 +78,11 @@ export const config = {
   pollIntervalMs: int(process.env.POLL_INTERVAL_MS, 5000),
   /** 本地并发上限，接口默认提供 3 个并发 */
   maxConcurrency: Math.min(int(process.env.MAX_CONCURRENCY, 3), 3),
+  /**
+   * 单个生成任务的整体超时（毫秒）。
+   * 超过后停止跟踪并标记失败，避免远端卡死时任务永远停在「生成中」。
+   */
+  jobTimeoutMs: int(process.env.JOB_TIMEOUT_MS, 30 * 60_000),
   /** Kimodo 文生动作（本地 CPU 推理），路径全部由 .env 指定 */
   kimodo: {
     /** kmd-generate 可执行文件（必填，未配置时功能不可用） */

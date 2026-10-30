@@ -60,7 +60,8 @@ function providerQuery(provider?: ProviderId | null): string {
 }
 
 export const api = {
-  state: (limit = 300) => request<StateResponse>(`/api/state?limit=${limit}`),
+  state: (limit = 300, signal?: AbortSignal) =>
+    request<StateResponse>(`/api/state?limit=${limit}`, { signal }),
   settings: () => request<SettingsSummary>('/api/settings'),
   providers: () => request<{ providers: ProviderSummary[] }>('/api/providers'),
 

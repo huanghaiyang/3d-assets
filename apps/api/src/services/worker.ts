@@ -14,6 +14,8 @@ const log = createLogger('worker');
 export interface WorkerOptions {
   pollIntervalMs: number;
   maxConcurrency: number;
+  /** 单任务整体超时（毫秒）：远端卡死时任务不会永远停在「生成中」 */
+  jobTimeoutMs: number;
 }
 
 export type RetryMode = 'resume' | 'resubmit';
@@ -123,6 +125,9 @@ export class GenerationWorker {
       return;
     }
 
+    // 本次运行的截止时间：每次重试都重新计时
+    const deadline = Date.now() + this.options.jobTimeoutMs;
+
     try {
       let remoteJobId = snapshot.remoteJobId;
       if (!remoteJobId) {
@@ -170,6 +175,17 @@ export class GenerationWorker {
             job.phase = 'canceled';
             job.finishedAt = new Date().toISOString();
           });
+          return;
+        }
+
+        // 整体超时：远端长时间不结束时主动收尾，把任务标成失败而不是一直等待
+        if (Date.now() > deadline) {
+          const minutes = Math.round(this.options.jobTimeoutMs / 60_000);
+          await this.fail(
+            jobId,
+            `任务超过 ${minutes} 分钟仍未完成，已停止跟踪（远端可能仍会计费，可重试继续查询）`,
+            'LocalTimeout',
+          );
           return;
         }
 

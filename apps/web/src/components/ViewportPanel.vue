@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import Icon from './ui/Icon.vue';
-import { ModelViewer, type MeshStats } from '@/viewer/ModelViewer';
+import { ModelViewer, ViewerCanceledError, type MeshStats } from '@/viewer/ModelViewer';
 import { pickPreviewTarget } from '@/viewer/assetTarget';
 import { useWorkspaceStore, isActive } from '@/stores/workspace';
 import { useNow } from '@/composables/useNow';
@@ -78,9 +78,13 @@ const estimatedProgress = computed(() => {
   return Math.min(95, Math.round(estimated));
 });
 
+/** 递增令牌：连续切换素材时丢弃过期的一次加载，避免旧结果覆盖新素材的状态 */
+let loadToken = 0;
+
 async function loadAsset(target: Asset | null): Promise<void> {
   const instance = viewer.value;
   if (!instance) return;
+  const token = ++loadToken;
   loadError.value = null;
 
   if (!target) {
@@ -107,7 +111,10 @@ async function loadAsset(target: Asset | null): Promise<void> {
   orientationCorrected.value = false;
   resetAnimationPreview();
   try {
-    stats.value = await instance.load(loadTarget);
+    const loaded = await instance.load(loadTarget);
+    // 加载期间又切了素材：本次结果已过期，状态留给后一次加载写
+    if (token !== loadToken) return;
+    stats.value = loaded;
     instance.setWireframe(store.wireframe);
     instance.setGrid(store.showGrid);
     instance.setAutoRotate(store.autoRotate);
@@ -117,11 +124,13 @@ async function loadAsset(target: Asset | null): Promise<void> {
     store.setNodeTree(instance.sceneNodes);
     instance.setNodeSelection(store.selectedNodeIds);
   } catch (err) {
+    // 被新素材取代的加载不算失败
+    if (token !== loadToken || err instanceof ViewerCanceledError) return;
     loadError.value = (err as Error).message;
     stats.value = null;
     store.setNodeTree([]);
   } finally {
-    loading.value = false;
+    if (token === loadToken) loading.value = false;
   }
 }
 
@@ -221,6 +230,8 @@ async function autoRig(): Promise<void> {
     // 绑骨成功后才需要动画列表，懒加载避免白跑一次文件夹扫描
     void ensureAnimationList();
   } catch (err) {
+    // 绑骨期间切换了素材：感受不到这次绑骨，静默忽略
+    if (err instanceof ViewerCanceledError) return;
     store.toast('error', err instanceof Error ? err.message : '自动绑骨失败');
   } finally {
     rigging.value = false;

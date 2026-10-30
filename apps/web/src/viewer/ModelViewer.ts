@@ -46,6 +46,17 @@ const MAX_WIREFRAME_OVERLAY_TRIANGLES = 150_000;
 export const PREVIEWABLE_FORMATS = ['glb', 'gltf', 'obj', 'stl', 'fbx'];
 
 /**
+ * 加载 / 绑骨在新请求或播放器销毁后被打断时抛出。
+ * 这不是真正的失败，调用方应当静默忽略，不要弹「加载失败」。
+ */
+export class ViewerCanceledError extends Error {
+  constructor() {
+    super('操作已被新的请求取代');
+    this.name = 'ViewerCanceledError';
+  }
+}
+
+/**
  * 工作区三维预览器：负责模型加载、取景、线框叠加、网格地面与截图。
  * 只做工作区需要的功能，不含动画/材质编辑等编辑器能力。
  */
@@ -76,6 +87,10 @@ export class ModelViewer {
   private wireOverlay: THREE.Group | null = null;
   private stats: MeshStats | null = null;
   private disposed = false;
+  /** 递增令牌：切换素材 / 清空后丢弃在途的模型加载结果 */
+  private loadToken = 0;
+  /** 递增令牌：切换素材 / 清空后丢弃在途的自动绑骨结果 */
+  private autoRigToken = 0;
   private wireframeOn = false;
   private gridOn = true;
 
@@ -260,7 +275,14 @@ export class ModelViewer {
 
   /** 加载并自动取景；返回网格统计信息 */
   async load(target: LoadTarget): Promise<MeshStats> {
+    const token = ++this.loadToken;
     const object = await this.loadObject(target);
+    // 加载期间切换了素材 / 播放器已销毁：本次结果已过期，释放后丢弃，
+    // 否则过期模型会装上画面并覆盖新素材的状态
+    if (this.disposed || token !== this.loadToken) {
+      disposeObject(object);
+      throw new ViewerCanceledError();
+    }
     this.clear();
 
     object.traverse((child) => {
@@ -337,17 +359,24 @@ export class ModelViewer {
       }
       case 'obj': {
         const loader = new OBJLoader();
+        let materialCreator: MTLLoader.MaterialCreator | null = null;
         if (target.materialUrl) {
           try {
             const mtlLoader = new MTLLoader();
-            const materials = await mtlLoader.loadAsync(target.materialUrl);
-            materials.preload();
-            loader.setMaterials(materials);
+            materialCreator = await mtlLoader.loadAsync(target.materialUrl);
+            materialCreator.preload();
+            loader.setMaterials(materialCreator);
           } catch {
             // 材质加载失败时退化为默认材质
           }
         }
-        return await loader.loadAsync(target.url);
+        try {
+          return await loader.loadAsync(target.url);
+        } catch (err) {
+          // 模型解析失败时材质已经建好但不会有人用了，就地释放，避免一次失败泄漏一批贴图
+          if (materialCreator) disposeMaterialCreator(materialCreator);
+          throw err;
+        }
       }
       case 'stl': {
         const geometry = await new STLLoader().loadAsync(target.url);
@@ -386,6 +415,9 @@ export class ModelViewer {
   }
 
   clear(): void {
+    // 让在途的加载 / 绑骨结果作废：它们返回时模型已经不是当前这一份
+    this.loadToken += 1;
+    this.autoRigToken += 1;
     this.clearNodeSelection();
     this.sceneTree = [];
     // 先停动画（此时 modelRoot 还在，可还原姿态、解绑混音器），再拆场景对象
@@ -479,7 +511,13 @@ export class ModelViewer {
   async autoRig(onProgress?: AutoRigProgress): Promise<AutoRigResult> {
     if (!this.modelRoot) throw new Error('当前没有已加载的模型');
     if (this.hasSkeleton) throw new Error('模型已包含骨架，无需自动绑定');
-    const result = await autoRigHumanoid(this.modelRoot, onProgress);
+    const token = ++this.autoRigToken;
+    const root = this.modelRoot;
+    const result = await autoRigHumanoid(root, onProgress);
+    // 绑骨期间切换了素材 / 播放器已销毁：不能把骨架状态记到新的模型上
+    if (this.disposed || token !== this.autoRigToken || this.modelRoot !== root) {
+      throw new ViewerCanceledError();
+    }
     this.rigged = true;
     // 记录绑定姿态：播放 / 停止动画时都从它出发，保证预览不会污染原始姿势
     this.captureRigRestPose();
@@ -847,4 +885,14 @@ function disposeObject(root: THREE.Object3D): void {
   for (const geometry of geometries) geometry.dispose();
   for (const material of materials) material.dispose();
   for (const texture of textures) texture.dispose();
+}
+
+/** 释放 MTL 解析出的材质与贴图（MaterialCreator 没有 dispose，只能逐个释放） */
+function disposeMaterialCreator(creator: MTLLoader.MaterialCreator): void {
+  for (const material of creator.getAsArray()) {
+    for (const value of Object.values(material as unknown as Record<string, unknown>)) {
+      if (value instanceof THREE.Texture) value.dispose();
+    }
+    material.dispose();
+  }
 }

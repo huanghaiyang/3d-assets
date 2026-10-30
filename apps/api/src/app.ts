@@ -55,6 +55,7 @@ export async function buildApp(): Promise<AppContext> {
   const worker = new GenerationWorker(workspace, {
     pollIntervalMs: config.pollIntervalMs,
     maxConcurrency: config.maxConcurrency,
+    jobTimeoutMs: config.jobTimeoutMs,
   });
 
   const app = Fastify({

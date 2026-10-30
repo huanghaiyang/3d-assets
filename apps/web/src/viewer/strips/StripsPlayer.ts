@@ -65,6 +65,9 @@ export interface StripsBakeResult {
   clip: THREE.AnimationClip;
 }
 
+/** FBX 源缓存上限：长会话里反复换素材时不能无限堆模型 */
+const FBX_CACHE_LIMIT = 16;
+
 /** 单条来源片段的加载状态，供检查器/时间轴显示 loading / 失败 */
 export type StripClipStatus = 'loading' | 'ready' | 'error';
 
@@ -397,6 +400,8 @@ export class StripsPlayer {
       this.buildTrajectory();
       this.buildSkeletonLines();
       this.resetCamera();
+      // 换模型后旧 base 已销毁，可以回收不再引用的源
+      this.pruneFbxCache();
       this.emit(true);
       return true;
     } catch (error) {
@@ -483,6 +488,8 @@ export class StripsPlayer {
 
     this.apply(this.time);
     this.updateTrajectory();
+    // 新的来源集合都装好了，回收不再引用的旧源
+    this.pruneFbxCache();
     this.emit(true);
   }
 
@@ -766,6 +773,35 @@ export class StripsPlayer {
   /** 广播单条来源片段的加载状态 */
   private emitClip(event: StripClipEvent): void {
     for (const listener of this.clipListeners) listener(event);
+  }
+
+  /** 当前正在使用的 FBX 路径：base 与各 fb-clip 来源，这些源被角色/片段引用，不能提前释放 */
+  private usedFbxPaths(): Set<string> {
+    const used = new Set<string>();
+    if (this.basePath) used.add(this.basePath);
+    for (const strip of this.strips) {
+      if (strip.source.kind === 'fbx-clip') used.add(strip.source.fbxPath);
+    }
+    return used;
+  }
+
+  /**
+   * 缓存超出上限时回收不再引用的 FBX 源（按加入顺序，先回收最旧的）。
+   * base 与条目骨架都是克隆体、与源共享几何体 / 材质 / 贴图，只动确定不再使用的源。
+   */
+  private pruneFbxCache(): void {
+    if (this.fbxCache.size <= FBX_CACHE_LIMIT) return;
+    const used = this.usedFbxPaths();
+    for (const [path, pending] of this.fbxCache) {
+      if (this.fbxCache.size <= FBX_CACHE_LIMIT) break;
+      if (used.has(path)) continue;
+      this.fbxCache.delete(path);
+      // 仍在加载的源：等它落地后立刻释放，避免刚回收又泄漏一个完整模型
+      void pending.then(
+        (source) => disposeObject(source.object),
+        () => undefined,
+      );
+    }
   }
 
   /**

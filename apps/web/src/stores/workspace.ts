@@ -273,6 +273,10 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   let pollTimer: number | null = null;
   let followJobId: string | null = null;
   let toastSeq = 0;
+  /** 在途的刷新请求：并发触发时共享同一个 Promise，避免请求越堆越多 */
+  let refreshInFlight: Promise<void> | null = null;
+  /** 刷新序号：旧响应不能覆盖新状态 */
+  let refreshSeq = 0;
 
   const selectedJob = computed(() => jobs.value.find((job) => job.id === selectedId.value) ?? null);
   const selectedAsset = computed(() => selectedJob.value?.asset ?? null);
@@ -305,9 +309,28 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     toasts.value = toasts.value.filter((item) => item.id !== id);
   }
 
-  async function refresh(): Promise<void> {
+  /** 单次刷新的超时兜底：后端卡住时不能在途请求一直挂着 */
+  const REFRESH_TIMEOUT_MS = 15_000;
+
+  /**
+   * 刷新任务 / 设置状态。
+   * 轮询、切回页面与操作后的主动刷新可能同时触发：已有请求在途时直接复用它，
+   * 既防止请求叠加，也保证前端只保留最新一次响应。
+   */
+  function refresh(): Promise<void> {
+    if (refreshInFlight) return refreshInFlight;
+    const seq = ++refreshSeq;
+    refreshInFlight = runRefresh(seq).finally(() => {
+      refreshInFlight = null;
+    });
+    return refreshInFlight;
+  }
+
+  async function runRefresh(seq: number): Promise<void> {
     try {
-      const state = await api.state();
+      const state = await api.state(300, AbortSignal.timeout(REFRESH_TIMEOUT_MS));
+      // 被更新的一次刷新抢先完成时，旧响应不能覆盖新状态
+      if (seq !== refreshSeq) return;
       jobs.value = state.jobs;
       settings.value = state.api;
       queue.value = state.queue;
@@ -359,6 +382,11 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     }
   }
 
+  /** 切回页面时立刻补一次刷新（轮询定时器在后台会被浏览器降频） */
+  function onVisibilityChange(): void {
+    if (!document.hidden) void refresh();
+  }
+
   function startPolling(): void {
     if (pollTimer !== null) return;
     void refresh();
@@ -366,9 +394,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     pollTimer = window.setInterval(() => {
       if (!document.hidden) void refresh();
     }, POLL_INTERVAL_MS);
-    document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) void refresh();
-    });
+    document.addEventListener('visibilitychange', onVisibilityChange);
   }
 
   function stopPolling(): void {
@@ -376,6 +402,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       window.clearInterval(pollTimer);
       pollTimer = null;
     }
+    // 监听必须成对移除：否则停掉轮询后每次切回页面仍会触发刷新
+    document.removeEventListener('visibilitychange', onVisibilityChange);
   }
 
   function select(jobId: string | null): void {

@@ -195,7 +195,11 @@ async function main(): Promise<void> {
     globalThis.fetch = (async () => new Response('{"error":"mock"}', { status: 500 })) as typeof fetch;
 
     const ws = await Workspace.open();
-    const worker = new GenerationWorker(ws, { pollIntervalMs: 1_000, maxConcurrency: 1 });
+    const worker = new GenerationWorker(ws, {
+      pollIntervalMs: 1_000,
+      maxConcurrency: 1,
+      jobTimeoutMs: 30 * 60_000,
+    });
 
     const queued = await worker.cancel('j_queued');
     check('未提交到远端：not-submitted', queued.canceled && queued.remote === 'not-submitted', queued);

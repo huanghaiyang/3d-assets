@@ -37,6 +37,8 @@ import {
   type TransformSpace,
 } from '@/viewer/FbxPlayer';
 import type { BoneDisplayMode, BoneNode, FlatBone } from '@/viewer/SkeletonOverlay';
+// 仅用于识别「被新选择取代」的加载，静默忽略而不是弹加载失败
+import { ViewerCanceledError } from '@/viewer/ModelViewer';
 import { matchToken } from '@/utils/fuzzy';
 import { applyFingerPoses, type FingerApplyResult, type FingerApplyTarget } from '@/utils/fingerPose';
 
@@ -419,8 +421,12 @@ export const useAnimationStore = defineStore('animation', () => {
 
   // ===== 播放 =====
 
+  /** 递增令牌：连续切换素材时丢弃过期的一次加载结果 */
+  let selectToken = 0;
+
   async function select(file: AnimationFile): Promise<void> {
     if (!player) return;
+    const token = ++selectToken;
     if (poseMode.value) setPoseMode(false);
     closeAnimationData();
     activeNewAnimationId.value = null;
@@ -432,6 +438,8 @@ export const useAnimationStore = defineStore('animation', () => {
     viewError.value = null;
     try {
       const result = await player.load(animationApi.fileUrl(file.path));
+      // 加载期间又选了别的文件：本次结果已过期，不覆盖新选择的状态
+      if (token !== selectToken) return;
       selectedClips.value = result.clips;
       selectedStats.value = result.stats;
       player.setGrid(showGrid.value);
@@ -462,12 +470,14 @@ export const useAnimationStore = defineStore('animation', () => {
         toast('info', '该 FBX 不包含动画片段，只显示静态模型');
       }
     } catch (err) {
+      // 被新选择取代的加载不算失败
+      if (token !== selectToken || err instanceof ViewerCanceledError) return;
       viewError.value = (err as Error).message;
       selectedClips.value = [];
       selectedStats.value = null;
       toast('error', `加载失败：${viewError.value}`);
     } finally {
-      viewLoading.value = false;
+      if (token === selectToken) viewLoading.value = false;
     }
   }
 
