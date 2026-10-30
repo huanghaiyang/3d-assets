@@ -44,20 +44,114 @@ const emptyTexture = () => new THREE.Texture();
 let pngModulePromise = null;
 let jpegModulePromise = null;
 
-/** 把 PNG/JPEG 字节解码成 RGBA */
+/** 封面贴图最大边长：封面只有 256px，8192² 的原图上传到 headless-gl 又慢又费内存 */
+const MAX_COVER_TEXTURE_SIZE = 1024;
+/**
+ * jpeg-js 默认只给 512MB 解码内存，超了直接抛错。
+ * 生成模型的贴图常见 4096² / 8192²（8192² 全量解码需要 800MB+），
+ * 一旦解码失败 GLTFLoader 会丢掉 baseColorTexture，材质退回默认白色 → 封面就成了「白模」。
+ * 所以超过这个阈值就先走「只解 DC 系数」的 1/8 降采样路径（见 decodeJpegDownscaled）；
+ * 只有降采样不支持的格式（如渐进式 JPEG）才退回全量解码，并按像素量把上限放宽到 1024MB。
+ */
+const JPEG_FULL_DECODE_MB = 512;
+const MAX_JPEG_DECODE_MB = 1024;
+
+/** 从 SOF 段读出 JPEG 尺寸（扫描头里不包含完整图像，只解段头） */
+function jpegDimensions(bytes) {
+  let offset = 2;
+  while (offset + 9 < bytes.length) {
+    if (bytes[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    const marker = bytes[offset + 1];
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      return {
+        height: (bytes[offset + 5] << 8) | bytes[offset + 6],
+        width: (bytes[offset + 7] << 8) | bytes[offset + 8],
+      };
+    }
+    offset += 2 + ((bytes[offset + 2] << 8) | bytes[offset + 3]);
+  }
+  return null;
+}
+
+/** 等比缩到 maxSize 以内（按面积平均降采样），过大贴图不必原样交给 WebGL */
+function shrinkRgba(image, maxSize = MAX_COVER_TEXTURE_SIZE) {
+  const { width, height, rgba } = image;
+  if (width <= maxSize && height <= maxSize) return image;
+  const scale = Math.max(width, height) / maxSize;
+  const outWidth = Math.max(1, Math.round(width / scale));
+  const outHeight = Math.max(1, Math.round(height / scale));
+  const out = Buffer.alloc(outWidth * outHeight * 4);
+  const stepX = width / outWidth;
+  const stepY = height / outHeight;
+  for (let y = 0; y < outHeight; y += 1) {
+    const y0 = Math.floor(y * stepY);
+    const y1 = Math.max(y0 + 1, Math.floor((y + 1) * stepY));
+    for (let x = 0; x < outWidth; x += 1) {
+      const x0 = Math.floor(x * stepX);
+      const x1 = Math.max(x0 + 1, Math.floor((x + 1) * stepX));
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let a = 0;
+      let count = 0;
+      for (let sy = y0; sy < y1; sy += 1) {
+        const row = sy * width;
+        for (let sx = x0; sx < x1; sx += 1) {
+          const i = (row + sx) * 4;
+          r += rgba[i];
+          g += rgba[i + 1];
+          b += rgba[i + 2];
+          a += rgba[i + 3];
+          count += 1;
+        }
+      }
+      const o = (y * outWidth + x) * 4;
+      out[o] = Math.round(r / count);
+      out[o + 1] = Math.round(g / count);
+      out[o + 2] = Math.round(b / count);
+      out[o + 3] = Math.round(a / count);
+    }
+  }
+  return { width: outWidth, height: outHeight, rgba: out };
+}
+
+/** 把 PNG/JPEG 字节解码成 RGBA（超大图降到 MAX_COVER_TEXTURE_SIZE 以内） */
 async function decodeImageBuffer(bytes) {
   if (bytes.length > 8 && bytes[0] === 0x89 && bytes.toString('ascii', 1, 4) === 'PNG') {
     if (!pngModulePromise) pngModulePromise = import('pngjs');
     const mod = await pngModulePromise;
     const PNG = mod.PNG ?? mod.default?.PNG;
     const png = PNG.sync.read(bytes);
-    return { width: png.width, height: png.height, rgba: png.data };
+    return shrinkRgba({ width: png.width, height: png.height, rgba: png.data });
   }
   if (bytes.length > 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
     if (!jpegModulePromise) jpegModulePromise = import('jpeg-js').then((mod) => mod.default ?? mod);
     const jpeg = await jpegModulePromise;
-    const decoded = jpeg.decode(bytes, { useTArray: true, formatAsRGBA: true });
-    return { width: decoded.width, height: decoded.height, rgba: Buffer.from(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength) };
+    const size = jpegDimensions(bytes);
+    const requiredMb = size
+      ? Math.ceil((size.width * size.height * 12) / 1048576) + 48
+      : MAX_JPEG_DECODE_MB;
+    if (requiredMb > JPEG_FULL_DECODE_MB) {
+      // 超大贴图：全量解码要 800MB+ 且慢，先走内存几 MB 的 1/8 降采样路径
+      try {
+        return shrinkRgba(decodeJpegDownscaled(bytes));
+      } catch {
+        /* 结构不支持降采样（如渐进式 JPEG）时退回全量解码 */
+      }
+    }
+    const decoded = jpeg.decode(bytes, {
+      useTArray: true,
+      formatAsRGBA: true,
+      maxMemoryUsageInMB: Math.max(512, Math.min(MAX_JPEG_DECODE_MB, requiredMb)),
+    });
+    return shrinkRgba({
+      width: decoded.width,
+      height: decoded.height,
+      rgba: Buffer.from(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength),
+    });
   }
   return null;
 }
@@ -92,7 +186,13 @@ THREE.TextureLoader.prototype.load = function load(url, onLoad, _onProgress, onE
         texture.needsUpdate = true;
         onLoad?.(texture);
       })
-      .catch((err) => onError?.(err));
+      .catch((err) => {
+        // 解码失败后 GLTFLoader 会丢掉这张贴图，材质只剩底色，这里至少留下日志便于排查
+        console.warn(
+          `[covers] 贴图解码失败（${err instanceof Error ? err.message : String(err)}），该材质将退化为纯色`,
+        );
+        onError?.(err);
+      });
     return emptyTexture();
   }
   const texture = emptyTexture();
@@ -317,13 +417,18 @@ function decodePngAverage(bytes) {
   return [r / weightSum / 255, g / weightSum / 255, b / weightSum / 255];
 }
 
-/** 取 JPEG 的平均颜色：只解 DC 系数（逐块平均值），不重建像素 */
-let lastJpegDebug = null;
-function decodeJpegAverage(bytes) {
+/**
+ * 解析 JPEG 段头（读到第一个 SOS 为止）。
+ * @returns {{frame, scanComponents, quantTables, huffmanTables, restartInterval, scanOffset}}
+ *   scanOffset 为熵编码数据起点；-1 表示文件里没有扫描数据。
+ */
+function parseJpegSegments(bytes) {
   const quantTables = new Map();
   const huffmanTables = new Map();
   let frame = null;
   let restartInterval = 0;
+  let scanOffset = -1;
+  let scanComponents = [];
   let offset = 2;
 
   const readUInt16 = (position) => (bytes[position] << 8) | bytes[position + 1];
@@ -392,7 +497,7 @@ function decodeJpegAverage(bytes) {
     } else if (marker === 0xda) {
       if (!frame) throw new Error('JPEG 缺少 SOF');
       const count = segment[0];
-      const scanComponents = [];
+      scanComponents = [];
       for (let i = 0; i < count; i += 1) {
         const base = 1 + i * 2;
         const component = frame.components.find((item) => item.id === segment[base]);
@@ -401,7 +506,7 @@ function decodeJpegAverage(bytes) {
         component.acTable = segment[base + 1] & 0x0f;
         scanComponents.push(component);
       }
-      decodeJpegScan(bytes, offset, frame, scanComponents, quantTables, huffmanTables, restartInterval);
+      scanOffset = offset;
       break;
     } else if (marker === 0xc2) {
       throw new Error('渐进式 JPEG 不支持');
@@ -409,6 +514,16 @@ function decodeJpegAverage(bytes) {
   }
 
   if (!frame) throw new Error('JPEG 解析失败');
+  return { frame, scanComponents, quantTables, huffmanTables, restartInterval, scanOffset };
+}
+
+/** 取 JPEG 的平均颜色：只解 DC 系数（逐块平均值），不重建像素 */
+let lastJpegDebug = null;
+function decodeJpegAverage(bytes) {
+  const { frame, scanComponents, quantTables, huffmanTables, restartInterval, scanOffset } = parseJpegSegments(bytes);
+  if (scanOffset >= 0) {
+    decodeJpegScan(bytes, scanOffset, frame, scanComponents, quantTables, huffmanTables, restartInterval);
+  }
   const maxH = Math.max(...frame.components.map((component) => component.h));
   const maxV = Math.max(...frame.components.map((component) => component.v));
   let ySum = 0;
@@ -456,6 +571,77 @@ function decodeJpegAverage(bytes) {
   return [clamp(red), clamp(green), clamp(blue)];
 }
 
+/**
+ * 超大 JPEG 的降采样解码：只取每个 8×8 块的 DC 系数（即该块平均色），
+ * 直接产出 1/8 分辨率的 RGBA（8192² → 1024²，内存几 MB）。
+ *
+ * 为什么要走这条路径：jpeg-js 全量解码 8192² 需要 800MB+ 内存（默认上限 512MB 直接报错），
+ * 而报错会让 GLTFLoader 丢掉 baseColorTexture，封面就渲染成白模。
+ * 封面输出只有 256px，1/8 分辨率完全够用。
+ *
+ * 只支持基线 JPEG（渐进式由调用方回退到全量解码）。
+ */
+function decodeJpegDownscaled(bytes) {
+  const parsed = parseJpegSegments(bytes);
+  if (parsed.scanOffset < 0) throw new Error('JPEG 没有扫描数据');
+  const { frame, scanComponents, quantTables, huffmanTables, restartInterval, scanOffset } = parsed;
+
+  const maxH = Math.max(...frame.components.map((component) => component.h));
+  const maxV = Math.max(...frame.components.map((component) => component.v));
+  const planes = new Map();
+  for (const component of frame.components) {
+    const columns = Math.ceil((frame.width * component.h) / (maxH * 8));
+    const rows = Math.ceil((frame.height * component.v) / (maxV * 8));
+    planes.set(component, { columns, rows, data: new Float32Array(columns * rows).fill(128) });
+  }
+
+  decodeJpegScan(bytes, scanOffset, frame, scanComponents, quantTables, huffmanTables, restartInterval, (component, blockRow, blockCol, value) => {
+    const plane = planes.get(component);
+    if (!plane || blockRow >= plane.rows || blockCol >= plane.columns) return;
+    plane.data[blockRow * plane.columns + blockCol] = value;
+  });
+
+  const luma = frame.components[0];
+  const lumaPlane = planes.get(luma);
+  const outWidth = lumaPlane.columns;
+  const outHeight = lumaPlane.rows;
+  const rgba = Buffer.alloc(outWidth * outHeight * 4);
+  const cb = frame.components[1];
+  const cr = frame.components[2];
+
+  /** 按分量采样率取该输出块对应的色度块 */
+  const sample = (component, x, y) => {
+    const plane = planes.get(component);
+    const column = Math.min(plane.columns - 1, Math.floor((x * component.h) / maxH));
+    const row = Math.min(plane.rows - 1, Math.floor((y * component.v) / maxV));
+    return plane.data[row * plane.columns + column];
+  };
+
+  for (let y = 0; y < outHeight; y += 1) {
+    for (let x = 0; x < outWidth; x += 1) {
+      const lumaValue = lumaPlane.data[y * outWidth + x];
+      const out = (y * outWidth + x) * 4;
+      if (!cb || !cr) {
+        // 灰度图：Y 分量直接作为 RGB
+        const gray = Math.max(0, Math.min(255, lumaValue));
+        rgba[out] = gray;
+        rgba[out + 1] = gray;
+        rgba[out + 2] = gray;
+        rgba[out + 3] = 255;
+        continue;
+      }
+      const cbValue = sample(cb, x, y) - 128;
+      const crValue = sample(cr, x, y) - 128;
+      rgba[out] = Math.max(0, Math.min(255, Math.round(lumaValue + 1.402 * crValue)));
+      rgba[out + 1] = Math.max(0, Math.min(255, Math.round(lumaValue - 0.344136 * cbValue - 0.714136 * crValue)));
+      rgba[out + 2] = Math.max(0, Math.min(255, Math.round(lumaValue + 1.772 * cbValue)));
+      rgba[out + 3] = 255;
+    }
+  }
+
+  return { width: outWidth, height: outHeight, rgba };
+}
+
 function buildHuffman(counts, symbols) {
   const table = new Map();
   const codes = new Map();
@@ -474,7 +660,12 @@ function buildHuffman(counts, symbols) {
   return table;
 }
 
-function decodeJpegScan(bytes, start, frame, components, quantTables, huffmanTables, restartInterval) {
+/**
+ * 解熵编码数据，逐块读出 DC 系数。
+ * @param {((component, blockRow, blockCol, value) => void) | null} onBlock
+ *   可选回调：拿到每个 8×8 块的平均值（降采样重建用）
+ */
+function decodeJpegScan(bytes, start, frame, components, quantTables, huffmanTables, restartInterval, onBlock = null) {
   let offset = start;
   let bitBuffer = 0;
   let bitCount = 0;
@@ -557,8 +748,12 @@ function decodeJpegScan(bytes, start, frame, components, quantTables, huffmanTab
             const dc = previous + diff;
             dcPredictors.set(component.id, dc);
             const quant = quantTables.get(component.quantId)?.[0] ?? 8;
-            component.dcSum += (dc * quant) / 8 + 128;
+            const blockValue = (dc * quant) / 8 + 128;
+            component.dcSum += blockValue;
             component.blocks += 1;
+            if (onBlock) {
+              onBlock(component, mcuRow * component.v + v, mcuCol * component.h + h, blockValue);
+            }
             // 跳过 AC 系数
             let k = 1;
             while (k < 64) {
@@ -663,6 +858,33 @@ function applyGlbMaterialColors(gltf, container) {
   });
 }
 
+/**
+ * WebGL 管线的兜底色：贴图没能加载出来（超大 JPEG 解码失败等）时，
+ * GLTF 的材质默认是白色，封面会变成「白模」。这里把贴图主色记到 userData，
+ * 提取渲染批次时用它替代白色。
+ */
+function stampFallbackColors(gltf, container) {
+  let colors;
+  try {
+    colors = glbMaterialAverages(container);
+  } catch {
+    return;
+  }
+  if (!colors.length) return;
+  gltf.scene.traverse((child) => {
+    if (!child.isMesh) return;
+    const materials = Array.isArray(child.material) ? child.material : [child.material];
+    for (const material of materials) {
+      if (!material || material.map?.image) continue;
+      const association = gltf.parser.associations.get(material);
+      const index = association?.materials;
+      if (typeof index !== 'number') continue;
+      const color = colors[index];
+      if (color) material.userData.coverFallbackColor = color;
+    }
+  });
+}
+
 // ===== 模型加载 =====
 
 function loadModel(filePath, options = {}) {
@@ -678,8 +900,9 @@ function loadModel(filePath, options = {}) {
         ext === 'gltf' ? buffer.toString('utf8') : array,
         activeBaseDir,
         (gltf) => {
-          // WebGL 管线用真实贴图，不需要“贴图主色”兜底；软件管线才替换材质颜色
-          if (container && !options.realTextures) applyGlbMaterialColors(gltf, container);
+          // WebGL 管线保留真实贴图，只给缺贴图的材质留兜底色；软件管线整体替换成贴图主色
+          if (container && options.realTextures) stampFallbackColors(gltf, container);
+          else if (container) applyGlbMaterialColors(gltf, container);
           resolve({ root: gltf.scene, animations: gltf.animations ?? [] });
         },
         (err) => reject(err instanceof Error ? err : new Error(String(err))),
@@ -1304,7 +1527,12 @@ function extractRenderBatches(root) {
       if (!batch) {
         const image = material.map?.image;
         batch = {
-          color: material.color ? [material.color.r, material.color.g, material.color.b] : [0.8, 0.8, 0.8],
+          // 贴图缺失时优先用贴图主色兜底（见 stampFallbackColors），否则才用材质底色
+          color: material.userData?.coverFallbackColor
+            ? material.userData.coverFallbackColor.slice()
+            : material.color
+              ? [material.color.r, material.color.g, material.color.b]
+              : [0.8, 0.8, 0.8],
           texture:
             image && image.data && image.width > 0 && image.height > 0
               ? { data: image.data, width: image.width, height: image.height }

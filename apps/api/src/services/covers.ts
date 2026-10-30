@@ -244,7 +244,7 @@ export function getCoverCacheDir(): string {
 }
 
 // 封面渲染行为变化时 +1，让旧缓存自然失效（文件 mtime 之外的第二层保险）
-export const COVER_CACHE_VERSION = '2';
+export const COVER_CACHE_VERSION = '3';
 
 /**
  * 缓存 key → 文件名：包含路径、mtime、尺寸、姿态，
