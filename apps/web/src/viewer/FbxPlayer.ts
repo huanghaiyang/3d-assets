@@ -319,7 +319,11 @@ export class FbxPlayer {
     this.axis =
       options.axisIndicator === false
         ? null
-        : new AxisIndicator(container, { bottom: options.axisIndicatorBottom ?? 14 });
+        : new AxisIndicator(container, {
+            bottom: options.axisIndicatorBottom ?? 14,
+            // 动画工作区与工作台的指示器设置各记一份
+            storageKey: 'axis-indicator:animation',
+          });
 
     this.camera = new THREE.PerspectiveCamera(40, 1, 0.05, 500);
     this.camera.position.set(2.4, 2.0, 3.2);

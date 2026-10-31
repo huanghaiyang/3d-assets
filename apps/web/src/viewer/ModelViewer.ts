@@ -234,8 +234,11 @@ export class ModelViewer {
     // 监听器必须早于 OrbitControls 注册（它构造时就挂到同一个 canvas 上），才能拦掉它自带的滚轮处理。
     this.renderer.domElement.addEventListener('wheel', this.onWheelZoom, { passive: false });
 
-    // 右下角 XYZ 轴向指示器（离屏缩略图渲染时不需要）
-    this.axis = options.axisIndicator === false ? null : new AxisIndicator(container);
+    // 右下角 XYZ 轴向指示器（离屏缩略图渲染时不需要）；设置按工作台单独记忆
+    this.axis =
+      options.axisIndicator === false
+        ? null
+        : new AxisIndicator(container, { storageKey: 'axis-indicator:workbench' });
 
     this.camera = new THREE.PerspectiveCamera(42, 1, 0.05, 500);
     this.camera.position.set(2.6, 2.1, 3.4);

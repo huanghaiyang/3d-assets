@@ -26,6 +26,7 @@ import {
 import { clipsFromAnimationData } from './clipFromAnimationData';
 import type { SomaPoseSample } from './somaRetarget';
 import { segmentColorNumber } from './segmentColors';
+import { AxisIndicator } from '../axisIndicator';
 
 export type GizmoMode = 'translate' | 'rotate';
 
@@ -109,6 +110,8 @@ export class StagePlayer {
   private readonly transform: TransformControls;
   private readonly selectionRing: THREE.Mesh;
   private readonly resizeObserver: ResizeObserver;
+  /** 右下角 XYZ 轴向指示器（抬到播放控制条上方，可调整 / 锁定） */
+  private readonly axis: AxisIndicator;
   private readonly clock = new THREE.Clock();
 
   private readonly runtimes = new Map<string, ActorRuntime>();
@@ -188,6 +191,12 @@ export class StagePlayer {
     // 上报的增量常常只有几像素，一格换算下来不到 1%，看起来就是「滚轮放大缩小失效」。
     // 监听器必须早于 OrbitControls 注册（它构造时就挂到同一个 canvas 上），才能拦掉它自带的滚轮处理。
     this.renderer.domElement.addEventListener('wheel', this.onWheelZoom, { passive: false });
+
+    // 右下角 XYZ 轴向指示器；底部是播放控制条，所以抬高放置。设置按舞台工作区单独记忆
+    this.axis = new AxisIndicator(container, {
+      bottom: 70,
+      storageKey: 'axis-indicator:stage',
+    });
 
     this.scene.background = null;
     this.scene.fog = new THREE.Fog(0x0b1220, 22, 46);
@@ -556,6 +565,7 @@ export class StagePlayer {
     this.token += 1;
     this.renderer.setAnimationLoop(null);
     this.resizeObserver.disconnect();
+    this.axis.dispose();
     this.renderer.domElement.removeEventListener('pointerdown', this.onPointerDown);
     this.renderer.domElement.removeEventListener('pointerup', this.onPointerUp);
     this.renderer.domElement.removeEventListener('wheel', this.onWheelZoom);
@@ -926,6 +936,7 @@ export class StagePlayer {
 
     // update() 返回 true 表示这一帧相机有变化（阻尼、用户拖拽）
     const cameraChanged = this.controls.update();
+    this.axis.update(this.camera);
     const now = performance.now();
     // 暂停且相机静止时把渲染降到约 20fps：舞台页常常同时挂着多个预览，空闲常渲很吃 GPU
     if (!this.playing && !cameraChanged && !this.renderRequested && now - this.lastRenderAt < 50) return;

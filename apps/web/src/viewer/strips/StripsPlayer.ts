@@ -28,6 +28,7 @@ import { clone as cloneSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.j
 import { animationApi } from '@/api/animation';
 import { kimodoApi } from '@/api/kimodo';
 import type { AnimationData } from '@/viewer/FbxPlayer';
+import { AxisIndicator } from '@/viewer/axisIndicator';
 import { filterShadowBones } from '@/viewer/SkeletonOverlay';
 import { FbxActor, type FbxSource } from '@/viewer/stage/FbxActor';
 import { disposeObject } from '@/viewer/stage/StageActor';
@@ -135,6 +136,8 @@ export class StripsPlayer {
   private readonly camera: THREE.PerspectiveCamera;
   private readonly controls: OrbitControls;
   private readonly resizeObserver: ResizeObserver;
+  /** 右下角 XYZ 轴向指示器（抬到播放控制条上方，可调整 / 锁定） */
+  private readonly axis: AxisIndicator;
   /** 每帧取 delta；暂停时也用它推进 OrbitControls 阻尼 */
   private readonly clock = new THREE.Clock();
 
@@ -221,6 +224,12 @@ export class StripsPlayer {
     // 上报的增量常常只有几像素，一格换算下来不到 1%，看起来就是「滚轮放大缩小失效」。
     // 监听器必须早于 OrbitControls 注册（它构造时就挂到同一个 canvas 上），才能拦掉它自带的滚轮处理。
     this.renderer.domElement.addEventListener('wheel', this.onWheelZoom, { passive: false });
+
+    // 右下角 XYZ 轴向指示器；底部是播放控制条，所以抬高放置。设置按拼接工作区单独记忆
+    this.axis = new AxisIndicator(container, {
+      bottom: 70,
+      storageKey: 'axis-indicator:strips',
+    });
 
     this.scene.background = null;
     this.scene.fog = new THREE.Fog(0x0b1220, 22, 46);
@@ -661,6 +670,7 @@ export class StripsPlayer {
     this.renderer.setAnimationLoop(null);
     this.renderer.domElement.removeEventListener('wheel', this.onWheelZoom);
     this.resizeObserver.disconnect();
+    this.axis.dispose();
     this.disposeBase();
     this.disposeFbxSources();
     this.controls.dispose();
@@ -709,6 +719,7 @@ export class StripsPlayer {
     }
     // update() 返回 true 表示这一帧相机有变化（阻尼、用户拖拽）
     const cameraChanged = this.controls.update();
+    this.axis.update(this.camera);
     const now = performance.now();
     // 暂停且相机静止时把渲染降到约 20fps：多个预览区同时挂载时空闲常渲非常吃 GPU
     if (!this.playing && !cameraChanged && !this.renderRequested && now - this.lastRenderAt < 50) return;
