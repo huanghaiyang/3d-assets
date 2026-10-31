@@ -125,14 +125,10 @@ function figurePos(joint: string): { x: number; y: number } {
   return MARKER_FIGURE[joint] ?? { x: 30, y: 50 };
 }
 
-/** Smart 标记行点击：未放置 → 进入添加模式；已放置 → 只选中（选中态在标题与示意图上高亮） */
+/** Smart 标记行点击：未放置 → 进入添加模式（只放标记，不生成骨骼）；已放置 → 只选中 */
 function pickArpMarker(joint: string): void {
   const instance = viewer.value;
   if (!instance) return;
-  if (!manualSnapshot.value) {
-    store.toast('info', '先点「猜测全部标记」或「添加骨架」生成参考骨');
-    return;
-  }
   if (!placedMarkers.value.has(joint)) {
     startMarkerPlacement(joint);
     return;
@@ -141,14 +137,15 @@ function pickArpMarker(joint: string): void {
 }
 
 /**
- * 添加一个标记（ARP 的 Add Markers）：没有参考骨时先建一副空骨架，
- * 随后下一个视口左键点击即为落点，Esc 或再点一次「取消添加」退出。
+ * 添加一个标记（ARP 的 Add Markers）：没有参考骨时只进入标记编辑，
+ * 不生成骨骼；随后下一个视口左键点击即为落点，Esc 或再点一次「取消添加」退出。
  */
 function startMarkerPlacement(joint: string): void {
   const instance = viewer.value;
   if (!instance || manualApplying.value) return;
   try {
-    if (!instance.isManualRigActive) instance.startManualRig();
+    // 没有参考骨时只建标记编辑会话，不生成骨骼：骨架会挡住标记落点和拖拽
+    if (!instance.isManualRigActive) instance.startManualRig({ createBones: false });
     instance.beginManualMarkerPlacement(joint);
     const marker = MANUAL_MARKERS.find((item) => item.joint === joint);
     store.toast('info', `请在模型上点击「${marker?.label ?? joint}」的位置`);
@@ -465,9 +462,14 @@ function addArmature(): void {
   if (!instance || !stats.value || manualApplying.value) return;
   rigPanelOpen.value = true;
   try {
-    const snapshot = instance.startManualRig({ guessMarkers: false });
+    // 已经在放标记时只补预览骨骼，不重置已放置的标记
+    const existed = instance.isManualRigActive;
+    const snapshot = existed ? instance.showManualRigBones() : instance.startManualRig({ guessMarkers: false });
     onManualRigChange(snapshot);
-    store.toast('info', '参考骨架已建：请在标记列表里逐个添加，或点「猜测全部标记」');
+    store.toast(
+      'info',
+      existed ? '已生成参考骨架，已放置的标记保留' : '参考骨架已建：请在标记列表里逐个添加，或点「猜测全部标记」',
+    );
   } catch (err) {
     store.toast('error', err instanceof Error ? err.message : '生成参考骨失败');
   }
@@ -954,7 +956,7 @@ function toggleAnimPlay(): void {
                   <span class="arp-marker-row-action">{{ placedMarkers.has(marker.joint) ? '已放置' : '添加' }}</span>
                 </button>
               </div>
-              <p v-if="!manualSnapshot" class="arp-hint">先点「猜测全部标记」或「添加骨架」，再逐个添加标记。</p>
+              <p v-if="!manualSnapshot" class="arp-hint">点标记行的「添加」即可在视口落点，不会自动生成骨骼。</p>
             </div>
           </div>
 

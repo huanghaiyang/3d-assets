@@ -666,10 +666,10 @@ export class ModelViewer {
 
   /**
    * 建参考骨架（ARP 的 Add Armature）。
-   * 默认不放置任何标记，用户逐个「添加」后在视口点模型落点；
-   * guessMarkers=true 时一次性按几何拟合放置全部标记（ARP 的 Guess Markers）。
+   * 默认生成预览骨骼并放置全部标记（Guess Markers）；用户逐个「添加」标记时
+   * 传 createBones=false，只建标记、不生成骨骼，避免骨架挡住标记操作。
    */
-  startManualRig(options: { guessMarkers?: boolean } = {}): ManualRigSnapshot {
+  startManualRig(options: { guessMarkers?: boolean; createBones?: boolean } = {}): ManualRigSnapshot {
     if (!this.modelRoot) throw new Error('当前没有已加载的模型');
     if (this.hasSkeleton) throw new Error('模型已包含骨架，无需手动绑定');
     const meshes = this.collectBindableMeshes();
@@ -682,12 +682,14 @@ export class ModelViewer {
     this.manualRigSelected = null;
     this.manualRigPlacing = null;
     this.manualRigFingersVisible = true;
+    // createBones=false：只进入标记编辑，不生成预览骨骼
+    this.manualRigBonesVisible = options.createBones !== false;
     this.manualRigAbort = new AbortController();
     // 编辑期间先隐藏自动绑骨留下的骨骼连线，避免两套骨架叠在一起看不清
     if (this.skeletonHelper) this.skeletonHelper.visible = false;
 
     this.buildManualRigMarkers();
-    this.attachManualRigBones();
+    if (this.manualRigBonesVisible) this.attachManualRigBones();
     this.attachManualRigPointer();
     this.emitManualRig();
     return this.manualRigSnapshot();
@@ -750,9 +752,9 @@ export class ModelViewer {
     this.refreshManualRig();
   }
 
-  /** 恢复上局标记（没有会话时先建一副空骨架） */
+  /** 恢复上局标记（没有会话时只进入标记编辑，不生成骨骼） */
   restoreManualMarkers(): ManualRigSnapshot {
-    if (!this.manualRig) this.startManualRig();
+    if (!this.manualRig) this.startManualRig({ createBones: false });
     const state = this.manualRig;
     if (state && this.manualRigLastMarkers) applyMarkerSnapshot(state, this.manualRigLastMarkers);
     if (state) this.refreshManualRig();
@@ -831,13 +833,31 @@ export class ModelViewer {
     this.emitManualRig();
   }
 
-  /** 预览骨架连线显示开关 */
+  /** 预览骨架连线显示开关；没有骨架时先按需生成（ARP 的 Add Armature 可随时补上） */
   setManualRigBonesVisible(on: boolean): void {
-    if (!this.manualRig || this.manualRigBonesVisible === on) return;
+    if (!this.manualRig) return;
+    if (on && !this.manualRigHelper) {
+      this.showManualRigBones();
+      return;
+    }
+    if (this.manualRigBonesVisible === on) return;
     this.manualRigBonesVisible = on;
     if (this.manualRigHelper) this.manualRigHelper.visible = on;
     this.requestRender();
     this.emitManualRig();
+  }
+
+  /**
+   * 生成参考骨架预览（ARP 的 Add Armature）。
+   * 逐个添加标记时不会建骨；用户显式点 Add Armature / Bones 开关时才走到这里，
+   * 已放置的标记位置会保留。
+   */
+  showManualRigBones(): ManualRigSnapshot {
+    if (!this.manualRig) return this.startManualRig();
+    this.manualRigBonesVisible = true;
+    if (!this.manualRigHelper) this.attachManualRigBones();
+    this.refreshManualRig();
+    return this.manualRigSnapshot();
   }
 
   /**
