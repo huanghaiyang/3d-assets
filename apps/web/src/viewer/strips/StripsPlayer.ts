@@ -28,7 +28,12 @@ import { clone as cloneSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.j
 import { animationApi } from '@/api/animation';
 import { kimodoApi } from '@/api/kimodo';
 import type { AnimationData } from '@/viewer/FbxPlayer';
-import { AxisIndicator, snapCameraToAxis, type AxisName } from '@/viewer/axisIndicator';
+import {
+  AxisIndicator,
+  snapCameraToAxis,
+  type AxisName,
+  type AxisSign,
+} from '@/viewer/axisIndicator';
 import { filterShadowBones } from '@/viewer/SkeletonOverlay';
 import { FbxActor, type FbxSource } from '@/viewer/stage/FbxActor';
 import { disposeObject } from '@/viewer/stage/StageActor';
@@ -229,8 +234,8 @@ export class StripsPlayer {
     this.axis = new AxisIndicator(container, {
       bottom: 70,
       storageKey: 'axis-indicator:strips',
-      // 点击轴端点：把相机切到该轴向视角
-      onAxisSelect: (axis) => this.snapToAxis(axis),
+      // 点击轴端点：把相机切到该轴向视角（±方向）
+      onAxisSelect: (axis, sign) => this.snapToAxis(axis, sign),
     });
 
     this.scene.background = null;
@@ -547,10 +552,10 @@ export class StripsPlayer {
     this.controls.update();
   }
 
-  /** 点击轴向指示器的轴端点：把相机切到该轴正方向视角（保持当前距离） */
-  private snapToAxis(axis: AxisName): void {
+  /** 点击轴向指示器的轴端点：把相机切到该轴 ± 方向视角（保持当前距离） */
+  private snapToAxis(axis: AxisName, sign: AxisSign): void {
     if (this.disposed) return;
-    snapCameraToAxis(this.camera, this.controls, axis);
+    snapCameraToAxis(this.camera, this.controls, axis, sign);
     this.renderRequested = true;
   }
 

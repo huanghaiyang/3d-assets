@@ -26,7 +26,7 @@ import {
 import { clipsFromAnimationData } from './clipFromAnimationData';
 import type { SomaPoseSample } from './somaRetarget';
 import { segmentColorNumber } from './segmentColors';
-import { AxisIndicator, snapCameraToAxis, type AxisName } from '../axisIndicator';
+import { AxisIndicator, snapCameraToAxis, type AxisName, type AxisSign } from '../axisIndicator';
 
 export type GizmoMode = 'translate' | 'rotate';
 
@@ -196,8 +196,8 @@ export class StagePlayer {
     this.axis = new AxisIndicator(container, {
       bottom: 70,
       storageKey: 'axis-indicator:stage',
-      // 点击轴端点：把相机切到该轴向视角
-      onAxisSelect: (axis) => this.snapToAxis(axis),
+      // 点击轴端点：把相机切到该轴向视角（±方向）
+      onAxisSelect: (axis, sign) => this.snapToAxis(axis, sign),
     });
 
     this.scene.background = null;
@@ -485,10 +485,10 @@ export class StagePlayer {
     this.controls.update();
   }
 
-  /** 点击轴向指示器的轴端点：把相机切到该轴正方向视角（保持当前距离） */
-  private snapToAxis(axis: AxisName): void {
+  /** 点击轴向指示器的轴端点：把相机切到该轴 ± 方向视角（保持当前距离） */
+  private snapToAxis(axis: AxisName, sign: AxisSign): void {
     if (this.disposed) return;
-    snapCameraToAxis(this.camera, this.controls, axis);
+    snapCameraToAxis(this.camera, this.controls, axis, sign);
     this.renderRequested = true;
   }
 

@@ -7,7 +7,7 @@ import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
-import { AxisIndicator, snapCameraToAxis, type AxisName } from './axisIndicator';
+import { AxisIndicator, snapCameraToAxis, type AxisName, type AxisSign } from './axisIndicator';
 import { NodeHighlighter, type SceneNode } from './sceneNodes';
 import {
   autoRigHumanoid,
@@ -240,8 +240,8 @@ export class ModelViewer {
         ? null
         : new AxisIndicator(container, {
             storageKey: 'axis-indicator:workbench',
-            // 点击轴端点：把相机切到该轴向视角
-            onAxisSelect: (axis) => this.snapToAxis(axis),
+            // 点击轴端点：把相机切到该轴向视角（±方向）
+            onAxisSelect: (axis, sign) => this.snapToAxis(axis, sign),
           });
 
     this.camera = new THREE.PerspectiveCamera(42, 1, 0.05, 500);
@@ -513,10 +513,10 @@ export class ModelViewer {
     this.frameCamera(size.y);
   }
 
-  /** 点击轴向指示器的轴端点：把相机切到该轴正方向视角（保持当前距离） */
-  private snapToAxis(axis: AxisName): void {
+  /** 点击轴向指示器的轴端点：把相机切到该轴 ± 方向视角（保持当前距离） */
+  private snapToAxis(axis: AxisName, sign: AxisSign): void {
     if (this.disposed) return;
-    snapCameraToAxis(this.camera, this.controls, axis);
+    snapCameraToAxis(this.camera, this.controls, axis, sign);
     this.requestRender();
   }
 

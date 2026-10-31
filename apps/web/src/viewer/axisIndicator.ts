@@ -12,7 +12,8 @@ import * as THREE from 'three';
  * 调整与锁定：右上角小齿轮点开可调大小 / 透明度，右下角小握柄可拖动换位置。
  * 图形本体不接收鼠标事件，指针落在指示器上时仍然能旋转视角、滚轮缩放；
  * 只有轴端点（字母 / 圆点）、齿轮、握柄和设置面板会截获操作。
- * 点击轴端点会让相机切到该世界轴的正方向视角（由播放器回调 onAxisSelect 完成），
+ * 点击轴端点会让相机切到该世界轴的正 / 负方向视角（实心圆点 + 字母 = 正方向，
+ * 空心圆环 + -X/-Y/-Z 字母 + 半根轴线 = 负方向，由播放器回调 onAxisSelect 完成），
  * 四个工作区共用；「锁定朝向」后禁用切换，三轴固定显示世界坐标系。
  * 「锁定位置」后不可拖动或重置。
  * 设置按工作区分别存进 localStorage（见 AxisIndicatorOptions.storageKey）。
@@ -20,6 +21,8 @@ import * as THREE from 'three';
 
 /** 三根世界轴的名字，也是「点击轴端点切换视角」的入参 */
 export type AxisName = 'x' | 'y' | 'z';
+/** 轴向正负：1 = +X/+Y/+Z（实心端点），-1 = -X/-Y/-Z（空心端点） */
+export type AxisSign = 1 | -1;
 
 interface AxisSpec {
   name: AxisName;
@@ -72,7 +75,7 @@ export interface AxisIndicatorOptions {
    * 点击轴端点（字母 / 圆点）时回调，参数是被点击的世界轴。
    * 播放器用它把相机切到对应轴向视角；不传则轴端点不可点击。
    */
-  onAxisSelect?: (axis: AxisName) => void;
+  onAxisSelect?: (axis: AxisName, sign: AxisSign) => void;
 }
 
 interface AxisIndicatorSettings {
@@ -92,8 +95,16 @@ interface AxisNode {
   line: SVGLineElement;
   dot: SVGCircleElement;
   label: SVGTextElement;
-  /** 轴端点的透明热区：扩大点击范围，悬停时整根轴高亮 */
+  /** 正方向端点的透明热区：扩大点击范围，悬停时整根轴高亮 */
   hit: SVGCircleElement;
+  /** 反方向（-X/-Y/-Z）端点：空心小圆，点击后相机切到负方向视角 */
+  negDot: SVGCircleElement;
+  /** 反方向的半根轴线 */
+  negLine: SVGLineElement;
+  /** 反方向字母（-X / -Y / -Z） */
+  negLabel: SVGTextElement;
+  /** 反方向端点的透明热区 */
+  negHit: SVGCircleElement;
 }
 
 interface DragState {
@@ -115,18 +126,24 @@ export interface AxisViewControls {
 }
 
 /**
- * 把相机摆到指定世界轴的正方向看向目标点，保持当前观察距离。
+ * 把相机摆到指定世界轴的正 / 负方向看向目标点，保持当前观察距离。
  * 点击轴向指示器的轴端点时由各播放器调用。
- * Y 轴是俯视，视线与 camera.up 平行，给一个极小的 z 偏移避免 lookAt 退化后画面乱翻。
+ * Y 轴是俯视 / 仰视，视线与 camera.up 平行，给一个极小的 z 偏移避免 lookAt 退化后画面乱翻。
+ *
+ * @param axis 世界轴
+ * @param sign 1 = 相机在该轴正方向（+X/+Y/+Z），-1 = 负方向（-X/-Y/-Z）
  */
 export function snapCameraToAxis(
   camera: THREE.Camera,
   controls: AxisViewControls,
   axis: AxisName,
+  sign: AxisSign = 1,
 ): void {
   const distance = camera.position.distanceTo(controls.target);
   if (!(distance > 1e-6)) return;
-  camera.position.copy(controls.target).addScaledVector(AXIS_DIRECTIONS[axis], distance);
+  camera.position
+    .copy(controls.target)
+    .addScaledVector(AXIS_DIRECTIONS[axis], distance * sign);
   if (axis === 'y') camera.position.z += distance * 1e-4;
   camera.lookAt(controls.target);
   controls.update();
@@ -186,7 +203,7 @@ export class AxisIndicator {
   private readonly nodes: AxisNode[];
   private readonly settings: AxisIndicatorSettings;
   /** 点击轴端点时通知播放器切换相机视角 */
-  private readonly onAxisSelect: ((axis: AxisName) => void) | null;
+  private readonly onAxisSelect: ((axis: AxisName, sign: AxisSign) => void) | null;
   private readonly storageKey: string | null;
   private readonly corner: 'bottom-left' | 'bottom-right';
   private readonly bottom: number;
@@ -259,12 +276,46 @@ export class AxisIndicator {
       hit.setAttribute('fill', 'transparent');
       hit.classList.add('axis-indicator__hit');
 
-      group.append(line, dot, label, hit);
-      // 点击轴端点：通知播放器把相机切到该轴向（锁定朝向后 requestAxis 会忽略）
-      group.addEventListener('click', () => this.requestAxis(spec.name));
+      // 反方向：半根轴线 + 空心圆点 + 字母（-X/-Y/-Z），与正方向对称但更淡
+      const negLine = document.createElementNS(SVG_NS, 'line');
+      negLine.setAttribute('stroke', spec.color);
+      negLine.setAttribute('stroke-width', '1.2');
+      negLine.setAttribute('stroke-linecap', 'round');
+
+      const negDot = document.createElementNS(SVG_NS, 'circle');
+      negDot.setAttribute('r', '2.4');
+      negDot.setAttribute('fill', 'transparent');
+      negDot.setAttribute('stroke', spec.color);
+      negDot.setAttribute('stroke-width', '1.2');
+      negDot.classList.add('axis-indicator__dot');
+      negDot.classList.add('axis-indicator__neg');
+
+      const negLabel = document.createElementNS(SVG_NS, 'text');
+      negLabel.textContent = `-${spec.label}`;
+      negLabel.setAttribute('fill', spec.color);
+      negLabel.setAttribute('font-weight', '600');
+      negLabel.setAttribute('text-anchor', 'middle');
+      negLabel.setAttribute('dominant-baseline', 'middle');
+      negLabel.classList.add('axis-indicator__label');
+
+      const negHit = document.createElementNS(SVG_NS, 'circle');
+      negHit.setAttribute('fill', 'transparent');
+      negHit.classList.add('axis-indicator__hit');
+
+      group.append(negLine, line, dot, label, hit, negDot, negLabel, negHit);
+      // 点击端点：通知播放器把相机切到该轴向（锁定朝向后 requestAxis 会忽略）。
+      // 正方向：圆点 / 字母 / 热区；负方向：空心圆环 / -X 字母 / 热区
+      const select = (sign: AxisSign) => () => this.requestAxis(spec.name, sign);
+      dot.addEventListener('click', select(1));
+      label.addEventListener('click', select(1));
+      hit.addEventListener('click', select(1));
+      negDot.addEventListener('click', select(-1));
+      negLabel.addEventListener('click', select(-1));
+      negHit.addEventListener('click', select(-1));
+      // 轴端点上的滚轮也转发给 canvas，避免挡住视口缩放
       group.addEventListener('wheel', this.onControlWheel, { passive: false });
       this.layer.appendChild(group);
-      return { spec, group, line, dot, label, hit };
+      return { spec, group, line, dot, label, hit, negDot, negLine, negLabel, negHit };
     });
 
     this.gear = this.buildGear();
@@ -364,6 +415,24 @@ export class AxisIndicator {
       node.hit.setAttribute('cx', endX.toFixed(2));
       node.hit.setAttribute('cy', endY.toFixed(2));
 
+      // 负方向端点落在中心的正对面；半轴 / 圆环 / 字母都比正方向淡，避免抢视觉
+      const negX = this.center * 2 - endX;
+      const negY = this.center * 2 - endY;
+      node.negLine.setAttribute('x2', negX.toFixed(2));
+      node.negLine.setAttribute('y2', negY.toFixed(2));
+      node.negLine.setAttribute('opacity', (opacity * 0.55).toFixed(2));
+      node.negLine.setAttribute('stroke-width', (1 + 0.5 * towardViewer).toFixed(2));
+
+      node.negDot.setAttribute('cx', negX.toFixed(2));
+      node.negDot.setAttribute('cy', negY.toFixed(2));
+      node.negDot.setAttribute('opacity', (opacity * 0.8).toFixed(2));
+      node.negHit.setAttribute('cx', negX.toFixed(2));
+      node.negHit.setAttribute('cy', negY.toFixed(2));
+
+      node.negLabel.setAttribute('x', (this.center - unitX * (radius + 9)).toFixed(2));
+      node.negLabel.setAttribute('y', (this.center - unitY * (radius + 9)).toFixed(2));
+      node.negLabel.setAttribute('opacity', (0.5 + 0.3 * towardViewer).toFixed(2));
+
       node.label.setAttribute('x', labelX.toFixed(2));
       node.label.setAttribute('y', labelY.toFixed(2));
       node.label.setAttribute('opacity', (0.7 + 0.3 * towardViewer).toFixed(2));
@@ -391,13 +460,21 @@ export class AxisIndicator {
     this.backdrop.setAttribute('r', String(this.size / 2 - 1));
 
     const fontSize = Math.round(clamp((this.size * 9) / DEFAULT_SIZE, 8, 12));
+    // 反方向字母多一个「-」，字号略小一点才能塞进圆内
+    const negFontSize = Math.max(7, Math.round(fontSize * 0.85));
     // 热区随尺寸放大：76px 时约 10px 半径，缩到 44px 也还有 8px，手指/鼠标都够点
     const hitRadius = Math.max(8, Math.round(this.size / 8));
+    // 负方向热区略小，避免两根轴都退化到圆心时互相抢点击
+    const negHitRadius = Math.max(6, Math.round(this.size / 10));
     for (const node of this.nodes) {
       node.line.setAttribute('x1', String(this.center));
       node.line.setAttribute('y1', String(this.center));
+      node.negLine.setAttribute('x1', String(this.center));
+      node.negLine.setAttribute('y1', String(this.center));
       node.label.setAttribute('font-size', String(fontSize));
+      node.negLabel.setAttribute('font-size', String(negFontSize));
       node.hit.setAttribute('r', String(hitRadius));
+      node.negHit.setAttribute('r', String(negHitRadius));
     }
 
     this.applyPosition();
@@ -415,10 +492,15 @@ export class AxisIndicator {
     if (locked) this.finishDrag();
   }
 
-  /** 点击轴端点：通知播放器把相机切到该轴向；锁定朝向时忽略（锁定后禁用切换） */
-  private requestAxis(axis: AxisName): void {
+  /**
+   * 点击轴端点：通知播放器把相机切到该轴向；锁定朝向时忽略（锁定后禁用切换）。
+   *
+   * @param axis 世界轴
+   * @param sign 1 = 正方向视角，-1 = 负方向视角
+   */
+  private requestAxis(axis: AxisName, sign: AxisSign): void {
     if (this.disposed || this.settings.orientLocked) return;
-    this.onAxisSelect?.(axis);
+    this.onAxisSelect?.(axis, sign);
   }
 
   /**
@@ -696,7 +778,7 @@ export class AxisIndicator {
     <input type="checkbox" data-axis-orient${this.settings.orientLocked ? ' checked' : ''} />
     <span>锁定朝向（固定世界坐标）</span>
   </label>
-  <p class="axis-indicator__note">点击轴端点可切换到该轴向视角；锁定朝向后禁用。</p>
+  <p class="axis-indicator__note">点击实心圆点 / 字母 = 正方向视角；空心圆环 / -X 字母 = 负方向视角。锁定朝向后禁用。</p>
   <p class="axis-indicator__note" data-axis-note>${note}</p>
   <button type="button" class="axis-indicator__reset" data-axis-reset${this.settings.locked ? ' disabled' : ''}>重置位置</button>
 `;
