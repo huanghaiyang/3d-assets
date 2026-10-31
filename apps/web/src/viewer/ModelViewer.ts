@@ -11,15 +11,67 @@ import { AxisIndicator } from './axisIndicator';
 import { NodeHighlighter, type SceneNode } from './sceneNodes';
 import {
   autoRigHumanoid,
+  buildBoundRig,
   detectOrientation,
   rootHasSkeleton,
   type AutoRigProgress,
   type AutoRigResult,
+  type BoundRigResult,
   type OrientationFix,
 } from './autorig/autoRig';
+import {
+  buildManualCapsules,
+  buildManualRigState,
+  captureManualMarkers,
+  clearManualMarkers,
+  guessManualMarkers,
+  hasRequiredMarkers,
+  isFingerJoint,
+  manualJointInfos,
+  missingManualMarkers,
+  mirrorManualJoints,
+  moveManualJointTo,
+  placeManualMarker,
+  resetManualJoints,
+  restoreManualMarkers as applyMarkerSnapshot,
+  setFingerRadiusScale,
+  setManualRigRadius,
+  MARKER_JOINTS,
+  type ManualRigJointInfo,
+  type ManualRigState,
+} from './autorig/manualRig';
 import { retargetClipToRig } from './autorig/retarget';
 
 export type { SceneNode };
+export type { ManualRigJointInfo };
+
+/** 手动绑骨会话快照：侧栏据此渲染标记列表、属性与坐标输入框 */
+export interface ManualRigSnapshot {
+  active: boolean;
+  selected: string | null;
+  fingersVisible: boolean;
+  /** 是否透视显示关节标记（Auto-Rig Pro 的 X-Ray） */
+  xray: boolean;
+  /** 是否显示预览骨架连线 */
+  bonesVisible: boolean;
+  /** 正在等待视口点击落点的标记关节名（ARP 的 Add Markers 添加中） */
+  placing: string | null;
+  /** 放置左右标记时是否同步镜像对侧（ARP 的 Mirror） */
+  mirror: boolean;
+  /** 是否按网格深度落点（ARP 的 Use Markers Depth） */
+  markerDepth: boolean;
+  /** 已放置的标记关节名 */
+  placed: string[];
+  /** 必需标记是否齐全（Go! 可点） */
+  canBuild: boolean;
+  /** 还没放置的必需标记（中文名，用于提示） */
+  missing: string[];
+  /** 手指粗细缩放系数 */
+  fingerScale: number;
+  /** 模型高度，供侧栏把坐标步长设成合理量级 */
+  height: number;
+  joints: ManualRigJointInfo[];
+}
 
 export interface MeshStats {
   format: string;
@@ -27,6 +79,10 @@ export interface MeshStats {
   triangles: number;
   vertices: number;
   materials: number;
+  /** 模型显示名（从 URL 取文件名），供 ARP 面板 Setup 区展示 */
+  name: string;
+  /** 归一化后包围盒高度（世界单位），供 ARP 面板 Setup 区展示 */
+  bboxSize: number;
 }
 
 export interface LoadTarget {
@@ -99,6 +155,37 @@ export class ModelViewer {
   private skeletonHelper: THREE.SkeletonHelper | null = null;
   /** 当前模型是否已通过 autoRig() 绑定骨架 */
   private rigged = false;
+
+  // ===== 手动绑骨（参考关节拖拽） =====
+  /** 手动绑骨会话；null 表示不在编辑状态 */
+  private manualRig: ManualRigState | null = null;
+  /** 关节标记球（场景根下的独立对象，不随 modelRoot 缩放走） */
+  private manualRigMarkers = new Map<string, THREE.Mesh>();
+  private manualRigGroup: THREE.Group | null = null;
+  /** 编辑期间临时挂在 modelRoot 下的预览骨骼（只用于画 SkeletonHelper） */
+  private manualRigRootBone: THREE.Bone | null = null;
+  private manualRigHelper: THREE.SkeletonHelper | null = null;
+  private manualRigSelected: string | null = null;
+  private manualRigFingersVisible = true;
+  /** X-Ray：关节标记始终画在模型前面（Auto-Rig Pro 的同名显示选项） */
+  private manualRigXRay = true;
+  /** 预览骨架连线显示开关 */
+  private manualRigBonesVisible = true;
+  /** 正在等待落点的标记（ARP Add Markers：点「添加」后下一次视口点击即为落点） */
+  private manualRigPlacing: string | null = null;
+  /** 落点时是否按网格深度（开启后标记贴到模型表面，关闭则保持标记当前深度） */
+  private manualRigMarkerDepth = false;
+  /** 放置左右标记时是否镜像对侧（ARP 的 Mirror） */
+  private manualRigMirror = true;
+  /** 上一局的标记位置（「恢复上局标记」用） */
+  private manualRigLastMarkers: Map<string, THREE.Vector3> | null = null;
+  /** 正在拖拽的关节与拖拽平面（平面法线 = 相机朝向，保证关节跟手） */
+  private manualRigDrag: { name: string; plane: THREE.Plane } | null = null;
+  private manualRigAbort: AbortController | null = null;
+  private readonly manualRigRaycaster = new THREE.Raycaster();
+  private readonly manualRigPointer = new THREE.Vector2();
+  /** UI 订阅：选中关节 / 拖动坐标 / 会话开始结束时回调 */
+  onManualRigChange: ((snapshot: ManualRigSnapshot) => void) | null = null;
 
   // ===== 绑骨后的动画预览 =====
   /** 驱动绑骨骨架的混音器；null 表示当前没有挂载动画 */
@@ -314,6 +401,11 @@ export class ModelViewer {
     root.position.y = (size.y / 2) * scale;
     root.updateMatrixWorld(true);
 
+    // 供 ARP 面板 Setup 区展示：从 URL 取文件名、归一化后包围盒高度
+    const urlName = target.url.split('/').pop() ?? target.url;
+    stats.name = decodeURIComponent(urlName.split('?')[0] || urlName);
+    stats.bboxSize = size.y * scale;
+
     this.modelRoot = root;
     this.scene.add(root);
     this.stats = stats;
@@ -418,6 +510,8 @@ export class ModelViewer {
     // 让在途的加载 / 绑骨结果作废：它们返回时模型已经不是当前这一份
     this.loadToken += 1;
     this.autoRigToken += 1;
+    // 手动绑骨的标记 / 预览骨架挂在场景根，必须先拆掉，否则会留在画面上
+    this.endManualRig();
     this.clearNodeSelection();
     this.sceneTree = [];
     // 先停动画（此时 modelRoot 还在，可还原姿态、解绑混音器），再拆场景对象
@@ -466,6 +560,19 @@ export class ModelViewer {
   }
 
   /**
+   * 旋转模型朝向（对应 ARP Smart 面板的 Turn 按钮，绕 Y 轴转指定角度）。
+   * 已绑骨时同步刷新骨架辅助线与阴影。
+   */
+  turnModel(degrees: number): void {
+    if (!this.modelRoot) return;
+    this.modelRoot.rotation.y += (degrees * Math.PI) / 180;
+    this.modelRoot.updateMatrixWorld(true);
+    if (this.rigged && this.skeletonHelper) this.skeletonHelper.updateMatrixWorld(true);
+    this.invalidateShadows();
+    this.requestRender();
+  }
+
+  /**
    * 单独纠正模型朝向（不依赖绑骨）。
    * 检测当前模型的水平朝向，若偏离 glTF 约定的 +Z 正面，把 modelRoot 绕 Y 轴旋转回来。
    * 已纠正时再点一次会还原到原始朝向（toggle），方便对比效果。
@@ -481,7 +588,7 @@ export class ModelViewer {
       this.modelRoot.updateMatrixWorld(true);
       if (this.rigged) {
         // 已绑骨时，骨架层是 modelRoot 的子节点，还原旋转后也要把 skeletonHelper 刷新一下
-        if (this.skeletonHelper) this.skeletonHelper.update();
+        if (this.skeletonHelper) this.skeletonHelper.updateMatrixWorld(true);
       }
       this.invalidateShadows();
       return { yaw: 0, note: '已还原模型原始朝向' };
@@ -498,7 +605,7 @@ export class ModelViewer {
     if (fix.yaw !== 0) {
       this.modelRoot.rotation.y += fix.yaw;
       this.modelRoot.updateMatrixWorld(true);
-      if (this.rigged && this.skeletonHelper) this.skeletonHelper.update();
+      if (this.rigged && this.skeletonHelper) this.skeletonHelper.updateMatrixWorld(true);
       this.invalidateShadows();
     }
     return fix;
@@ -527,6 +634,673 @@ export class ModelViewer {
     this.setSkeletonVisible(true);
     this.invalidateShadows();
     return result;
+  }
+
+  // ===== 手动绑骨（参考关节拖拽） =====
+
+  /** 是否处于手动绑骨编辑状态 */
+  get isManualRigActive(): boolean {
+    return this.manualRig !== null;
+  }
+
+  /** 供侧栏渲染的快照（标记状态 + 关节列表 + 选中项 + 坐标） */
+  private manualRigSnapshot(): ManualRigSnapshot {
+    const state = this.manualRig;
+    return {
+      active: state !== null,
+      selected: this.manualRigSelected,
+      fingersVisible: this.manualRigFingersVisible,
+      xray: this.manualRigXRay,
+      bonesVisible: this.manualRigBonesVisible,
+      placing: this.manualRigPlacing,
+      mirror: this.manualRigMirror,
+      markerDepth: this.manualRigMarkerDepth,
+      placed: state ? [...state.placed] : [],
+      canBuild: state ? hasRequiredMarkers(state) : false,
+      missing: state ? missingManualMarkers(state).map((marker) => marker.label) : [],
+      fingerScale: state?.fingerScale ?? 1,
+      height: state?.metrics.height ?? 0,
+      joints: state ? manualJointInfos(state) : [],
+    };
+  }
+
+  /**
+   * 建参考骨架（ARP 的 Add Armature）。
+   * 默认不放置任何标记，用户逐个「添加」后在视口点模型落点；
+   * guessMarkers=true 时一次性按几何拟合放置全部标记（ARP 的 Guess Markers）。
+   */
+  startManualRig(options: { guessMarkers?: boolean } = {}): ManualRigSnapshot {
+    if (!this.modelRoot) throw new Error('当前没有已加载的模型');
+    if (this.hasSkeleton) throw new Error('模型已包含骨架，无需手动绑定');
+    const meshes = this.collectBindableMeshes();
+    if (meshes.length === 0) throw new Error('模型里没有可绑定的网格');
+
+    this.cancelManualRig();
+    this.stopRigAnimation();
+
+    this.manualRig = buildManualRigState(this.modelRoot, meshes, options);
+    this.manualRigSelected = null;
+    this.manualRigPlacing = null;
+    this.manualRigFingersVisible = true;
+    this.manualRigAbort = new AbortController();
+    // 编辑期间先隐藏自动绑骨留下的骨骼连线，避免两套骨架叠在一起看不清
+    if (this.skeletonHelper) this.skeletonHelper.visible = false;
+
+    this.buildManualRigMarkers();
+    this.attachManualRigBones();
+    this.attachManualRigPointer();
+    this.emitManualRig();
+    return this.manualRigSnapshot();
+  }
+
+  /** 一次性按几何拟合放置全部标记（ARP 的 Guess Markers） */
+  guessManualRigMarkers(): ManualRigSnapshot {
+    const state = this.manualRig;
+    if (!state) return this.startManualRig({ guessMarkers: true });
+    guessManualMarkers(state);
+    this.refreshManualRig();
+    return this.manualRigSnapshot();
+  }
+
+  /**
+   * 开始在视口放置某个标记（ARP 的 Add Markers）：
+   * 下一次左键点击模型即为落点，Esc 取消。
+   */
+  beginManualMarkerPlacement(name: string | null): void {
+    const state = this.manualRig;
+    if (!state) return;
+    this.manualRigPlacing = name && state.joints.has(name) ? name : null;
+    this.renderer.domElement.style.cursor = this.manualRigPlacing ? 'crosshair' : '';
+    if (this.manualRigPlacing) this.manualRigSelected = this.manualRigPlacing;
+    this.updateManualRigSelection();
+    this.requestRender();
+    this.emitManualRig();
+  }
+
+  /** 镜像开关：放置左右标记时对侧一起落位 */
+  setManualRigMirror(on: boolean): void {
+    if (!this.manualRig || this.manualRigMirror === on) return;
+    this.manualRigMirror = on;
+    this.emitManualRig();
+  }
+
+  /** 「使用标记深度」开关 */
+  setManualRigMarkerDepth(on: boolean): void {
+    if (!this.manualRig || this.manualRigMarkerDepth === on) return;
+    this.manualRigMarkerDepth = on;
+    this.emitManualRig();
+  }
+
+  /** 手指粗细缩放（按拟合半径的比例） */
+  setManualRigFingerScale(scale: number): void {
+    const state = this.manualRig;
+    if (!state) return;
+    setFingerRadiusScale(state, scale);
+    this.emitManualRig();
+  }
+
+  /** 取消和删除标记：先记录这一局的落点，再清空标记 */
+  removeManualMarkers(): void {
+    const state = this.manualRig;
+    if (!state) return;
+    this.manualRigLastMarkers = captureManualMarkers(state);
+    clearManualMarkers(state);
+    this.manualRigPlacing = null;
+    this.renderer.domElement.style.cursor = '';
+    this.refreshManualRig();
+  }
+
+  /** 恢复上局标记（没有会话时先建一副空骨架） */
+  restoreManualMarkers(): ManualRigSnapshot {
+    if (!this.manualRig) this.startManualRig();
+    const state = this.manualRig;
+    if (state && this.manualRigLastMarkers) applyMarkerSnapshot(state, this.manualRigLastMarkers);
+    if (state) this.refreshManualRig();
+    return this.manualRigSnapshot();
+  }
+
+  /** 选中某个关节（侧栏点击关节名时调用） */
+  selectManualRigJoint(name: string | null): void {
+    if (!this.manualRig) return;
+    this.manualRigSelected = name && this.manualRig.joints.has(name) ? name : null;
+    this.updateManualRigSelection();
+    this.requestRender();
+    this.emitManualRig();
+  }
+
+  /** 侧栏输入坐标：直接改写关节位置（世界坐标） */
+  moveManualRigJoint(name: string, position: readonly [number, number, number]): void {
+    const state = this.manualRig;
+    if (!state) return;
+    const point = state.joints.get(name);
+    if (!point) return;
+    if (!position.every((value) => Number.isFinite(value))) return;
+    moveManualJointTo(state, name, new THREE.Vector3(position[0], position[1], position[2]));
+    this.refreshManualRig();
+  }
+
+  /** 关节 / 标记变化后的统一刷新：预览骨架、标记球、选中态与侧栏快照 */
+  private refreshManualRig(): void {
+    this.syncManualRigBones();
+    this.syncManualRigMarkers();
+    this.updateManualRigSelection();
+    this.emitManualRig();
+  }
+
+  /** 以模型中线为对称面，把左侧关节镜像到右侧 */
+  mirrorManualRig(): void {
+    if (!this.manualRig) return;
+    mirrorManualJoints(this.manualRig);
+    this.syncManualRigBones();
+    this.syncManualRigMarkers();
+    this.emitManualRig();
+  }
+
+  /** 恢复到进入手动绑骨时的初始关节位置 */
+  resetManualRig(): void {
+    if (!this.manualRig) return;
+    resetManualJoints(this.manualRig);
+    this.syncManualRigBones();
+    this.syncManualRigMarkers();
+    this.emitManualRig();
+  }
+
+  /** 手指关节标记显示开关（只影响标记，绑定仍包含手指骨） */
+  setManualRigFingersVisible(on: boolean): void {
+    if (!this.manualRig || this.manualRigFingersVisible === on) return;
+    this.manualRigFingersVisible = on;
+    this.updateManualRigSelection();
+    this.requestRender();
+    this.emitManualRig();
+  }
+
+  /** 修改某根参考骨的胶囊半径（Auto-Rig Pro 的参考骨 radius） */
+  setManualRigRadius(name: string, radius: number): void {
+    const state = this.manualRig;
+    if (!state) return;
+    setManualRigRadius(state, name, radius);
+    this.emitManualRig();
+  }
+
+  /** X-Ray 开关：关闭后关节标记会被模型遮挡 */
+  setManualRigXRay(on: boolean): void {
+    if (!this.manualRig || this.manualRigXRay === on) return;
+    this.manualRigXRay = on;
+    this.applyManualRigMarkerDepth();
+    this.requestRender();
+    this.emitManualRig();
+  }
+
+  /** 预览骨架连线显示开关 */
+  setManualRigBonesVisible(on: boolean): void {
+    if (!this.manualRig || this.manualRigBonesVisible === on) return;
+    this.manualRigBonesVisible = on;
+    if (this.manualRigHelper) this.manualRigHelper.visible = on;
+    this.requestRender();
+    this.emitManualRig();
+  }
+
+  /**
+   * 按当前关节坐标完成绑定：重建胶囊 → 算权重 → 换绑 SkinnedMesh。
+   *
+   * @returns 建骨 / 换绑结果；被新素材取代时抛 ViewerCanceledError
+   */
+  async applyManualRig(onProgress?: AutoRigProgress): Promise<BoundRigResult> {
+    const state = this.manualRig;
+    const root = this.modelRoot;
+    if (!state || !root) throw new Error('当前不在手动绑骨状态');
+    this.onManualRigPointerUp();
+    this.manualRigPlacing = null;
+    this.renderer.domElement.style.cursor = '';
+
+    // 必需标记不齐就建骨会得到错位的胶囊，先拦住并提示缺哪几个
+    const missing = missingManualMarkers(state);
+    if (missing.length > 0) {
+      throw new Error(`还有 ${missing.length} 个必需标记没有放置：${missing.map((item) => item.label).join('、')}`);
+    }
+
+    const token = ++this.autoRigToken;
+    const meshes = this.collectBindableMeshes();
+    if (meshes.length === 0) throw new Error('模型里没有可绑定的网格');
+    const capsules = buildManualCapsules(state);
+    const joints = new Map<string, THREE.Vector3>();
+    for (const [name, point] of state.joints) joints.set(name, point.clone());
+
+    const bound = await buildBoundRig(
+      root,
+      meshes,
+      state.boneDefs,
+      joints,
+      capsules,
+      state.metrics.height,
+      state.metrics.centerX,
+      onProgress,
+    );
+    // 绑骨期间切换了素材 / 播放器已销毁：骨架不能记到新模型上
+    if (this.disposed || token !== this.autoRigToken || this.modelRoot !== root) {
+      throw new ViewerCanceledError();
+    }
+
+    // 预览骨架必须先摘掉：它的骨名与真实骨架重名，会污染绑定姿态记录
+    this.endManualRig();
+    this.rigged = true;
+    this.captureRigRestPose();
+    if (this.nodeHighlighter) this.sceneTree = this.nodeHighlighter.reset(this.modelRoot);
+    this.applyWireframeState();
+    this.setSkeletonVisible(true);
+    this.invalidateShadows();
+    return bound;
+  }
+
+  /** 放弃手动绑骨（关节改动不生效） */
+  cancelManualRig(): void {
+    if (!this.manualRig) return;
+    this.endManualRig();
+  }
+
+  private endManualRig(): void {
+    // 会话结束前记下落点，供「恢复上局标记」使用
+    if (this.manualRig) this.manualRigLastMarkers = captureManualMarkers(this.manualRig);
+    this.releaseManualRigPointer();
+    this.disposeManualRigMarkers();
+    this.detachManualRigBones();
+    this.manualRigDrag = null;
+    this.manualRigPlacing = null;
+    this.renderer.domElement.style.cursor = '';
+    this.manualRig = null;
+    this.manualRigSelected = null;
+    this.controls.enabled = true;
+    this.requestRender();
+    this.emitManualRig();
+  }
+
+  private collectBindableMeshes(): THREE.Mesh[] {
+    const meshes: THREE.Mesh[] = [];
+    this.modelRoot?.traverse((child) => {
+      const mesh = child as THREE.Mesh;
+      if (!mesh.isMesh || (mesh as THREE.SkinnedMesh).isSkinnedMesh) return;
+      if (!mesh.geometry?.getAttribute('position')) return;
+      meshes.push(mesh);
+    });
+    return meshes;
+  }
+
+  private buildManualRigMarkers(): void {
+    const state = this.manualRig;
+    if (!state) return;
+    this.disposeManualRigMarkers();
+
+    const group = new THREE.Group();
+    group.name = 'manual-rig-markers';
+    // 标记球尺寸按身高取，缩放过的模型与原始尺寸模型都保持同样的视觉大小
+    const radius = Math.max(0.008, Math.min(0.05, state.metrics.height * 0.013));
+    const geometry = new THREE.SphereGeometry(radius, 16, 12);
+    const boneNames = new Set(state.boneDefs.map((def) => def.name));
+
+    for (const name of state.jointOrder) {
+      const point = state.joints.get(name);
+      if (!point) continue;
+      const marker = new THREE.Mesh(
+        geometry,
+        new THREE.MeshBasicMaterial({
+          color: 0x4da3ff,
+          depthTest: false,
+          transparent: true,
+          opacity: 0.92,
+        }),
+      );
+      marker.name = name;
+      marker.position.copy(point);
+      // X-Ray 开启时永远画在模型前面：被关节埋在网格里也能看见、可点中
+      marker.userData.kind = boneNames.has(name) ? 'bone' : 'tip';
+      marker.userData.finger = isFingerJoint(name);
+      group.add(marker);
+      this.manualRigMarkers.set(name, marker);
+    }
+
+    this.manualRigGroup = group;
+    this.scene.add(group);
+    this.applyManualRigMarkerDepth();
+    this.updateManualRigSelection();
+    this.syncManualRigMarkers();
+  }
+
+  /** 按 X-Ray 状态设置标记的绘制深度：关闭后标记会被模型遮挡，便于确认关节是否埋进网格 */
+  private applyManualRigMarkerDepth(): void {
+    for (const marker of this.manualRigMarkers.values()) {
+      const material = marker.material as THREE.MeshBasicMaterial;
+      material.depthTest = this.manualRigXRay;
+      material.transparent = this.manualRigXRay;
+      material.opacity = this.manualRigXRay ? 0.92 : 1;
+      material.needsUpdate = true;
+      marker.renderOrder = this.manualRigXRay ? 1000 : 0;
+    }
+  }
+
+  private disposeManualRigMarkers(): void {
+    const group = this.manualRigGroup;
+    if (group) {
+      this.scene.remove(group);
+      const geometries = new Set<THREE.BufferGeometry>();
+      group.traverse((child) => {
+        const mesh = child as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        geometries.add(mesh.geometry);
+        (mesh.material as THREE.Material).dispose();
+      });
+      for (const geometry of geometries) geometry.dispose();
+      this.manualRigGroup = null;
+    }
+    this.manualRigMarkers.clear();
+  }
+
+  /** 标记的颜色 / 选中放大 / 手指与未放置标记的显隐 */
+  private updateManualRigSelection(): void {
+    const state = this.manualRig;
+    for (const [name, marker] of this.manualRigMarkers) {
+      const material = marker.material as THREE.MeshBasicMaterial;
+      const selected = name === this.manualRigSelected;
+      const finger = marker.userData.finger === true;
+      // 未放置的 Smart 标记不显示：必须先在面板里「添加」再点模型落点
+      const isMarker = MARKER_JOINTS.has(name);
+      const placed = !isMarker || state?.placed.has(name) === true;
+      marker.visible = placed && (this.manualRigFingersVisible || !finger);
+      marker.scale.setScalar(selected ? 1.7 : 1);
+      material.color.setHex(
+        selected
+          ? 0xff4d6d
+          : isMarker
+            ? 0x39d98a
+            : finger
+              ? 0x9d7bff
+              : marker.userData.kind === 'tip'
+                ? 0xffa94d
+                : 0x4da3ff,
+      );
+    }
+  }
+
+  private syncManualRigMarkers(): void {
+    const state = this.manualRig;
+    if (!state) return;
+    for (const [name, marker] of this.manualRigMarkers) {
+      const point = state.joints.get(name);
+      if (point) marker.position.copy(point);
+    }
+    this.requestRender();
+  }
+
+  /** 建立预览骨架（挂在 modelRoot 下的 Bone 层级，只用于画 SkeletonHelper） */
+  private attachManualRigBones(): void {
+    const root = this.modelRoot;
+    const state = this.manualRig;
+    if (!root || !state) return;
+    this.detachManualRigBones();
+    root.updateMatrixWorld(true);
+
+    const boneMap = new Map<string, THREE.Bone>();
+    for (const def of state.boneDefs) {
+      const bone = new THREE.Bone();
+      bone.name = def.name;
+      boneMap.set(def.name, bone);
+    }
+    for (const def of state.boneDefs) {
+      if (!def.parent) continue;
+      const parent = boneMap.get(def.parent);
+      const child = boneMap.get(def.name);
+      if (parent && child) parent.add(child);
+    }
+    const rootBone = boneMap.get(state.boneDefs[0]?.name ?? '');
+    if (!rootBone) return;
+
+    root.add(rootBone);
+    this.manualRigRootBone = rootBone;
+    this.applyManualBonePositions(boneMap, state, root);
+
+    const helper = new THREE.SkeletonHelper(rootBone);
+    (helper.material as THREE.LineBasicMaterial).depthTest = false;
+    helper.renderOrder = 999;
+    helper.visible = this.manualRigBonesVisible;
+    this.manualRigHelper = helper;
+    this.scene.add(helper);
+    this.requestRender();
+  }
+
+  /** 关节位置变化后重算预览骨骼的局部坐标并刷新连线 */
+  private syncManualRigBones(): void {
+    const root = this.modelRoot;
+    const state = this.manualRig;
+    if (!root || !state || !this.manualRigRootBone) return;
+    const boneMap = new Map<string, THREE.Bone>();
+    this.manualRigRootBone.traverse((child) => {
+      const bone = child as THREE.Bone;
+      if (bone.isBone) boneMap.set(bone.name, bone);
+    });
+    this.applyManualBonePositions(boneMap, state, root);
+  }
+
+  /**
+   * 把世界坐标关节换算成骨骼局部坐标。
+   * boneDefs 已按「父先子后」排列，逐根更新父骨骼世界矩阵后 worldToLocal 才是准的。
+   */
+  private applyManualBonePositions(
+    boneMap: Map<string, THREE.Bone>,
+    state: ManualRigState,
+    root: THREE.Object3D,
+  ): void {
+    for (const def of state.boneDefs) {
+      const joint = state.joints.get(def.name);
+      const bone = boneMap.get(def.name);
+      const container = bone?.parent;
+      if (!joint || !bone || !container) continue;
+      container.updateWorldMatrix(true, false);
+      bone.position.copy(container.worldToLocal(joint.clone()));
+    }
+    root.updateMatrixWorld(true);
+    // three r171 的 SkeletonHelper 把绘制逻辑挂在 updateMatrixWorld 上（没有 update()）
+    this.manualRigHelper?.updateMatrixWorld(true);
+    this.requestRender();
+  }
+
+  private detachManualRigBones(): void {
+    if (this.manualRigHelper) {
+      this.scene.remove(this.manualRigHelper);
+      this.manualRigHelper.dispose();
+      this.manualRigHelper = null;
+    }
+    if (this.manualRigRootBone) {
+      this.manualRigRootBone.removeFromParent();
+      this.manualRigRootBone = null;
+    }
+  }
+
+  /**
+   * 在容器上以 capture 阶段监听 pointerdown：
+   * 只有命中关节标记时才 stopPropagation，让 OrbitControls 收不到这次按下，
+   * 从而把这一次拖拽让给关节；没命中时照常旋转视角。
+   */
+  private attachManualRigPointer(): void {
+    const signal = this.manualRigAbort?.signal;
+    if (!signal) return;
+    this.container.addEventListener('pointerdown', this.onManualRigPointerDown, { capture: true, signal });
+    // 兜底：个别指针设备 / 自动化只派发 click 不派发 pointerdown，这里再补一次落点
+    window.addEventListener('click', this.onManualRigPlaceClick, { capture: true, signal });
+    // Esc 取消正在进行的标记放置
+    window.addEventListener('keydown', this.onManualRigKeyDown, { signal });
+  }
+
+  private releaseManualRigPointer(): void {
+    this.manualRigAbort?.abort();
+    this.manualRigAbort = null;
+    window.removeEventListener('pointermove', this.onManualRigPointerMove, true);
+    window.removeEventListener('pointerup', this.onManualRigPointerUp, true);
+    window.removeEventListener('pointercancel', this.onManualRigPointerUp, true);
+  }
+
+  private onManualRigKeyDown = (event: KeyboardEvent): void => {
+    if (event.key !== 'Escape' || !this.manualRigPlacing) return;
+    this.manualRigPlacing = null;
+    this.renderer.domElement.style.cursor = '';
+    this.emitManualRig();
+  };
+
+  private onManualRigPointerDown = (event: PointerEvent): void => {
+    if (!this.manualRig || event.button !== 0) return;
+
+    // 标记添加中：这一下就是落点，不能同时触发视角旋转
+    if (this.manualRigPlacing) {
+      event.stopPropagation();
+      event.preventDefault();
+      this.placeManualMarkerAt(event);
+      return;
+    }
+
+    const marker = this.pickManualRigMarker(event);
+    if (!marker) return;
+
+    // 命中关节：这一下交给拖拽，不要再让 OrbitControls 开始旋转
+    event.stopPropagation();
+    event.preventDefault();
+    this.manualRigSelected = marker.name;
+    this.updateManualRigSelection();
+    this.manualRigDrag = {
+      name: marker.name,
+      // 拖拽平面过关节、法线朝相机：屏幕上的位移直接映射成关节位移
+      plane: new THREE.Plane().setFromNormalAndCoplanarPoint(
+        this.camera.getWorldDirection(new THREE.Vector3()),
+        marker.position,
+      ),
+    };
+    this.controls.enabled = false;
+    window.addEventListener('pointermove', this.onManualRigPointerMove, true);
+    window.addEventListener('pointerup', this.onManualRigPointerUp, true);
+    window.addEventListener('pointercancel', this.onManualRigPointerUp, true);
+    this.emitManualRig();
+  };
+
+  private onManualRigPointerMove = (event: PointerEvent): void => {
+    const drag = this.manualRigDrag;
+    const state = this.manualRig;
+    if (!drag || !state) return;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    event.preventDefault();
+
+    this.manualRigPointer.set(
+      ((event.clientX - rect.left) / rect.width) * 2 - 1,
+      -((event.clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    this.manualRigRaycaster.setFromCamera(this.manualRigPointer, this.camera);
+    const hit = new THREE.Vector3();
+    if (!this.manualRigRaycaster.ray.intersectPlane(drag.plane, hit)) return;
+    if (!state.joints.has(drag.name)) return;
+
+    // 用 moveManualJointTo 而不是直接 copy：移动手腕时手指、手尖一起跟随
+    moveManualJointTo(state, drag.name, hit);
+    this.syncManualRigBones();
+    this.syncManualRigMarkers();
+    this.emitManualRig();
+  };
+
+  private onManualRigPointerUp = (): void => {
+    if (!this.manualRigDrag) return;
+    this.manualRigDrag = null;
+    this.controls.enabled = true;
+    window.removeEventListener('pointermove', this.onManualRigPointerMove, true);
+    window.removeEventListener('pointerup', this.onManualRigPointerUp, true);
+    window.removeEventListener('pointercancel', this.onManualRigPointerUp, true);
+    this.emitManualRig();
+  };
+
+  private pickManualRigMarker(event: PointerEvent): THREE.Mesh | null {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    this.manualRigPointer.set(
+      ((event.clientX - rect.left) / rect.width) * 2 - 1,
+      -((event.clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    this.manualRigRaycaster.setFromCamera(this.manualRigPointer, this.camera);
+    const candidates = [...this.manualRigMarkers.values()].filter((marker) => marker.visible);
+    const hits = this.manualRigRaycaster.intersectObjects(candidates, false);
+    const hit = hits[0]?.object as THREE.Mesh | undefined;
+    return hit && hit.isMesh ? hit : null;
+  }
+
+  /** click 兜底：pointerdown 已经把落点处理掉时 placing 已清空，不会重复放置 */
+  private onManualRigPlaceClick = (event: MouseEvent): void => {
+    if (!this.manualRigPlacing) return;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const inside =
+      event.clientX >= rect.left &&
+      event.clientX <= rect.right &&
+      event.clientY >= rect.top &&
+      event.clientY <= rect.bottom;
+    if (!inside) return;
+    event.stopPropagation();
+    event.preventDefault();
+    this.placeManualMarkerAt(event);
+  };
+
+  /**
+   * 把当前「添加中」的标记落到点击位置。
+   * 落点写进关节后立刻退出添加模式，选中新标记便于继续微调。
+   */
+  private placeManualMarkerAt(event: { clientX: number; clientY: number }): void {
+    const state = this.manualRig;
+    const name = this.manualRigPlacing;
+    if (!state || !name) return;
+    const point = this.resolveMarkerPlacement(state, name, event);
+    // 点在空白处（射线既没打到模型也没打中深度平面）：保持添加模式，等下一次点击
+    if (!point) return;
+
+    const changed = placeManualMarker(state, name, point, this.manualRigMirror);
+    this.manualRigPlacing = null;
+    this.renderer.domElement.style.cursor = '';
+    this.manualRigSelected = changed[0] ?? name;
+    this.refreshManualRig();
+  }
+
+  /**
+   * 计算标记落点：
+   *  - 开启「使用标记深度」时贴到网格表面（ARP 的 Use Markers Depth）；
+   *  - 关闭时保持标记当前深度，只按屏幕位置移动（过标记且朝向相机的平面）。
+   */
+  private resolveMarkerPlacement(
+    state: ManualRigState,
+    name: string,
+    event: { clientX: number; clientY: number },
+  ): THREE.Vector3 | null {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    this.manualRigPointer.set(
+      ((event.clientX - rect.left) / rect.width) * 2 - 1,
+      -((event.clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    this.manualRigRaycaster.setFromCamera(this.manualRigPointer, this.camera);
+
+    if (this.manualRigMarkerDepth) {
+      const hits = this.manualRigRaycaster.intersectObjects(this.collectBindableMeshes(), false);
+      if (hits[0]) return hits[0].point.clone();
+    }
+
+    const current =
+      state.joints.get(name) ??
+      new THREE.Vector3(
+        state.metrics.centerX,
+        state.metrics.baseY + state.metrics.height * 0.5,
+        state.metrics.centerZ,
+      );
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
+      this.camera.getWorldDirection(new THREE.Vector3()),
+      current,
+    );
+    const hit = new THREE.Vector3();
+    return this.manualRigRaycaster.ray.intersectPlane(plane, hit) ? hit : null;
+  }
+
+  private emitManualRig(): void {
+    this.onManualRigChange?.(this.manualRigSnapshot());
+    this.requestRender();
   }
 
   // ===== 绑骨后的动画预览 =====
@@ -858,7 +1632,7 @@ function collectStats(object: THREE.Object3D, format: string): MeshStats {
     for (const material of meshMaterials) if (material) materials.add(material);
   });
 
-  return { format, meshes, triangles: Math.round(triangles), vertices, materials: materials.size };
+  return { format, meshes, triangles: Math.round(triangles), vertices, materials: materials.size, name: '', bboxSize: 0 };
 }
 
 function disposeObject(root: THREE.Object3D): void {

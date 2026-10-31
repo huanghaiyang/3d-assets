@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import Icon from './ui/Icon.vue';
-import { ModelViewer, ViewerCanceledError, type MeshStats } from '@/viewer/ModelViewer';
+import { ModelViewer, ViewerCanceledError, type ManualRigJointInfo, type ManualRigSnapshot, type MeshStats } from '@/viewer/ModelViewer';
+import { MANUAL_MARKERS } from '@/viewer/autorig/manualRig';
 import { pickPreviewTarget } from '@/viewer/assetTarget';
 import { useWorkspaceStore, isActive } from '@/stores/workspace';
 import { useNow } from '@/composables/useNow';
@@ -29,6 +30,206 @@ const rigging = ref(false);
 const rigProgress = ref(0);
 /** 模型是否已手动/绑骨流程纠正过朝向（用于按钮 active 状态） */
 const orientationCorrected = ref(false);
+/** 绑骨进度卡上的标题 / 说明（自动绑骨与手动绑骨共用一张卡） */
+const riggingMode = ref<'auto' | 'manual'>('auto');
+const riggingLabel = computed(() => (riggingMode.value === 'manual' ? '正在按手动关节绑定' : '正在自动绑骨'));
+const riggingNote = computed(() =>
+  riggingMode.value === 'manual'
+    ? '按当前关节位置重建胶囊并计算蒙皮权重…'
+    : '拟合骨架并计算蒙皮权重…',
+);
+
+// ===== 手动绑骨（拖动参考关节） =====
+/** 是否处于手动绑骨编辑状态（关节标记与预览骨架可见） */
+const manualSnapshot = ref<ManualRigSnapshot | null>(null);
+const manualApplying = ref(false);
+const manualProgress = ref(0);
+/** Auto-Rig 面板是否展开（布局参考 Auto-Rig Pro 的 N 面板：常驻、不依赖是否已生成参考骨） */
+const rigPanelOpen = ref(false);
+/** ARP 面板的五个标签页（对齐 Auto-Rig Pro：Smart / Rig / Remap / Skin / Export） */
+const ARP_TABS = ['smart', 'rig', 'remap', 'skin', 'export'] as const;
+type ArpTab = (typeof ARP_TABS)[number];
+/** ARP 面板当前标签页 */
+const arpTab = ref<ArpTab>('smart');
+/** 可折叠分组的展开状态 */
+const arpCollapsed = ref<Record<string, boolean>>({
+  setup: false,
+  markers: false,
+  settings: false,
+});
+/** Smart 标记的镜像开关在 ModelViewer 里维护（放置左右标记时同步对侧） */
+/** 每只手的手指数（当前骨架固定五指，面板只做展示） */
+const fingerCount = 5;
+
+/** 面板可见条件：模型已加载、且还没有骨架（有骨架后交给骨骼显示 / 动画预览） */
+const rigPanelVisible = computed(() => rigPanelOpen.value && stats.value !== null && !hasSkeleton.value);
+
+/** 已放置标记的关节名集合 */
+const placedMarkers = computed(() => new Set(manualSnapshot.value?.placed ?? []));
+
+/** 当前选中的标记定义（用于「已选标记」标题与人体示意图高亮） */
+const selectedMarker = computed(
+  () => MANUAL_MARKERS.find((marker) => marker.joint === manualSnapshot.value?.selected) ?? null,
+);
+
+/** 下一个建议放置的标记：先补齐必需标记，再补脚掌等可选项 */
+const nextMarker = computed(
+  () =>
+    MANUAL_MARKERS.find((marker) => marker.required && !placedMarkers.value.has(marker.joint)) ??
+    MANUAL_MARKERS.find((marker) => !placedMarkers.value.has(marker.joint)) ??
+    null,
+);
+
+/** 已放置的标记数量（含可选项） */
+const placedMarkerCount = computed(
+  () => MANUAL_MARKERS.filter((marker) => placedMarkers.value.has(marker.joint)).length,
+);
+
+/** 正在等待落点的标记中文名（按钮文案用） */
+const placingLabel = computed(() => {
+  const joint = manualSnapshot.value?.placing;
+  return MANUAL_MARKERS.find((marker) => marker.joint === joint)?.label ?? '';
+});
+
+/**
+ * 人体示意图上的标记落点（0..60 x 0..100 的归一化坐标）。
+ * 对应 ARP 面板里那张「人形 + 绿点」预览图：绿点 = 已放置，灰点 = 未放置。
+ */
+const MARKER_FIGURE: Record<string, { x: number; y: number }> = {
+  Head: { x: 30, y: 17 },
+  Neck: { x: 30, y: 23 },
+  Hips: { x: 30, y: 55 },
+  ShoulderL: { x: 45, y: 27 },
+  ShoulderR: { x: 15, y: 27 },
+  UpperArmL: { x: 52, y: 40 },
+  UpperArmR: { x: 8, y: 40 },
+  ForearmL: { x: 57, y: 49 },
+  ForearmR: { x: 3, y: 49 },
+  UpperLegL: { x: 37, y: 59 },
+  UpperLegR: { x: 23, y: 59 },
+  LowerLegL: { x: 39, y: 80 },
+  LowerLegR: { x: 21, y: 80 },
+  FootL: { x: 41, y: 92 },
+  FootR: { x: 19, y: 92 },
+  ToeL: { x: 46, y: 95 },
+  ToeR: { x: 14, y: 95 },
+};
+
+/** 切换可折叠分组 */
+function toggleArpSection(key: string): void {
+  arpCollapsed.value = { ...arpCollapsed.value, [key]: !arpCollapsed.value[key] };
+}
+
+/** 人体示意图坐标（没有登记时落在躯干中央） */
+function figurePos(joint: string): { x: number; y: number } {
+  return MARKER_FIGURE[joint] ?? { x: 30, y: 50 };
+}
+
+/** Smart 标记行点击：未放置 → 进入添加模式；已放置 → 只选中（选中态在标题与示意图上高亮） */
+function pickArpMarker(joint: string): void {
+  const instance = viewer.value;
+  if (!instance) return;
+  if (!manualSnapshot.value) {
+    store.toast('info', '先点「猜测全部标记」或「添加骨架」生成参考骨');
+    return;
+  }
+  if (!placedMarkers.value.has(joint)) {
+    startMarkerPlacement(joint);
+    return;
+  }
+  instance.selectManualRigJoint(joint);
+}
+
+/**
+ * 添加一个标记（ARP 的 Add Markers）：没有参考骨时先建一副空骨架，
+ * 随后下一个视口左键点击即为落点，Esc 或再点一次「取消添加」退出。
+ */
+function startMarkerPlacement(joint: string): void {
+  const instance = viewer.value;
+  if (!instance || manualApplying.value) return;
+  try {
+    if (!instance.isManualRigActive) instance.startManualRig();
+    instance.beginManualMarkerPlacement(joint);
+    const marker = MANUAL_MARKERS.find((item) => item.joint === joint);
+    store.toast('info', `请在模型上点击「${marker?.label ?? joint}」的位置`);
+  } catch (err) {
+    store.toast('error', err instanceof Error ? err.message : '添加标记失败');
+  }
+}
+
+function cancelMarkerPlacement(): void {
+  viewer.value?.beginManualMarkerPlacement(null);
+}
+
+/** 猜测全部标记（ARP 的 Guess Markers）：按几何拟合一次性放置 */
+function guessMarkers(): void {
+  const instance = viewer.value;
+  if (!instance || manualApplying.value) return;
+  try {
+    const snapshot = instance.guessManualRigMarkers();
+    onManualRigChange(snapshot);
+    store.toast('success', `已按几何拟合放置 ${snapshot.placed.length} 个标记，可直接 Go! 或逐个微调`);
+  } catch (err) {
+    store.toast('error', err instanceof Error ? err.message : '猜测标记失败');
+  }
+}
+
+/** 镜像开关：放置左右标记时对侧一起落位 */
+function toggleMirror(event: Event): void {
+  viewer.value?.setManualRigMirror((event.target as HTMLInputElement).checked);
+}
+
+/** 使用标记深度：开启后落点贴合网格表面 */
+function toggleMarkerDepth(event: Event): void {
+  viewer.value?.setManualRigMarkerDepth((event.target as HTMLInputElement).checked);
+}
+
+/** 恢复上局标记（上一局的落点位置） */
+function restoreLastMarkers(): void {
+  const instance = viewer.value;
+  if (!instance) return;
+  const snapshot = instance.restoreManualMarkers();
+  onManualRigChange(snapshot);
+  if (snapshot.placed.length === 0) store.toast('info', '还没有可恢复的标记');
+  else store.toast('success', `已恢复 ${snapshot.placed.length} 个标记`);
+}
+
+/** 取消和删除标记：清空当前落点，参考骨架保留 */
+function removeMarkers(): void {
+  const instance = viewer.value;
+  if (!instance || !manualSnapshot.value) return;
+  instance.removeManualMarkers();
+  store.toast('info', '已删除全部标记');
+}
+
+/** 手指粗细（按拟合半径的倍数） */
+function onFingerScaleInput(event: Event): void {
+  const value = Number((event.target as HTMLInputElement).value);
+  if (!Number.isFinite(value)) return;
+  viewer.value?.setManualRigFingerScale(value);
+}
+
+const selectedJoint = computed<ManualRigJointInfo | null>(() => {
+  const snapshot = manualSnapshot.value;
+  if (!snapshot?.selected) return null;
+  return snapshot.joints.find((joint) => joint.name === snapshot.selected) ?? null;
+});
+
+/** 侧栏按「基础骨 / 末端参考 / 手指」分组，避免 60 多个关节混在一列 */
+const coordStep = computed(() => {
+  const height = manualSnapshot.value?.height ?? 0;
+  return height > 0 ? (height / 1000).toFixed(4) : '0.001';
+});
+
+/** 参考骨半径滑杆的取值范围（按身高比例，和默认半径量级一致） */
+const radiusMin = computed(() => adv((manualSnapshot.value?.height ?? 0) * 0.004));
+const radiusMax = computed(() => adv((manualSnapshot.value?.height ?? 0) * 0.15));
+const radiusStep = computed(() => adv((manualSnapshot.value?.height ?? 0) / 500));
+
+/** 0 高度（未绑骨）时给一个稳定的兜底值，避免滑杆 min/max 都是 0 */
+function adv(value: number): string {
+  return (value > 0 ? value : 0.001).toFixed(4);
+}
 
 // ===== 绑骨后的动画预览 =====
 /** 动画库文件列表（懒加载：首次绑骨成功后读取一次） */
@@ -109,6 +310,8 @@ async function loadAsset(target: Asset | null): Promise<void> {
   rigged.value = false;
   skeletonOn.value = false;
   orientationCorrected.value = false;
+  manualSnapshot.value = null;
+  rigPanelOpen.value = false;
   resetAnimationPreview();
   try {
     const loaded = await instance.load(loadTarget);
@@ -165,11 +368,13 @@ watch(
 onMounted(() => {
   if (containerRef.value) {
     viewer.value = new ModelViewer(containerRef.value);
+    viewer.value.onManualRigChange = onManualRigChange;
     void loadAsset(asset.value);
   }
 });
 
 onBeforeUnmount(() => {
+  if (viewer.value) viewer.value.onManualRigChange = null;
   viewer.value?.dispose();
   viewer.value = null;
 });
@@ -204,6 +409,7 @@ async function autoRig(): Promise<void> {
   if (!confirmed) return;
 
   rigging.value = true;
+  riggingMode.value = 'auto';
   rigProgress.value = 0;
   try {
     const result = await instance.autoRig((done, total) => {
@@ -236,6 +442,132 @@ async function autoRig(): Promise<void> {
   } finally {
     rigging.value = false;
   }
+}
+
+/** 视口 / 侧栏的关节变化回调：把快照同步到侧栏（会话结束后存 null，面板回到 Add Armature） */
+function onManualRigChange(snapshot: ManualRigSnapshot): void {
+  manualSnapshot.value = snapshot.active ? snapshot : null;
+  if (snapshot.active) rigPanelOpen.value = true;
+}
+
+/** 展开 / 收起 Auto-Rig 面板（收起不会丢弃已生成的参考骨） */
+function toggleRigPanel(): void {
+  if (!stats.value) return;
+  rigPanelOpen.value = !rigPanelOpen.value;
+}
+
+/**
+ * Add Armature：建一副空的参考骨架（基础 19 骨 + 双手各 15 根指骨）。
+ * 对应 ARP 的第一步：生成骨架 → 用 Add Markers 放置标记 → Go!。
+ */
+function addArmature(): void {
+  const instance = viewer.value;
+  if (!instance || !stats.value || manualApplying.value) return;
+  rigPanelOpen.value = true;
+  try {
+    const snapshot = instance.startManualRig({ guessMarkers: false });
+    onManualRigChange(snapshot);
+    store.toast('info', '参考骨架已建：请在标记列表里逐个添加，或点「猜测全部标记」');
+  } catch (err) {
+    store.toast('error', err instanceof Error ? err.message : '生成参考骨失败');
+  }
+}
+
+/** 旋转模型（ARP Smart 面板 Turn 按钮） */
+function turnModel(degrees: number): void {
+  viewer.value?.turnModel(degrees);
+}
+
+/** 修改选中参考骨的胶囊半径（ARP 的 radius，决定蒙皮影响范围） */
+function onJointRadiusInput(name: string, event: Event): void {
+  const value = Number((event.target as HTMLInputElement).value);
+  if (!Number.isFinite(value)) return;
+  viewer.value?.setManualRigRadius(name, value);
+}
+
+function toggleManualXRay(): void {
+  const snapshot = manualSnapshot.value;
+  if (!snapshot) return;
+  viewer.value?.setManualRigXRay(!snapshot.xray);
+}
+
+function toggleManualBones(): void {
+  const snapshot = manualSnapshot.value;
+  if (!snapshot) return;
+  viewer.value?.setManualRigBonesVisible(!snapshot.bonesVisible);
+}
+
+/** 删除参考骨（放弃这一步，模型回到未绑骨状态） */
+function removeArmature(): void {
+  const instance = viewer.value;
+  if (!instance || !manualSnapshot.value) return;
+  instance.cancelManualRig();
+  store.toast('info', '已删除参考骨架');
+}
+
+/** 按当前关节完成绑定 */
+async function applyManualRig(): Promise<void> {
+  const instance = viewer.value;
+  if (!instance || manualApplying.value) return;
+  manualApplying.value = true;
+  manualProgress.value = 0;
+  riggingMode.value = 'manual';
+  rigging.value = true;
+  rigProgress.value = 0;
+  try {
+    const result = await instance.applyManualRig((done, total) => {
+      const percent = total > 0 ? Math.round((done / total) * 100) : 0;
+      manualProgress.value = percent;
+      rigProgress.value = percent;
+    });
+    hasSkeleton.value = true;
+    rigged.value = true;
+    skeletonOn.value = instance.isSkeletonVisible;
+    store.setNodeTree(instance.sceneNodes);
+    store.toast(
+      'success',
+      `手动绑骨完成：${result.bones} 根骨骼 · ${result.vertices.toLocaleString('en-US')} 个顶点`,
+    );
+    // 绑骨成功后才需要动画列表，懒加载避免白跑一次文件夹扫描
+    void ensureAnimationList();
+  } catch (err) {
+    // 绑骨期间切换了素材：感受不到这次绑骨，静默忽略
+    if (err instanceof ViewerCanceledError) return;
+    store.toast('error', err instanceof Error ? err.message : '手动绑骨失败');
+  } finally {
+    manualApplying.value = false;
+    rigging.value = false;
+  }
+}
+
+/** 侧栏输入坐标（世界坐标） */
+function onJointCoordInput(name: string, axis: number, event: Event): void {
+  const instance = viewer.value;
+  const info = selectedJoint.value;
+  if (!instance || !info || info.name !== name) return;
+  const value = Number((event.target as HTMLInputElement).value);
+  if (!Number.isFinite(value)) return;
+  const next: [number, number, number] = [info.position[0], info.position[1], info.position[2]];
+  next[axis] = value;
+  instance.moveManualRigJoint(name, next);
+}
+
+function toggleManualFingers(): void {
+  const instance = viewer.value;
+  if (!instance || !manualSnapshot.value) return;
+  instance.setManualRigFingersVisible(!manualSnapshot.value.fingersVisible);
+}
+
+/** Mirror 开关（放置左右标记时同步对侧） */
+function toggleMirrorFlag(): void {
+  const snapshot = manualSnapshot.value;
+  if (!snapshot) return;
+  viewer.value?.setManualRigMirror(!snapshot.mirror);
+}
+
+/** 恢复到进入绑骨时的初始关节 */
+function resetManualRig(): void {
+  viewer.value?.resetManualRig();
 }
 
 /** 单独纠正模型朝向（不依赖绑骨；已纠正时再点一次还原） */
@@ -429,6 +761,17 @@ function toggleAnimPlay(): void {
           <Icon name="bone" :size="15" />
         </button>
         <button
+          v-if="!hasSkeleton"
+          class="tool"
+          :class="{ active: rigPanelOpen }"
+          type="button"
+          title="Auto-Rig 手动绑骨（参考骨摆位 → Match to Rig）"
+          :disabled="rigging"
+          @click="toggleRigPanel"
+        >
+          <Icon name="pose" :size="15" />
+        </button>
+        <button
           v-if="hasSkeleton"
           class="tool"
           :class="{ active: skeletonOn }"
@@ -483,6 +826,335 @@ function toggleAnimPlay(): void {
       </div>
     </div>
 
+    <!-- Auto-Rig Pro 风格 N 面板：Smart / Rig / Remap / Skin / Export 五个标签 -->
+    <div v-if="rigPanelVisible" class="overlay overlay-arppanel">
+      <div class="arp-card">
+        <!-- 顶部标签栏（对齐 ARP 的 N 面板标签） -->
+        <div class="arp-tabs">
+          <button
+            v-for="tab in ARP_TABS"
+            :key="tab"
+            class="arp-tab"
+            :class="{ active: arpTab === tab }"
+            type="button"
+            @click="arpTab = tab"
+          >
+            {{ tab.charAt(0).toUpperCase() + tab.slice(1) }}
+          </button>
+          <button class="arp-close" type="button" title="收起面板" @click="rigPanelOpen = false">×</button>
+        </div>
+
+        <!-- ===================== Smart 标签 ===================== -->
+        <div v-if="arpTab === 'smart'" class="arp-body">
+          <!-- Setup 分组：选择对象 + 朝向旋转 -->
+          <div class="arp-section">
+            <button class="arp-section-head" type="button" @click="toggleArpSection('setup')">
+              <span class="arp-caret" :class="{ open: !arpCollapsed.setup }">▸</span>
+              <span>Setup</span>
+            </button>
+            <div v-show="!arpCollapsed.setup" class="arp-section-body">
+              <div class="arp-row">
+                <span class="arp-label">Selected</span>
+                <span class="arp-value mono">{{ stats?.name?.slice(0, 16) ?? '—' }}</span>
+              </div>
+              <div class="arp-row">
+                <span class="arp-label">BBox</span>
+                <span class="arp-value mono">
+                  {{ stats ? `${stats.bboxSize.toFixed(1)}` : '—' }}
+                </span>
+              </div>
+              <div class="arp-turn">
+                <button class="arp-turn-btn" type="button" title="左转 90°" @click="turnModel(-90)">⟲</button>
+                <button class="arp-turn-btn" type="button" title="右转 90°" @click="turnModel(90)">⟳</button>
+                <span class="arp-turn-label">Turn</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 标记预览 + 已选标记（对应 ARP 面板顶部的人形示意图） -->
+          <div class="arp-marker-preview">
+            <svg class="arp-figure" viewBox="0 0 60 100" aria-hidden="true">
+              <circle class="arp-figure-head" cx="30" cy="10" r="6.5" />
+              <path
+                class="arp-figure-body"
+                d="M30 17 L30 55 M30 26 L15 28 L8 40 L3 49 M30 26 L45 28 L52 40 L57 49 M30 55 L23 59 L21 80 L19 92 M30 55 L37 59 L39 80 L41 92 M19 92 L14 95 M41 92 L46 95"
+              />
+              <circle
+                v-for="marker in MANUAL_MARKERS"
+                :key="marker.joint"
+                class="arp-figure-dot"
+                :class="{
+                  placed: placedMarkers.has(marker.joint),
+                  active: manualSnapshot?.selected === marker.joint,
+                }"
+                :cx="figurePos(marker.joint).x"
+                :cy="figurePos(marker.joint).y"
+                r="2.2"
+              />
+            </svg>
+            <div class="arp-marker-status">
+              <span class="arp-marker-kicker">已选标记</span>
+              <span class="arp-marker-name">{{ selectedMarker ? selectedMarker.label : '未选择' }}</span>
+              <span v-if="selectedMarker" class="arp-marker-en mono">{{ selectedMarker.name }}</span>
+              <span class="arp-marker-count mono">{{ placedMarkerCount }}/{{ MANUAL_MARKERS.length }}</span>
+            </div>
+          </div>
+
+          <!-- 添加下一个标记 / 取消添加（ARP 的 Add Markers） -->
+          <button v-if="manualSnapshot?.placing" class="arp-guess placing" type="button" @click="cancelMarkerPlacement">
+            <Icon name="close" :size="12" />
+            取消添加（{{ placingLabel }}）
+          </button>
+          <button
+            v-else-if="nextMarker"
+            class="arp-guess"
+            type="button"
+            :disabled="manualApplying"
+            @click="startMarkerPlacement(nextMarker.joint)"
+          >
+            <Icon name="plus" :size="12" />
+            添加{{ nextMarker.label }}
+          </button>
+          <button v-else class="arp-guess" type="button" disabled>
+            <Icon name="check" :size="12" />
+            标记已全部放置
+          </button>
+          <p v-if="manualSnapshot?.placing" class="arp-hint on">在模型上点击落点，Esc 取消</p>
+
+          <!-- 猜测全部标记（几何拟合一次性放置） -->
+          <button class="arp-guess ghost" type="button" :disabled="manualApplying" @click="guessMarkers">
+            <Icon name="bone" :size="12" />
+            猜测全部标记
+          </button>
+
+          <!-- Markers 分组：逐个添加 / 选中 -->
+          <div class="arp-section">
+            <button class="arp-section-head" type="button" @click="toggleArpSection('markers')">
+              <span class="arp-caret" :class="{ open: !arpCollapsed.markers }">▸</span>
+              <span>标记</span>
+              <span class="arp-section-count">{{ placedMarkerCount }}/{{ MANUAL_MARKERS.length }}</span>
+            </button>
+            <div v-show="!arpCollapsed.markers" class="arp-section-body">
+              <div class="arp-marker-list">
+                <button
+                  v-for="marker in MANUAL_MARKERS"
+                  :key="marker.joint"
+                  class="arp-marker-row"
+                  :class="{
+                    placed: placedMarkers.has(marker.joint),
+                    active: manualSnapshot?.selected === marker.joint,
+                    optional: !marker.required,
+                  }"
+                  type="button"
+                  @click="pickArpMarker(marker.joint)"
+                >
+                  <span class="arp-marker-dot" />
+                  <span class="arp-marker-row-label">{{ marker.label }}</span>
+                  <span class="arp-marker-row-en mono">{{ marker.name }}</span>
+                  <span class="arp-marker-row-action">{{ placedMarkers.has(marker.joint) ? '已放置' : '添加' }}</span>
+                </button>
+              </div>
+              <p v-if="!manualSnapshot" class="arp-hint">先点「猜测全部标记」或「添加骨架」，再逐个添加标记。</p>
+            </div>
+          </div>
+
+          <!-- 标记选项（对齐 ARP Smart 面板的复选框） -->
+          <label class="arp-check">
+            <input
+              type="checkbox"
+              :checked="manualSnapshot?.mirror ?? false"
+              :disabled="!manualSnapshot"
+              @change="toggleMirror"
+            />
+            <span>镜像</span>
+            <span class="arp-check-hint">左右标记同步落位</span>
+          </label>
+          <label class="arp-check">
+            <input
+              type="checkbox"
+              :checked="manualSnapshot?.markerDepth ?? false"
+              :disabled="!manualSnapshot"
+              @change="toggleMarkerDepth"
+            />
+            <span>使用标记深度</span>
+            <span class="arp-check-hint">贴到网格表面</span>
+          </label>
+          <div class="arp-mini-actions">
+            <button class="arp-btn" type="button" :disabled="!manualSnapshot" @click="restoreLastMarkers">
+              恢复上局标记
+            </button>
+            <button
+              class="arp-btn"
+              type="button"
+              :disabled="!manualSnapshot?.placed.length"
+              @click="removeMarkers"
+            >
+              取消和删除标记
+            </button>
+          </div>
+
+          <!-- 骨骼设置（对齐 ARP 的预设 / 手指 / 骨段设置区） -->
+          <div class="arp-section">
+            <button class="arp-section-head" type="button" @click="toggleArpSection('settings')">
+              <span class="arp-caret" :class="{ open: !arpCollapsed.settings }">▸</span>
+              <span>骨骼设置</span>
+              <span class="arp-section-count">ARP 默认</span>
+            </button>
+            <div v-show="!arpCollapsed.settings" class="arp-section-body">
+              <div class="arp-row">
+                <span class="arp-label">骨架预设</span>
+                <span class="arp-value">ARP 默认</span>
+              </div>
+              <div class="arp-row">
+                <span class="arp-label">手指</span>
+                <span class="arp-value mono">{{ fingerCount }} 指 / 手</span>
+              </div>
+              <div class="arp-row">
+                <span class="arp-label">手指粗细</span>
+                <input
+                  class="arp-range"
+                  type="range"
+                  min="0.4"
+                  max="2.5"
+                  step="0.05"
+                  :value="manualSnapshot?.fingerScale ?? 1"
+                  :disabled="!manualSnapshot"
+                  @input="onFingerScaleInput"
+                />
+                <span class="arp-value mono">{{ (manualSnapshot?.fingerScale ?? 1).toFixed(2) }}</span>
+              </div>
+              <div class="arp-row">
+                <span class="arp-label">脊椎 / 颈部</span>
+                <span class="arp-value">2 段 / 1 段</span>
+              </div>
+              <p class="arp-hint">骨段数量固定为 19 骨结构，保证动画重定向与 GLB 导出兼容。</p>
+            </div>
+          </div>
+
+          <!-- 显示选项 -->
+          <div v-if="manualSnapshot" class="arp-toggles">
+            <button class="arp-toggle" :class="{ on: manualSnapshot.xray }" type="button" @click="toggleManualXRay">
+              X-Ray
+            </button>
+            <button class="arp-toggle" :class="{ on: manualSnapshot.bonesVisible }" type="button" @click="toggleManualBones">
+              Bones
+            </button>
+            <button
+              class="arp-toggle"
+              :class="{ on: manualSnapshot.fingersVisible }"
+              type="button"
+              @click="toggleManualFingers"
+            >
+              Fingers
+            </button>
+            <button class="arp-toggle" :class="{ on: manualSnapshot.mirror }" type="button" @click="toggleMirrorFlag">
+              Mirror
+            </button>
+            <button class="arp-toggle" type="button" @click="resetManualRig">Reset</button>
+          </div>
+
+          <!-- Go! 主按钮（= Match to Rig） -->
+          <button
+            class="arp-go"
+            type="button"
+            :disabled="!manualSnapshot?.canBuild || manualApplying"
+            @click="applyManualRig"
+          >
+            <Icon name="check" :size="12" />
+            Go!
+          </button>
+          <p v-if="manualSnapshot && !manualSnapshot.canBuild" class="arp-hint">
+            还差必需标记：{{ manualSnapshot.missing.join('、') }}
+          </p>
+        </div>
+
+        <!-- ===================== Rig 标签 ===================== -->
+        <div v-else-if="arpTab === 'rig'" class="arp-body">
+          <button class="arp-guess" type="button" @click="addArmature">
+            <Icon name="bone" :size="12" />
+            Add Armature
+          </button>
+
+          <div class="arp-row">
+            <span class="arp-label">Rig type</span>
+            <span class="arp-value">Human</span>
+          </div>
+
+          <div class="arp-row">
+            <span class="arp-label">Mode</span>
+            <span class="arp-value" :class="{ on: manualSnapshot }">
+              {{ manualSnapshot ? 'Reference Bones' : 'Object Mode' }}
+            </span>
+          </div>
+
+          <!-- 选中参考骨的属性 -->
+          <div v-if="selectedJoint" class="arp-bone-props">
+            <div class="arp-bone-head">
+              <span class="mono">{{ selectedJoint.name }}</span>
+              <span class="arp-tag">{{ selectedJoint.kind === 'bone' ? 'ref' : 'tip' }}</span>
+            </div>
+            <div v-if="selectedJoint.radius !== null" class="coord-row">
+              <span class="coord-label">R</span>
+              <input
+                class="manual-range"
+                type="range"
+                :min="radiusMin"
+                :max="radiusMax"
+                :step="radiusStep"
+                :value="selectedJoint.radius"
+                @input="onJointRadiusInput(selectedJoint.name, $event)"
+              />
+              <input
+                class="coord-input arp-radius-num"
+                type="number"
+                :step="coordStep"
+                :value="selectedJoint.radius.toFixed(4)"
+                @change="onJointRadiusInput(selectedJoint.name, $event)"
+              />
+            </div>
+            <div v-for="axis in [0, 1, 2]" :key="axis" class="coord-row">
+              <span class="coord-label">{{ ['X', 'Y', 'Z'][axis] }}</span>
+              <input
+                class="coord-input"
+                type="number"
+                :step="coordStep"
+                :value="selectedJoint.position[axis].toFixed(4)"
+                @change="onJointCoordInput(selectedJoint.name, axis, $event)"
+              />
+            </div>
+          </div>
+          <div v-else-if="manualSnapshot" class="arp-hint">在 Smart 标签的标记网格点选，或在视口里点标记球</div>
+          <div v-else class="arp-hint">先点 Add Armature 生成参考骨</div>
+
+          <!-- 显示选项 -->
+          <div v-if="manualSnapshot" class="arp-toggles">
+            <button class="arp-toggle" :class="{ on: manualSnapshot.xray }" type="button" @click="toggleManualXRay">X-Ray</button>
+            <button class="arp-toggle" :class="{ on: manualSnapshot.bonesVisible }" type="button" @click="toggleManualBones">Bones</button>
+            <button class="arp-toggle" :class="{ on: manualSnapshot.fingersVisible }" type="button" @click="toggleManualFingers">Fingers</button>
+            <button class="arp-toggle" :class="{ on: manualSnapshot.mirror }" type="button" @click="toggleMirrorFlag">Mirror</button>
+            <button class="arp-toggle" type="button" @click="resetManualRig">Reset</button>
+          </div>
+
+          <div v-if="manualSnapshot" class="arp-actions">
+            <button class="arp-cancel" type="button" @click="removeArmature">Remove</button>
+            <button class="arp-apply" type="button" :disabled="manualApplying" @click="applyManualRig">
+              <Icon name="check" :size="12" />
+              Match to Rig
+            </button>
+          </div>
+        </div>
+
+        <!-- ===================== 其余标签（占位，对齐 ARP 结构） ===================== -->
+        <div v-else class="arp-body">
+          <div class="arp-placeholder">
+            <span class="arp-ph-title">{{ arpTab.charAt(0).toUpperCase() + arpTab.slice(1) }}</span>
+            <p class="arp-hint">{{ arpTab === 'remap' ? '骨骼名称重映射与动作重定向' : arpTab === 'skin' ? '蒙皮绑定与权重平滑' : '导出 GLB / FBX' }}</p>
+            <p class="arp-hint">此标签对应 Auto-Rig Pro 的同名模块，当前版本在完成绑骨后通过动画预览与导出按钮使用。</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 绑骨后的动画预览（左下角，避开底部居中的生成状态卡） -->
     <div v-if="rigged" class="overlay overlay-anim">
       <div class="anim-card">
@@ -523,14 +1195,14 @@ function toggleAnimPlay(): void {
       <div class="status-card">
         <div class="status-row">
           <Icon name="bone" :size="14" />
-          <span class="status-text">正在自动绑骨</span>
+          <span class="status-text">{{ riggingLabel }}</span>
           <span class="mono faint">{{ rigProgress }}%</span>
         </div>
         <div class="progress">
           <div class="progress-bar" :style="{ width: `${rigProgress}%` }" />
         </div>
         <div class="status-meta">
-          <span>拟合 T-pose 骨架并计算蒙皮权重…</span>
+          <span>{{ riggingNote }}</span>
         </div>
       </div>
     </div>
@@ -788,6 +1460,641 @@ function toggleAnimPlay(): void {
   padding: 4px 10px;
   border-radius: 999px;
   pointer-events: none;
+}
+
+/* 手动绑骨侧栏（右侧，与右上角工具栏并排） */
+/* ========== Auto-Rig Pro 风格 N 面板 ========== */
+.overlay-arppanel {
+  top: 14px;
+  right: 58px;
+  width: min(280px, calc(100% - 72px));
+  max-height: calc(100% - 28px);
+  display: flex;
+  z-index: 3;
+}
+
+.arp-card {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-height: 100%;
+  border-radius: var(--radius);
+  background: rgba(20, 21, 25, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+/* 顶部标签栏（Smart / Rig / Remap / Skin / Export） */
+.arp-tabs {
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.arp-tab {
+  flex: 1;
+  height: 26px;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  transition: color 0.12s, background 0.12s;
+}
+
+.arp-tab:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.arp-tab.active {
+  color: var(--accent-hover);
+  background: var(--accent-soft);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.arp-close {
+  width: 22px;
+  height: 26px;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.arp-close:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+}
+
+.arp-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  overflow-y: auto;
+}
+
+/* 可折叠分组（Blender N 面板的 section 风格） */
+.arp-section {
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+  overflow: hidden;
+}
+
+.arp-section-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.arp-section-head:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.arp-caret {
+  display: inline-block;
+  width: 10px;
+  color: var(--text-faint);
+  font-size: 9px;
+  transition: transform 0.12s;
+}
+
+.arp-caret.open {
+  transform: rotate(90deg);
+}
+
+.arp-section-count {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--accent-hover);
+}
+
+.arp-section-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 8px 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.arp-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 20px;
+}
+
+.arp-label {
+  font-size: 10px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.arp-value {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.arp-value.on {
+  color: var(--accent-hover);
+}
+
+/* Setup 区的 Turn 按钮 */
+.arp-turn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.arp-turn-btn {
+  width: 24px;
+  height: 22px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-sm);
+  background: var(--bg-app);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.arp-turn-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+
+.arp-turn-label {
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+/* Guess Markers / Add Armature 主按钮 */
+.arp-guess {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 32px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.02));
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.arp-guess:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+
+.arp-guess:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Mirror 复选框 */
+.arp-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.arp-check input {
+  accent-color: var(--accent);
+}
+
+.arp-check-hint {
+  margin-left: auto;
+  font-size: 9px;
+  color: var(--text-faint);
+}
+
+/* 标记预览：人形示意图 + 已选标记（对应 ARP 面板顶部的标记状态图） */
+.arp-marker-preview {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 10px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.28);
+}
+
+.arp-figure {
+  width: 64px;
+  height: 104px;
+  margin: 0 auto;
+  display: block;
+}
+
+.arp-figure-head {
+  fill: rgba(255, 255, 255, 0.1);
+  stroke: rgba(255, 255, 255, 0.28);
+  stroke-width: 0.8;
+}
+
+.arp-figure-body {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.22);
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.arp-figure-dot {
+  fill: rgba(255, 255, 255, 0.06);
+  stroke: rgba(255, 255, 255, 0.26);
+  stroke-width: 0.8;
+}
+
+.arp-figure-dot.placed {
+  fill: #39d98a;
+  stroke: #0b0c0e;
+}
+
+.arp-figure-dot.active {
+  fill: #ffb54d;
+  stroke: #ffb54d;
+  stroke-width: 1.4;
+}
+
+.arp-marker-status {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.arp-marker-kicker {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.arp-marker-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.arp-marker-en {
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.arp-marker-count {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--accent-hover);
+}
+
+/* 标记列表：每行一个标记（绿点 = 已放置） */
+.arp-marker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 232px;
+  overflow-y: auto;
+}
+
+.arp-marker-row {
+  display: grid;
+  grid-template-columns: 8px 1fr auto auto;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+  font-size: 11px;
+  text-align: left;
+}
+
+.arp-marker-row:hover {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text);
+}
+
+.arp-marker-row.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+
+.arp-marker-row.optional {
+  opacity: 0.78;
+}
+
+.arp-marker-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.arp-marker-row.placed .arp-marker-dot {
+  background: #39d98a;
+}
+
+.arp-marker-row.active .arp-marker-dot {
+  background: #ffb54d;
+}
+
+.arp-marker-row-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.arp-marker-row-en {
+  font-size: 9px;
+  color: var(--text-faint);
+}
+
+.arp-marker-row.placed .arp-marker-row-en {
+  color: rgba(57, 217, 138, 0.75);
+}
+
+.arp-marker-row-action {
+  font-size: 9px;
+  color: var(--text-faint);
+}
+
+.arp-marker-row.placed .arp-marker-row-action {
+  color: rgba(57, 217, 138, 0.9);
+}
+
+/* 添加中状态：主按钮变成「取消添加」 */
+.arp-guess.placing {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+
+.arp-guess.ghost {
+  height: 26px;
+  background: transparent;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.arp-mini-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+}
+
+.arp-range {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+.arp-hint.on {
+  color: var(--accent-hover);
+}
+
+.arp-hint {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text-faint);
+}
+
+.arp-num {
+  width: 36px;
+  height: 22px;
+  padding: 0 4px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-sm);
+  background: var(--bg-app);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-align: center;
+}
+
+.arp-btn {
+  height: 24px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-sm);
+  background: var(--bg-app);
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.arp-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+
+.arp-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Go! 大按钮 */
+.arp-go {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 36px;
+  margin-top: 4px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: #0b0c0e;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.arp-go:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+
+.arp-go:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Rig 标签：选中参考骨的属性 */
+.arp-bone-props {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.arp-bone-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.arp-tag {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 9px;
+  color: var(--text-faint);
+}
+
+.arp-radius-num {
+  flex: 0 0 58px;
+}
+
+/* 显示选项 / 快捷操作 */
+.arp-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.arp-toggle {
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.arp-toggle:hover {
+  color: var(--text);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.arp-toggle.on {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent-hover);
+}
+
+/* 底部操作区（Remove / Match to Rig） */
+.arp-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.arp-cancel {
+  flex: 1;
+  height: 30px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.arp-cancel:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.arp-apply {
+  flex: 1.5;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 30px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: #0b0c0e;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.arp-apply:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+
+.arp-apply:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+/* 其余标签的占位 */
+.arp-placeholder {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 10px;
+}
+
+.arp-ph-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* 坐标输入（Rig 标签内仍沿用） */
+.coord-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.coord-label {
+  width: 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.coord-input {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  padding: 0 6px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-sm);
+  background: var(--bg-app);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.manual-range {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
 }
 
 /* 绑骨后的动画预览面板 */

@@ -42,8 +42,17 @@ interface BoneDef {
   joint: [number, number, number];
 }
 
+/**
+ * 绑骨用的骨骼定义：只描述层级，不含关节位置。
+ * 自动绑骨用上面的固定模板，手动绑骨用用户拖动后的关节坐标，两种流程共用同一套建骨/蒙皮实现。
+ */
+export interface RigBoneDef {
+  name: string;
+  parent: string | null;
+}
+
 /** 蒙皮胶囊：a/b 为世界坐标，radius 为世界半径；side 用于左右互斥 */
-interface CapsuleSpec {
+export interface CapsuleSpec {
   bone: string;
   a: THREE.Vector3;
   b: THREE.Vector3;
@@ -85,6 +94,8 @@ const BONE_DEFS: BoneDef[] = [
 
 /** 每顶点最多 4 个骨骼影响（WebGL / glTF 上限） */
 const MAX_INFLUENCES = 4;
+/** 权重沿网格表面平滑的迭代次数（2 轮足以摊开关节处的硬边，再多会糊掉手指） */
+const SMOOTH_ITERATIONS = 2;
 /** 每处理这么多顶点让出一次主线程，避免大模型卡死 UI */
 const CHUNK_VERTICES = 16384;
 /** 异侧肢体权重衰减系数 */
@@ -906,7 +917,7 @@ function fallbackLeg(
   };
 }
 
-interface BodyFit {
+export interface BodyFit {
   /** 骨骼名 → 世界坐标关节 */
   joints: Map<string, THREE.Vector3>;
   /** 世界坐标蒙皮胶囊 */
@@ -924,7 +935,7 @@ interface BodyFit {
  * 所有关节都以世界坐标给出，后续建 Bone 层级时再用 worldToLocal 反解局部坐标，
  * 这样 modelRoot 自带缩放 / 旋转时也不会错位。
  */
-function fitBody(root: THREE.Object3D, meshes: THREE.Mesh[]): BodyFit {
+export function fitHumanoid(root: THREE.Object3D, meshes: THREE.Mesh[]): BodyFit {
   root.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(root);
   const size = box.getSize(new THREE.Vector3());
@@ -1166,19 +1177,63 @@ export async function autoRigHumanoid(
   }
 
   // ---- 从网格几何拟合人体关节与胶囊（失败部位单独回退模板比例）----
-  const body = fitBody(root, meshes);
+  const body = fitHumanoid(root, meshes);
 
-  // ---- 骨骼世界坐标 ----
+  // ---- 建骨 + 蒙皮（与手动绑骨共用）----
+  const bound = await buildBoundRig(
+    root,
+    meshes,
+    BONE_DEFS,
+    body.joints,
+    body.capsules,
+    body.height,
+    body.centerX,
+    onProgress,
+  );
+  return { ...bound, orientation, fit: body.fit };
+}
+
+/** 建骨 + 蒙皮的结果（不含朝向、拟合质量这类流程信息） */
+export interface BoundRigResult {
+  bones: number;
+  skinnedMeshes: number;
+  vertices: number;
+}
+
+/**
+ * 按「关节世界坐标 + 蒙皮胶囊」建立骨骼层级，并给所有网格算权重、原地换绑成 SkinnedMesh。
+ *
+ * 自动绑骨与手动绑骨共用这一段，两者的差别只是关节坐标从哪来：
+ * 自动绑骨来自几何拟合，手动绑骨来自用户在视口里拖动的关节标记。
+ * 调用前 root 必须已经就位（朝向 / 缩放已确定），绑定姿态即当前姿态。
+ *
+ * @param scaleReference 模型高度，用于给胶囊半径设一个下限，避免细长肢体出现零宽胶囊
+ * @param centerX 模型左右中线（世界 X），用于左右肢体权重的互斥抑制
+ */
+export async function buildBoundRig(
+  root: THREE.Object3D,
+  meshes: THREE.Mesh[],
+  boneDefs: readonly RigBoneDef[],
+  joints: Map<string, THREE.Vector3>,
+  capsuleSpecs: readonly CapsuleSpec[],
+  scaleReference: number,
+  centerX: number,
+  onProgress?: AutoRigProgress,
+): Promise<BoundRigResult> {
   const boneIndexByName = new Map<string, number>();
-  BONE_DEFS.forEach((def, index) => boneIndexByName.set(def.name, index));
-  const jointWorld = BONE_DEFS.map((def) => body.joints.get(def.name)!.clone());
+  boneDefs.forEach((def, index) => boneIndexByName.set(def.name, index));
+  const jointWorld = boneDefs.map((def) => {
+    const point = joints.get(def.name);
+    if (!point) throw new Error(`缺少关节坐标：${def.name}`);
+    return point.clone();
+  });
 
   // ---- 蒙皮胶囊换算成 WorldCapsule ----
-  const capsules: WorldCapsule[] = body.capsules
+  const capsules: WorldCapsule[] = capsuleSpecs
     .map((def) => {
       const boneIndex = boneIndexByName.get(def.bone);
       if (boneIndex === undefined) return null;
-      const radius = Math.max(def.radius, body.height * 0.012);
+      const radius = Math.max(def.radius, scaleReference * 0.012);
       return {
         boneIndex,
         a: def.a,
@@ -1197,7 +1252,7 @@ export async function autoRigHumanoid(
   const totalVertices = meshes.reduce((sum, mesh) => sum + totalVerticesSafe(mesh), 0);
   let doneVertices = 0;
   const vertex = new THREE.Vector3();
-  const weights = new Float32Array(BONE_DEFS.length);
+  const weights = new Float32Array(boneDefs.length);
   const processedGeometries = new Set<string>();
   // 换绑列表：等骨架建好、绑定后一次性同步替换，避免渲染循环看到「未绑骨架的 SkinnedMesh」
   const pendingSwaps: Array<{ mesh: THREE.Mesh; skinned: THREE.SkinnedMesh }> = [];
@@ -1215,7 +1270,7 @@ export async function autoRigHumanoid(
 
     for (let i = 0; i < count; i += 1) {
       vertex.fromBufferAttribute(position, i).applyMatrix4(mesh.matrixWorld);
-      computeWeights(vertex, capsules, abList, body.centerX, weights);
+      computeWeights(vertex, capsules, abList, centerX, weights);
       writeTop4(weights, skinIndex, skinWeight, i);
 
       doneVertices += 1;
@@ -1224,6 +1279,10 @@ export async function autoRigHumanoid(
         await yieldToUi();
       }
     }
+
+    // 沿网格表面平滑权重：胶囊距离是「空间距离」，关节附近权重会突变，
+    // 蒙皮后表现为折角塌陷。沿三角面邻接做两轮平均，过渡带摊开，接近骨热蒙皮效果。
+    smoothSkinWeights(geometry, skinIndex, skinWeight, boneDefs.length, SMOOTH_ITERATIONS);
 
     geometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(skinIndex, MAX_INFLUENCES));
     geometry.setAttribute('skinWeight', new THREE.Float32BufferAttribute(skinWeight, MAX_INFLUENCES));
@@ -1247,18 +1306,18 @@ export async function autoRigHumanoid(
   onProgress?.(totalVertices, totalVertices);
 
   // ---- 建骨骼层级并挂到模型根下 ----
-  const bones: THREE.Bone[] = BONE_DEFS.map((def) => {
+  const bones: THREE.Bone[] = boneDefs.map((def) => {
     const bone = new THREE.Bone();
     bone.name = def.name;
     return bone;
   });
-  BONE_DEFS.forEach((def, index) => {
+  boneDefs.forEach((def, index) => {
     if (def.parent) bones[boneIndexByName.get(def.parent)!]!.add(bones[index]!);
   });
   const rootBone = bones[0]!;
   root.add(rootBone);
   // 父先子后：用父骨骼的世界矩阵反解局部坐标（modelRoot 自身带缩放，必须走 worldToLocal）
-  BONE_DEFS.forEach((_, index) => {
+  boneDefs.forEach((_, index) => {
     const bone = bones[index]!;
     const parent = bone.parent as THREE.Object3D;
     parent.updateWorldMatrix(true, false);
@@ -1280,13 +1339,7 @@ export async function autoRigHumanoid(
     skinned.bind(skeleton, skinned.matrixWorld.clone());
   }
 
-  return {
-    bones: bones.length,
-    skinnedMeshes: pendingSwaps.length,
-    vertices: doneVertices,
-    orientation,
-    fit: body.fit,
-  };
+  return { bones: bones.length, skinnedMeshes: pendingSwaps.length, vertices: doneVertices };
 }
 
 function totalVerticesSafe(mesh: THREE.Mesh): number {
@@ -1374,4 +1427,144 @@ function writeTop4(
     return;
   }
   for (let slot = 0; slot < used; slot += 1) skinWeight[offset + slot] /= sum;
+}
+
+/**
+ * 沿网格三角面邻接做权重平滑（Blender 骨热蒙皮「沿表面扩散」的近似）。
+ *
+ * 胶囊距离是空间距离：关节内侧的相邻顶点常常一半归上臂、一半归前臂，蒙皮后
+ * 折角处直接塌陷。这里让每个顶点和自己的拓扑邻居做加权平均，把过渡带摊开。
+ * 只沿三角面传播，所以手掌贴在大腿上、双腿并拢时不会跨部件互相污染。
+ *
+ * 实现用 CSR 邻接表 + 乒乓缓冲，不额外保存「每顶点 × 骨骼数」的完整权重矩阵，
+ * 内存占用保持在每顶点 4 个影响的量级。
+ */
+function smoothSkinWeights(
+  geometry: THREE.BufferGeometry,
+  skinIndex: Uint16Array,
+  skinWeight: Float32Array,
+  boneCount: number,
+  iterations: number,
+): void {
+  const index = geometry.getIndex();
+  if (!index || iterations <= 0) return;
+  const count = skinIndex.length / MAX_INFLUENCES;
+  if (count < 3 || boneCount <= 0) return;
+
+  const triangles = Math.floor(index.count / 3);
+  if (triangles === 0) return;
+  const indexArray = index.array as ArrayLike<number>;
+
+  // ---- 建 CSR 邻接表：每个顶点记录三角面里的另外两个顶点 ----
+  const offsets = new Uint32Array(count + 1);
+  for (let t = 0; t < triangles; t += 1) {
+    const a = indexArray[t * 3]!;
+    const b = indexArray[t * 3 + 1]!;
+    const c = indexArray[t * 3 + 2]!;
+    offsets[a + 1] += 2;
+    offsets[b + 1] += 2;
+    offsets[c + 1] += 2;
+  }
+  for (let i = 1; i <= count; i += 1) offsets[i] += offsets[i - 1]!;
+  const total = offsets[count]!;
+  if (total === 0) return;
+
+  const links = new Uint32Array(total);
+  const cursor = offsets.slice(0, count);
+  for (let t = 0; t < triangles; t += 1) {
+    const a = indexArray[t * 3]!;
+    const b = indexArray[t * 3 + 1]!;
+    const c = indexArray[t * 3 + 2]!;
+    let slot = cursor[a]!;
+    links[slot] = b;
+    links[slot + 1] = c;
+    cursor[a] = slot + 2;
+    slot = cursor[b]!;
+    links[slot] = c;
+    links[slot + 1] = a;
+    cursor[b] = slot + 2;
+    slot = cursor[c]!;
+    links[slot] = a;
+    links[slot + 1] = b;
+    cursor[c] = slot + 2;
+  }
+
+  // ---- 乒乓缓冲：读旧权重、写新权重 ----
+  let readIndex: Uint16Array = skinIndex;
+  let readWeight: Float32Array = skinWeight;
+  let writeIndex: Uint16Array = new Uint16Array(count * MAX_INFLUENCES);
+  let writeWeight: Float32Array = new Float32Array(count * MAX_INFLUENCES);
+  const accum = new Float32Array(boneCount);
+
+  for (let iter = 0; iter < iterations; iter += 1) {
+    for (let v = 0; v < count; v += 1) {
+      accum.fill(0);
+      const ownOffset = v * MAX_INFLUENCES;
+      for (let slot = 0; slot < MAX_INFLUENCES; slot += 1) {
+        const weight = readWeight[ownOffset + slot]!;
+        if (weight <= 0) continue;
+        accum[readIndex[ownOffset + slot]!] += weight * 0.5;
+      }
+      const start = offsets[v]!;
+      const end = offsets[v + 1]!;
+      const neighbors = end - start;
+      if (neighbors > 0) {
+        const scale = 0.5 / neighbors;
+        for (let link = start; link < end; link += 1) {
+          const neighborOffset = links[link]! * MAX_INFLUENCES;
+          for (let slot = 0; slot < MAX_INFLUENCES; slot += 1) {
+            const weight = readWeight[neighborOffset + slot]!;
+            if (weight <= 0) continue;
+            accum[readIndex[neighborOffset + slot]!] += weight * scale;
+          }
+        }
+      }
+
+      // 重新压回 top-4 并归一化
+      const outOffset = v * MAX_INFLUENCES;
+      // 乒乓缓冲会复用上一轮的槽位，先清空避免残留权重泄漏到本轮
+      for (let slot = 0; slot < MAX_INFLUENCES; slot += 1) {
+        writeIndex[outOffset + slot] = 0;
+        writeWeight[outOffset + slot] = 0;
+      }
+      let sum = 0;
+      let used = 0;
+      for (let slot = 0; slot < MAX_INFLUENCES; slot += 1) {
+        let bestBone = -1;
+        let bestWeight = 0;
+        for (let bone = 0; bone < boneCount; bone += 1) {
+          const weight = accum[bone]!;
+          if (weight > bestWeight) {
+            bestWeight = weight;
+            bestBone = bone;
+          }
+        }
+        if (bestBone < 0) break;
+        writeIndex[outOffset + slot] = bestBone;
+        writeWeight[outOffset + slot] = bestWeight;
+        sum += bestWeight;
+        used += 1;
+        accum[bestBone] = 0;
+      }
+      if (used === 0 || sum <= 0) {
+        writeIndex[outOffset] = 0;
+        writeWeight[outOffset] = 1;
+      } else {
+        for (let slot = 0; slot < used; slot += 1) writeWeight[outOffset + slot] /= sum;
+      }
+    }
+
+    const swapIndex = readIndex;
+    const swapWeight = readWeight;
+    readIndex = writeIndex;
+    readWeight = writeWeight;
+    writeIndex = swapIndex;
+    writeWeight = swapWeight;
+  }
+
+  // 迭代次数为偶数时结果落在原始缓冲；奇数时把最终结果拷回去
+  if (readIndex !== skinIndex) {
+    skinIndex.set(readIndex);
+    skinWeight.set(readWeight);
+  }
 }
