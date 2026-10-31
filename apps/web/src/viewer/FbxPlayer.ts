@@ -145,7 +145,7 @@ export interface ModalTransformState {
 
 /** 场景节点树的一个节点（对象层级，不含骨骼以外的特殊语义） */
 import { NodeHighlighter, type SceneNode } from './sceneNodes';
-import { AxisIndicator } from './axisIndicator';
+import { AxisIndicator, snapCameraToAxis, type AxisName } from './axisIndicator';
 import { buildBoneNameMap, clipsFromAnimationData } from './stage/clipFromAnimationData';
 
 export type { SceneNode };
@@ -323,6 +323,8 @@ export class FbxPlayer {
             bottom: options.axisIndicatorBottom ?? 14,
             // 动画工作区与工作台的指示器设置各记一份
             storageKey: 'axis-indicator:animation',
+            // 点击轴端点：把相机切到该轴向视角
+            onAxisSelect: (axis) => this.snapToAxis(axis),
           });
 
     this.camera = new THREE.PerspectiveCamera(40, 1, 0.05, 500);
@@ -1348,6 +1350,13 @@ export class FbxPlayer {
 
   resetView(): void {
     this.frameModel();
+  }
+
+  /** 点击轴向指示器的轴端点：把相机切到该轴正方向视角（保持当前距离） */
+  private snapToAxis(axis: AxisName): void {
+    if (this.disposed) return;
+    snapCameraToAxis(this.camera, this.controls, axis);
+    this.renderRequested = true;
   }
 
   /** 让相机框住模型（按动画多个时间点采样，避免运动幅度大时出画） */

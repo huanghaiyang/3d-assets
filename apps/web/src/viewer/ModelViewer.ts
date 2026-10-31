@@ -7,7 +7,7 @@ import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
-import { AxisIndicator } from './axisIndicator';
+import { AxisIndicator, snapCameraToAxis, type AxisName } from './axisIndicator';
 import { NodeHighlighter, type SceneNode } from './sceneNodes';
 import {
   autoRigHumanoid,
@@ -238,7 +238,11 @@ export class ModelViewer {
     this.axis =
       options.axisIndicator === false
         ? null
-        : new AxisIndicator(container, { storageKey: 'axis-indicator:workbench' });
+        : new AxisIndicator(container, {
+            storageKey: 'axis-indicator:workbench',
+            // 点击轴端点：把相机切到该轴向视角
+            onAxisSelect: (axis) => this.snapToAxis(axis),
+          });
 
     this.camera = new THREE.PerspectiveCamera(42, 1, 0.05, 500);
     this.camera.position.set(2.6, 2.1, 3.4);
@@ -507,6 +511,13 @@ export class ModelViewer {
     const size = new THREE.Vector3();
     box.getSize(size);
     this.frameCamera(size.y);
+  }
+
+  /** 点击轴向指示器的轴端点：把相机切到该轴正方向视角（保持当前距离） */
+  private snapToAxis(axis: AxisName): void {
+    if (this.disposed) return;
+    snapCameraToAxis(this.camera, this.controls, axis);
+    this.requestRender();
   }
 
   clear(): void {

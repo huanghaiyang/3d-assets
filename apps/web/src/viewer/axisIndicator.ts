@@ -10,13 +10,19 @@ import * as THREE from 'three';
  * 工作台视口（ModelViewer）与动画预览视口（FbxPlayer）共用这一个实现，保证两处观感一致。
  *
  * 调整与锁定：右上角小齿轮点开可调大小 / 透明度，右下角小握柄可拖动换位置。
- * 图形本身不接收鼠标事件，指针落在指示器上时仍然能旋转视角、滚轮缩放；
- * 只有齿轮 / 握柄 / 设置面板这几个小控件会截获操作。
- * 「锁定位置」后不可拖动或重置；「锁定朝向」后三轴固定显示世界坐标系，不随相机旋转。
+ * 图形本体不接收鼠标事件，指针落在指示器上时仍然能旋转视角、滚轮缩放；
+ * 只有轴端点（字母 / 圆点）、齿轮、握柄和设置面板会截获操作。
+ * 点击轴端点会让相机切到该世界轴的正方向视角（由播放器回调 onAxisSelect 完成），
+ * 四个工作区共用；「锁定朝向」后禁用切换，三轴固定显示世界坐标系。
+ * 「锁定位置」后不可拖动或重置。
  * 设置按工作区分别存进 localStorage（见 AxisIndicatorOptions.storageKey）。
  */
 
+/** 三根世界轴的名字，也是「点击轴端点切换视角」的入参 */
+export type AxisName = 'x' | 'y' | 'z';
+
 interface AxisSpec {
+  name: AxisName;
   label: string;
   dir: THREE.Vector3;
   color: string;
@@ -35,10 +41,17 @@ const PANEL_GAP = 8;
 
 const IDENTITY = new THREE.Quaternion();
 
+/** 三个世界轴的正方向：点击轴端点后相机摆到该方向看向目标 */
+const AXIS_DIRECTIONS: Record<AxisName, THREE.Vector3> = {
+  x: new THREE.Vector3(1, 0, 0),
+  y: new THREE.Vector3(0, 1, 0),
+  z: new THREE.Vector3(0, 0, 1),
+};
+
 const AXES: AxisSpec[] = [
-  { label: 'X', dir: new THREE.Vector3(1, 0, 0), color: '#ff6b6b' },
-  { label: 'Y', dir: new THREE.Vector3(0, 1, 0), color: '#7ee787' },
-  { label: 'Z', dir: new THREE.Vector3(0, 0, 1), color: '#5aa9ff' },
+  { name: 'x', label: 'X', dir: AXIS_DIRECTIONS.x, color: '#ff6b6b' },
+  { name: 'y', label: 'Y', dir: AXIS_DIRECTIONS.y, color: '#7ee787' },
+  { name: 'z', label: 'Z', dir: AXIS_DIRECTIONS.z, color: '#5aa9ff' },
 ];
 
 export interface AxisIndicatorOptions {
@@ -55,6 +68,11 @@ export interface AxisIndicatorOptions {
    * 不传则不写入 localStorage（离屏缩略图这类一次性渲染不需要记住）。
    */
   storageKey?: string;
+  /**
+   * 点击轴端点（字母 / 圆点）时回调，参数是被点击的世界轴。
+   * 播放器用它把相机切到对应轴向视角；不传则轴端点不可点击。
+   */
+  onAxisSelect?: (axis: AxisName) => void;
 }
 
 interface AxisIndicatorSettings {
@@ -74,6 +92,8 @@ interface AxisNode {
   line: SVGLineElement;
   dot: SVGCircleElement;
   label: SVGTextElement;
+  /** 轴端点的透明热区：扩大点击范围，悬停时整根轴高亮 */
+  hit: SVGCircleElement;
 }
 
 interface DragState {
@@ -88,6 +108,30 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+/** OrbitControls 的最小结构：切换轴向视角只需要观察目标与 update() */
+export interface AxisViewControls {
+  target: THREE.Vector3;
+  update: () => unknown;
+}
+
+/**
+ * 把相机摆到指定世界轴的正方向看向目标点，保持当前观察距离。
+ * 点击轴向指示器的轴端点时由各播放器调用。
+ * Y 轴是俯视，视线与 camera.up 平行，给一个极小的 z 偏移避免 lookAt 退化后画面乱翻。
+ */
+export function snapCameraToAxis(
+  camera: THREE.Camera,
+  controls: AxisViewControls,
+  axis: AxisName,
+): void {
+  const distance = camera.position.distanceTo(controls.target);
+  if (!(distance > 1e-6)) return;
+  camera.position.copy(controls.target).addScaledVector(AXIS_DIRECTIONS[axis], distance);
+  if (axis === 'y') camera.position.z += distance * 1e-4;
+  camera.lookAt(controls.target);
+  controls.update();
+}
+
 /** 全局只注入一次样式，避免每个实例都往 head 里塞一份 CSS */
 function ensureStyles(): void {
   if (document.getElementById(STYLE_ID)) return;
@@ -96,6 +140,12 @@ function ensureStyles(): void {
   style.textContent = `
 .axis-indicator{position:absolute;z-index:3;touch-action:none;user-select:none;pointer-events:none;}
 .axis-indicator__surface{display:block;pointer-events:none;}
+.axis-indicator__axis{cursor:pointer;}
+.axis-indicator__dot,.axis-indicator__label{pointer-events:auto;}
+.axis-indicator__hit{pointer-events:all;}
+.axis-indicator__axis:hover{filter:brightness(1.35);}
+.axis-indicator.is-orient-locked .axis-indicator__axis{cursor:not-allowed;}
+.axis-indicator.is-orient-locked .axis-indicator__axis:hover{filter:none;}
 .axis-indicator__gear{position:absolute;top:-3px;right:-3px;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;padding:0;border-radius:50%;border:1px solid rgba(255,255,255,.12);background:rgba(16,18,23,.86);color:#aeb6c4;opacity:.45;pointer-events:auto;transition:opacity .15s ease,color .15s ease;cursor:pointer;z-index:4;}
 .axis-indicator__gear:hover,.axis-indicator.is-open .axis-indicator__gear,.axis-indicator__gear:focus-visible{opacity:1;color:#e6e9f0;border-color:rgba(255,255,255,.25);}
 .axis-indicator.is-locked .axis-indicator__gear{color:#f2b45a;}
@@ -135,6 +185,8 @@ export class AxisIndicator {
   private canvas: HTMLCanvasElement | null;
   private readonly nodes: AxisNode[];
   private readonly settings: AxisIndicatorSettings;
+  /** 点击轴端点时通知播放器切换相机视角 */
+  private readonly onAxisSelect: ((axis: AxisName) => void) | null;
   private readonly storageKey: string | null;
   private readonly corner: 'bottom-left' | 'bottom-right';
   private readonly bottom: number;
@@ -158,6 +210,7 @@ export class AxisIndicator {
     this.bottom = options.bottom ?? 14;
     this.side = options.side ?? 14;
     this.storageKey = options.storageKey ?? null;
+    this.onAxisSelect = options.onAxisSelect ?? null;
     this.settings = this.loadSettings(options.size ?? DEFAULT_SIZE);
     this.size = this.settings.size;
     this.center = this.size / 2;
@@ -182,6 +235,7 @@ export class AxisIndicator {
 
     this.nodes = AXES.map((spec) => {
       const group = document.createElementNS(SVG_NS, 'g');
+      group.classList.add('axis-indicator__axis');
       const line = document.createElementNS(SVG_NS, 'line');
       line.setAttribute('stroke', spec.color);
       line.setAttribute('stroke-width', '1.8');
@@ -190,6 +244,7 @@ export class AxisIndicator {
       const dot = document.createElementNS(SVG_NS, 'circle');
       dot.setAttribute('r', '2.4');
       dot.setAttribute('fill', spec.color);
+      dot.classList.add('axis-indicator__dot');
 
       const label = document.createElementNS(SVG_NS, 'text');
       label.textContent = spec.label;
@@ -197,10 +252,19 @@ export class AxisIndicator {
       label.setAttribute('font-weight', '700');
       label.setAttribute('text-anchor', 'middle');
       label.setAttribute('dominant-baseline', 'middle');
+      label.classList.add('axis-indicator__label');
 
-      group.append(line, dot, label);
+      // 透明热区：圆点 + 字母太小，扩大成能点的区域；填充透明才算可命中
+      const hit = document.createElementNS(SVG_NS, 'circle');
+      hit.setAttribute('fill', 'transparent');
+      hit.classList.add('axis-indicator__hit');
+
+      group.append(line, dot, label, hit);
+      // 点击轴端点：通知播放器把相机切到该轴向（锁定朝向后 requestAxis 会忽略）
+      group.addEventListener('click', () => this.requestAxis(spec.name));
+      group.addEventListener('wheel', this.onControlWheel, { passive: false });
       this.layer.appendChild(group);
-      return { spec, group, line, dot, label };
+      return { spec, group, line, dot, label, hit };
     });
 
     this.gear = this.buildGear();
@@ -216,6 +280,8 @@ export class AxisIndicator {
     this.canvas = container.querySelector<HTMLCanvasElement>('canvas');
 
     if (this.settings.locked) element.classList.add('is-locked');
+    // 锁定朝向时轴端点不可切换：光标改成 not-allowed 给出提示
+    if (this.settings.orientLocked) element.classList.add('is-orient-locked');
 
     this.applySize(this.settings.size);
     this.applyOpacity(this.settings.opacity);
@@ -294,6 +360,10 @@ export class AxisIndicator {
       node.dot.setAttribute('cy', endY.toFixed(2));
       node.dot.setAttribute('opacity', opacity.toFixed(2));
 
+      // 点击热区跟着端点走：透明填充只负责放大命中范围
+      node.hit.setAttribute('cx', endX.toFixed(2));
+      node.hit.setAttribute('cy', endY.toFixed(2));
+
       node.label.setAttribute('x', labelX.toFixed(2));
       node.label.setAttribute('y', labelY.toFixed(2));
       node.label.setAttribute('opacity', (0.7 + 0.3 * towardViewer).toFixed(2));
@@ -321,10 +391,13 @@ export class AxisIndicator {
     this.backdrop.setAttribute('r', String(this.size / 2 - 1));
 
     const fontSize = Math.round(clamp((this.size * 9) / DEFAULT_SIZE, 8, 12));
+    // 热区随尺寸放大：76px 时约 10px 半径，缩到 44px 也还有 8px，手指/鼠标都够点
+    const hitRadius = Math.max(8, Math.round(this.size / 8));
     for (const node of this.nodes) {
       node.line.setAttribute('x1', String(this.center));
       node.line.setAttribute('y1', String(this.center));
       node.label.setAttribute('font-size', String(fontSize));
+      node.hit.setAttribute('r', String(hitRadius));
     }
 
     this.applyPosition();
@@ -340,6 +413,12 @@ export class AxisIndicator {
     this.settings.locked = locked;
     this.element.classList.toggle('is-locked', locked);
     if (locked) this.finishDrag();
+  }
+
+  /** 点击轴端点：通知播放器把相机切到该轴向；锁定朝向时忽略（锁定后禁用切换） */
+  private requestAxis(axis: AxisName): void {
+    if (this.disposed || this.settings.orientLocked) return;
+    this.onAxisSelect?.(axis);
   }
 
   /**
@@ -617,6 +696,7 @@ export class AxisIndicator {
     <input type="checkbox" data-axis-orient${this.settings.orientLocked ? ' checked' : ''} />
     <span>锁定朝向（固定世界坐标）</span>
   </label>
+  <p class="axis-indicator__note">点击轴端点可切换到该轴向视角；锁定朝向后禁用。</p>
   <p class="axis-indicator__note" data-axis-note>${note}</p>
   <button type="button" class="axis-indicator__reset" data-axis-reset${this.settings.locked ? ' disabled' : ''}>重置位置</button>
 `;
@@ -670,6 +750,8 @@ export class AxisIndicator {
 
     orientInput.addEventListener('change', () => {
       this.settings.orientLocked = orientInput.checked;
+      // 锁定/解锁朝向后，轴端点的可点击状态跟着变
+      this.element.classList.toggle('is-orient-locked', this.settings.orientLocked);
       this.applyOrientation(this.orientation());
       this.persist();
     });
